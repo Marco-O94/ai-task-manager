@@ -1,12 +1,10 @@
 //! NDJSON wire protocol with `claude -p --input-format stream-json` (spec §7.4, §7.5, §7.8):
 //! capped line reader, inbound classification, outbound frames, approval responses.
 //! Owner: M2-CLAUDE. Everything except the reader and the writer is pure.
-// M1 contract stubs: remove these allows when implementing.
-#![allow(unused_variables, dead_code, clippy::ptr_arg)]
 
 use atm_types::{ApprovalDecision, Id};
-use serde_json::Value;
-use tokio::io::{AsyncBufRead, AsyncWrite};
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 /// Per-line caps (spec §7.5, §7.11).
@@ -19,6 +17,7 @@ pub const STDIN_CHANNEL: usize = 64;
 pub const DENY_PREFIX: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: ";
 /// Deny message for `AskUserQuestion`, which is disallowed in v1 but may still arrive.
 pub const ASK_USER_QUESTION_DENY: &str = "Ask your question in plain text in your reply instead.";
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
 
 /// Outcome of [`read_line_capped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,12 +31,46 @@ pub enum Line {
 
 /// Reads one line into `buf` (cleared first) using `fill_buf`/`consume`; past `max` bytes
 /// discards the rest of the line and returns `TooLong` so the caller keeps reading.
+///
+/// Not cancel-safe: bytes are consumed as they are read, so dropping the future mid-line
+/// loses that line's head. Drive it from a dedicated reader task, never from a `select!` arm.
 pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     max: usize,
 ) -> std::io::Result<Line> {
-    Err(std::io::Error::other("M2-CLAUDE: read_line_capped"))
+    buf.clear();
+    let mut len = 0usize;
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(match (too_long, len) {
+                (true, _) => Line::TooLong(len),
+                (false, 0) => Line::Eof,
+                (false, _) => Line::Complete,
+            });
+        }
+        let newline = available.iter().position(|&b| b == b'\n');
+        let chunk = &available[..newline.unwrap_or(available.len())];
+        len += chunk.len();
+        if !too_long && buf.len() + chunk.len() > max {
+            too_long = true;
+            buf.clear();
+        }
+        if !too_long {
+            buf.extend_from_slice(chunk);
+        }
+        let used = newline.map_or(chunk.len(), |i| i + 1);
+        reader.consume(used);
+        if newline.is_some() {
+            return Ok(if too_long {
+                Line::TooLong(len)
+            } else {
+                Line::Complete
+            });
+        }
+    }
 }
 
 /// Fields of a `control_request` with subtype `can_use_tool` (spec §7.8).
@@ -81,40 +114,125 @@ pub enum Inbound {
     NotJson,
 }
 
+fn str_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_owned)
+}
+
+/// Classifies one stdout line. A control frame without a `request_id` cannot be answered
+/// and falls back to `Message` (the normalizer ignores it).
 pub fn parse(line: &[u8]) -> Inbound {
-    todo!("M2-CLAUDE: wire::parse")
+    if line.trim_ascii_start().first() != Some(&b'{') {
+        return Inbound::NotJson;
+    }
+    let Ok(v) = serde_json::from_slice::<Value>(line) else {
+        return Inbound::NotJson;
+    };
+    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+        "control_response" => {
+            let response = &v["response"];
+            let request_id =
+                str_field(response, "request_id").or_else(|| str_field(&v, "request_id"));
+            let Some(request_id) = request_id else {
+                return Inbound::Message(v);
+            };
+            let result = if response["subtype"] == "error" {
+                Err(match &response["error"] {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+            } else {
+                Ok(response.get("response").cloned().unwrap_or(Value::Null))
+            };
+            Inbound::ControlResponse { request_id, result }
+        }
+        "control_request" => {
+            let Some(request_id) = str_field(&v, "request_id") else {
+                return Inbound::Message(v);
+            };
+            let request = &v["request"];
+            let subtype = str_field(request, "subtype").unwrap_or_default();
+            if subtype == "can_use_tool"
+                && let (Some(tool_name), Some(input), Some(tool_use_id)) = (
+                    str_field(request, "tool_name"),
+                    request.get("input").filter(|i| !i.is_null()),
+                    str_field(request, "tool_use_id"),
+                )
+            {
+                return Inbound::CanUseTool(CanUseTool {
+                    request_id,
+                    tool_name,
+                    input: input.clone(),
+                    tool_use_id,
+                    permission_suggestions: request
+                        .get("permission_suggestions")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    request: request.clone(),
+                });
+            }
+            Inbound::ControlRequest {
+                request_id,
+                subtype,
+            }
+        }
+        "control_cancel_request" => match str_field(&v, "request_id") {
+            Some(request_id) => Inbound::ControlCancel { request_id },
+            None => Inbound::Message(v),
+        },
+        "keep_alive" => Inbound::KeepAlive,
+        "stream_event" => Inbound::StreamEvent(v),
+        _ => Inbound::Message(v),
+    }
 }
 
 /// `atm_<n>_<8 hex>`: id of a request sent by the host.
 pub fn request_id(n: u64) -> String {
-    todo!("M2-CLAUDE: request_id")
+    format!("atm_{n}_{:08x}", uuid::Uuid::new_v4().as_u128() as u32)
 }
 
 /// `{"type":"control_request","request_id":…,"request":{"subtype":"initialize","hooks":null}}`.
 pub fn initialize_request(request_id: &str) -> Value {
-    todo!("M2-CLAUDE: initialize_request")
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {"subtype": "initialize", "hooks": null},
+    })
 }
 
 /// `{"type":"control_request","request_id":…,"request":{"subtype":"interrupt"}}`.
 pub fn interrupt_request(request_id: &str) -> Value {
-    todo!("M2-CLAUDE: interrupt_request")
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": {"subtype": "interrupt"},
+    })
 }
 
 /// `{"type":"user","message":{"role":"user","content":<prompt>},"parent_tool_use_id":null}`
 /// (no `session_id`).
 pub fn user_message(prompt: &str) -> Value {
-    todo!("M2-CLAUDE: user_message")
+    json!({
+        "type": "user",
+        "message": {"role": "user", "content": prompt},
+        "parent_tool_use_id": null,
+    })
 }
 
 /// `control_response` with subtype `success` echoing `request_id`.
 pub fn control_success(request_id: &str, response: Value) -> Value {
-    todo!("M2-CLAUDE: control_success")
+    json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": request_id, "response": response},
+    })
 }
 
 /// `control_response` with `{"subtype":"error","request_id":…,"error":<error>}`, e.g.
 /// `"Unsupported control request subtype: X"`.
 pub fn control_error(request_id: &str, error: &str) -> Value {
-    todo!("M2-CLAUDE: control_error")
+    json!({
+        "type": "control_response",
+        "response": {"subtype": "error", "request_id": request_id, "error": error},
+    })
 }
 
 /// A `can_use_tool` waiting for the user (in memory only, no timeout; spec §7.8).
@@ -131,33 +249,106 @@ pub struct Pending {
     pub suggestions: Value,
 }
 
+impl Pending {
+    /// Registers a `can_use_tool` under a new app-side `approval_id`.
+    pub fn new(approval_id: Id, req: &CanUseTool) -> Pending {
+        Pending {
+            approval_id,
+            request_id: req.request_id.clone(),
+            tool_use_id: req.tool_use_id.clone(),
+            tool_name: req.tool_name.clone(),
+            input: req.input.clone(),
+            suggestions: req.permission_suggestions.clone(),
+        }
+    }
+}
+
 /// True only if every suggestion is `addRules` with `behavior:"allow"` and every rule has
 /// a non-empty `ruleContent` (whole-tool rules are never rememberable).
 pub fn can_remember(suggestions: &Value) -> bool {
-    todo!("M2-CLAUDE: can_remember")
+    let rememberable = |s: &Value| {
+        s["type"] == "addRules"
+            && s["behavior"] == "allow"
+            && s["rules"].as_array().is_some_and(|rules| {
+                !rules.is_empty()
+                    && rules
+                        .iter()
+                        .all(|r| r["ruleContent"].as_str().is_some_and(|c| !c.is_empty()))
+            })
+    };
+    suggestions
+        .as_array()
+        .is_some_and(|all| !all.is_empty() && all.iter().all(rememberable))
 }
 
 /// Complete `control_response` frame for a decision (spec §7.8 table), echoing
 /// `pending.request_id`. Allow always carries `updatedInput` (the original input); remember
 /// adds `updatedPermissions` with every destination rewritten to `"session"`; deny uses
 /// [`DENY_PREFIX`] + message and `interrupt`; `AskUserQuestion` is always denied with
-/// [`ASK_USER_QUESTION_DENY`].
+/// [`ASK_USER_QUESTION_DENY`]. `remember` is ignored unless [`can_remember`] holds, so a
+/// whole-tool rule is never sent.
 pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Value {
-    todo!("M2-CLAUDE: approval_response")
+    let response = if pending.tool_name == ASK_USER_QUESTION {
+        json!({"behavior": "deny", "message": ASK_USER_QUESTION_DENY, "interrupt": false})
+    } else {
+        match decision {
+            ApprovalDecision::Allow { remember } => {
+                let mut allow = json!({"behavior": "allow", "updatedInput": pending.input});
+                if *remember && can_remember(&pending.suggestions) {
+                    let mut suggestions = pending.suggestions.clone();
+                    for s in suggestions.as_array_mut().into_iter().flatten() {
+                        s["destination"] = "session".into();
+                    }
+                    allow["updatedPermissions"] = suggestions;
+                }
+                allow
+            }
+            ApprovalDecision::Deny { message, interrupt } => json!({
+                "behavior": "deny",
+                "message": format!("{DENY_PREFIX}{message}"),
+                "interrupt": interrupt,
+            }),
+        }
+    };
+    control_success(&pending.request_id, response)
 }
 
-/// `Tool(ruleContent)` strings added to `attempts.allow_rules` on "Consenti sempre".
+/// `Tool(ruleContent)` strings added to `attempts.allow_rules` on "Consenti sempre"; empty
+/// unless [`can_remember`] holds, and always for `AskUserQuestion` (always denied).
 pub fn remembered_rules(pending: &Pending) -> Vec<String> {
-    todo!("M2-CLAUDE: remembered_rules")
+    if pending.tool_name == ASK_USER_QUESTION || !can_remember(&pending.suggestions) {
+        return Vec::new();
+    }
+    let rules = pending.suggestions.as_array().into_iter().flatten();
+    rules
+        .flat_map(|s| s["rules"].as_array().into_iter().flatten())
+        .map(|r| {
+            let tool = r["toolName"].as_str().unwrap_or(&pending.tool_name);
+            format!("{tool}({})", r["ruleContent"].as_str().unwrap_or_default())
+        })
+        .collect()
 }
 
 /// The single stdin writer: for each frame writes the JSON, `\n`, flushes, and appends the
 /// same line to `log` (`stdin.jsonl`) if given. Returns when `rx` is closed (all senders
 /// dropped = stdin closed, spec §7.4 step 3) or on a write error.
 pub async fn write_frames<W: AsyncWrite + Unpin>(
-    stdin: W,
-    rx: mpsc::Receiver<Value>,
-    log: Option<tokio::fs::File>,
+    mut stdin: W,
+    mut rx: mpsc::Receiver<Value>,
+    mut log: Option<tokio::fs::File>,
 ) -> std::io::Result<()> {
-    Err(std::io::Error::other("M2-CLAUDE: write_frames"))
+    while let Some(frame) = rx.recv().await {
+        let mut line = serde_json::to_vec(&frame)?;
+        line.push(b'\n');
+        stdin.write_all(&line).await?;
+        stdin.flush().await?;
+        // A failing diagnostic log must not stop the turn: stop logging instead. tokio's
+        // File buffers internally, hence the flush.
+        if let Some(file) = &mut log
+            && (file.write_all(&line).await.is_err() || file.flush().await.is_err())
+        {
+            log = None;
+        }
+    }
+    stdin.shutdown().await
 }

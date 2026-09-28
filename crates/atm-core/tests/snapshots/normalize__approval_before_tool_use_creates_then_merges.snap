@@ -1,0 +1,78 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_2",
+        "name": "Edit",
+        "summary": "Edit src/lib.rs",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/lib.rs\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+        "status": {
+          "state": "AwaitingApproval",
+          "approval_id": "approval-2",
+          "can_remember": false,
+          "reason": "matches an ask rule"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_2",
+        "name": "Edit",
+        "summary": "Edit src/lib.rs",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/lib.rs\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+        "status": {
+          "state": "Denied",
+          "message": "non toccare lib.rs"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 2,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_2",
+        "name": "Edit",
+        "summary": "Edit src/lib.rs",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/lib.rs\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+        "status": {
+          "state": "Denied",
+          "message": "non toccare lib.rs"
+        },
+        "output": {
+          "text": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: ",
+          "truncated_bytes": 0,
+          "is_error": true
+        }
+      }
+    }
+  }
+]

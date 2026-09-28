@@ -1,0 +1,43 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "SessionInit",
+        "model": "claude-opus-5-5",
+        "permission_mode": "acceptEdits",
+        "api_key_source": "none",
+        "mcp_servers": 0,
+        "warnings": []
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 11,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 2000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "SessionInit",
+        "model": "claude-opus-5-5",
+        "permission_mode": "default",
+        "api_key_source": "ANTHROPIC_API_KEY",
+        "mcp_servers": 2,
+        "warnings": [
+          "Il CLI usa una chiave API (ANTHROPIC_API_KEY): l'uso viene fatturato via API, non con l'abbonamento.",
+          "Il CLI lavora in /private/tmp/elsewhere invece che nel worktree /Users/me/.ai-task-manager/worktrees/demo/atm-1-hello."
+        ]
+      }
+    }
+  }
+]

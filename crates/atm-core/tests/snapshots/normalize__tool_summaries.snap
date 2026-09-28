@@ -1,0 +1,90 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: summaries
+---
+[
+  [
+    "Bash",
+    "$ cargo test --locked"
+  ],
+  [
+    "Bash",
+    "$ echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  ],
+  [
+    "Read",
+    "Read src/main.rs"
+  ],
+  [
+    "Read",
+    "Read /etc/hosts"
+  ],
+  [
+    "Read",
+    "Read /Users/me/.ai-task-manager/worktrees/demo/atm-1-hello-other/x.rs"
+  ],
+  [
+    "Edit",
+    "Edit a.rs"
+  ],
+  [
+    "MultiEdit",
+    "Edit b.rs"
+  ],
+  [
+    "NotebookEdit",
+    "Edit n.ipynb"
+  ],
+  [
+    "Write",
+    "Write hello.txt"
+  ],
+  [
+    "Grep",
+    "Grep \"fn main\" src"
+  ],
+  [
+    "Grep",
+    "Grep \"TODO\" ."
+  ],
+  [
+    "Glob",
+    "Glob **/*.rs"
+  ],
+  [
+    "WebFetch",
+    "https://example.com/docs"
+  ],
+  [
+    "WebSearch",
+    "rust tokio process group"
+  ],
+  [
+    "Task",
+    "Subagent: Review the diff"
+  ],
+  [
+    "Agent",
+    "Subagent: Explore the repo"
+  ],
+  [
+    "TodoWrite",
+    "Todos: 2/4"
+  ],
+  [
+    "mcp__github__create_issue",
+    "MCP github/create_issue"
+  ],
+  [
+    "mcp__my_server__do__thing",
+    "MCP my_server/do__thing"
+  ],
+  [
+    "ExitPlanMode",
+    "ExitPlanMode"
+  ],
+  [
+    "Read",
+    "Read ."
+  ]
+]

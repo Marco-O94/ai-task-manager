@@ -1,0 +1,19 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: "view(n.on_user_message(\"# Crea hello\\n\\nScrivi hello.txt\", 1000))"
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "UserMessage",
+        "text": "# Crea hello\n\nScrivi hello.txt"
+      }
+    }
+  }
+]

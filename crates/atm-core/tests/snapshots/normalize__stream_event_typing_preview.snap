@@ -1,0 +1,31 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Typing": "Hel"
+  },
+  {
+    "Typing": "Hello world"
+  },
+  {
+    "Typing": "Pensando"
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1700,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "AssistantText",
+        "text": "Hello world"
+      }
+    }
+  },
+  {
+    "Typing": null
+  }
+]

@@ -1,0 +1,49 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 11,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1100,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_running",
+        "name": "Bash",
+        "summary": "$ sleep 100",
+        "input": "{\"command\":\"sleep 100\"}",
+        "status": {
+          "state": "Cancelled"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 12,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1200,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_waiting",
+        "name": "Bash",
+        "summary": "$ rm x",
+        "input": "{\"command\":\"rm x\"}",
+        "status": {
+          "state": "Cancelled"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  }
+]

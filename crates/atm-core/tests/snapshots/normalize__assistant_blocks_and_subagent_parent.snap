@@ -1,0 +1,55 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: "view(n.on_line(&line, 1000))"
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": "toolu_parent",
+      "body": {
+        "type": "Thinking",
+        "text": "Plan: write the file."
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 11,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": "toolu_parent",
+      "body": {
+        "type": "AssistantText",
+        "text": "Creating it now."
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 12,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": "toolu_parent",
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_1",
+        "name": "Write",
+        "summary": "Write src/hello.txt",
+        "input": "{\"content\":\"hello\\n\",\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/hello.txt\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  }
+]
