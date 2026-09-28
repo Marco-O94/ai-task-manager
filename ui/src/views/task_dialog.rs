@@ -74,7 +74,11 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
     });
 
     let is_edit = move || mode.with(|m| matches!(m, Some(TaskDialogMode::Edit(_))));
+    // Cmd/Ctrl+Enter bypasses the disabled submit button.
     let submit = move || {
+        if busy.get_untracked() {
+            return;
+        }
         let Some(current) = mode.get_untracked() else {
             return;
         };

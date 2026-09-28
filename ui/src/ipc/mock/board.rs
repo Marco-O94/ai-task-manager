@@ -127,23 +127,29 @@ pub fn task(id: &str) -> Option<Task> {
 
 /// For `attempt.rs`: lifecycle transition of a task (start → inprogress, turn end →
 /// inreview, merge → done, discard → todo), appended to the end of the new column; emits
-/// `changed`.
+/// `changed`. A task already in `status` keeps its place (the user's drag order).
 #[allow(dead_code)] // hook for attempt.rs
 pub fn set_task_status(id: &str, status: TaskStatus) {
-    let project = with(|m| move_to(&mut m.tasks, id, status, None).then(|| m.touch(id)));
+    let project = with(|m| {
+        let task = m.tasks.iter().find(|t| t.id == id)?;
+        if task.status == status {
+            return Some(task.project_id.clone());
+        }
+        move_to(&mut m.tasks, id, status, None).then(|| m.touch(id))
+    });
     if let Some(project) = project {
         changed(Some(project), Some(id.to_owned()));
     }
 }
 
 /// For `attempt.rs`: changes the mock env (usage-limit `paused`, `auth` after an auth
-/// failure, `running`) and emits `env_changed`, as the runner does.
+/// failure, `running`) and emits `env_changed`, as the runner does. `f` runs outside the
+/// mock's borrow, so it may call the other hooks.
 pub fn update_env(f: impl FnOnce(&mut EnvStatus)) {
-    let env = with(|m| {
-        f(&mut m.env);
-        m.env.checked_at = super::now_ms();
-        m.env.clone()
-    });
+    let mut env = with(|m| m.env.clone());
+    f(&mut env);
+    env.checked_at = super::now_ms();
+    with(|m| m.env = env.clone());
     super::emit(EVENT_ENV_CHANGED, &env);
 }
 

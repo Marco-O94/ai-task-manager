@@ -86,9 +86,13 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
                 .unwrap_or(PermissionMode::AcceptEdits),
             default_model: non_empty(model.get_untracked()),
         };
-        run(ctx, busy, "Progetto aggiornato", async move {
-            ipc::call::<UpdateProject>(&req).await.map(|_| ())
-        });
+        run(
+            ctx,
+            busy,
+            "Progetto aggiornato",
+            async move { ipc::call::<UpdateProject>(&req).await },
+            drop,
+        );
     };
     let save_security = move |_| {
         let Some(id) = ctx.project.get_untracked() else {
@@ -102,9 +106,20 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
                 .unwrap_or(ConfigPolicy::Isolated),
             allow_bypass: allow_bypass.get_untracked(),
         };
-        run(ctx, busy, "Sicurezza del progetto aggiornata", async move {
-            ipc::call::<SetProjectSecurity>(&req).await.map(|_| ())
-        });
+        run(
+            ctx,
+            busy,
+            "Sicurezza del progetto aggiornata",
+            async move { ipc::call::<SetProjectSecurity>(&req).await },
+            // Autonomo is no longer selectable; the backend may also have reset the default.
+            move |p: Project| {
+                if !p.allow_bypass
+                    && mode.try_get_untracked().as_deref() == Some("bypassPermissions")
+                {
+                    mode.try_set(PermissionMode::AcceptEdits.as_str().to_owned());
+                }
+            },
+        );
     };
     let remove = move |_| {
         if !confirm_remove.get_untracked() {
@@ -122,6 +137,7 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
             busy,
             "Progetto rimosso; i branch restano",
             async move { ipc::call::<RemoveProject>(&req).await },
+            drop,
         );
     };
 
@@ -201,17 +217,20 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
     }
 }
 
-/// Runs one action: `busy` meanwhile, then a toast and a reload of the project list.
-fn run(
+/// Runs one action: `busy` meanwhile, then `on_ok` with the result, a toast and a reload of
+/// the project list.
+fn run<T: 'static>(
     ctx: AppCtx,
     busy: RwSignal<bool>,
     done: &'static str,
-    call: impl Future<Output = Result<(), AppError>> + 'static,
+    call: impl Future<Output = Result<T, AppError>> + 'static,
+    on_ok: impl FnOnce(T) + 'static,
 ) {
     busy.set(true);
     spawn_local(async move {
         match call.await {
-            Ok(()) => {
+            Ok(res) => {
+                on_ok(res);
                 ctx.toasts.success(done);
                 ctx.refresh_projects();
             }
