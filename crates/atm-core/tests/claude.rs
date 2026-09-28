@@ -125,6 +125,22 @@ fn argv_bypass_enabled() {
 }
 
 #[test]
+fn argv_bypass_without_opt_in_runs_as_default() {
+    let args = TurnArgs {
+        permission_mode: PermissionMode::BypassPermissions,
+        allow_bypass: false,
+        ..turn_args()
+    };
+    let argv = claude::build_argv(&args);
+    let modes: Vec<_> = argv
+        .iter()
+        .filter(|a| a.starts_with("--permission-mode="))
+        .collect();
+    assert_eq!(modes, ["--permission-mode=default"]);
+    assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
+}
+
+#[test]
 fn argv_model_and_effort() {
     let args = TurnArgs {
         model: Some("opus".into()),
@@ -216,6 +232,14 @@ fn child_env_scrubs_and_sets() {
 
     let italian = ChildEnv::new(os_vars(&[("LANG", "it_IT.UTF-8")]), "/bin".as_ref(), false);
     assert_eq!(get(&italian, "LANG").as_deref(), Some("it_IT.UTF-8"));
+
+    // Debug names the variables but never prints a value (spec §10.2).
+    let debug = format!("{passthrough:?}");
+    assert!(debug.contains("ANTHROPIC_API_KEY"), "{debug}");
+    assert!(
+        !debug.contains("sk-test") && !debug.contains("/Users/me"),
+        "{debug}"
+    );
 }
 
 #[test]
@@ -359,6 +383,33 @@ fn candidates_follow_the_spec_order() {
             "/usr/local/bin/claude",
         ]
         .map(PathBuf::from)
+    );
+}
+
+#[test]
+fn candidates_are_always_absolute() {
+    let dir = common::tempdir();
+    let bin = dir.path().canonicalize().unwrap().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_script(&bin, "claude", "#!/bin/sh\n");
+    // The same directory spelled relative to the test's cwd: an existing file, still skipped.
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count());
+    let relative_bin = PathBuf::from(format!("{up}{}", bin.strip_prefix("/").unwrap().display()));
+    assert!(relative_bin.join("claude").is_file());
+    let path = std::env::join_paths([relative_bin, PathBuf::new(), bin.clone()]).unwrap();
+    let env = ChildEnv::new(
+        os_vars(&[("ATM_CLAUDE_PATH", "dev/fake-claude"), ("HOME", "home")]),
+        &path,
+        false,
+    );
+    assert_eq!(
+        claude::candidates(Some(Path::new("rel/claude")), &env),
+        [
+            cwd.join("rel/claude"),
+            cwd.join("dev/fake-claude"),
+            bin.join("claude")
+        ]
     );
 }
 
@@ -874,7 +925,14 @@ fn approval_response_deny_and_ask_user_question() {
     );
     assert!(wire::DENY_PREFIX.ends_with("the user said: "));
 
-    let ask = pending("AskUserQuestion", Value::Null);
+    let ask = pending(
+        "AskUserQuestion",
+        json!([add_rules(
+            json!([{"toolName":"AskUserQuestion","ruleContent":"x"}]),
+            "allow"
+        )]),
+    );
+    assert!(wire::remembered_rules(&ask).is_empty());
     for decision in [
         ApprovalDecision::Allow { remember: true },
         ApprovalDecision::Deny {
@@ -1205,6 +1263,16 @@ async fn killpg_reaches_the_whole_group() {
     let command = claude::process_command(pgid).await.unwrap();
     assert!(command.contains("fake-claude"), "{command}");
     assert!(claude::pid_alive(pgid));
+    let grandchild = fx
+        .records()
+        .iter()
+        .find_map(|r| (r["kind"] == "grandchild").then(|| r["pid"].as_i64()))
+        .flatten()
+        .expect("the fake recorded its grandchild");
+    let grandchild = i32::try_from(grandchild).unwrap();
+    assert!(claude::pid_alive(grandchild));
+    // SAFETY: getpgid only reads the process table.
+    assert_eq!(unsafe { libc::getpgid(grandchild) }, pgid);
 
     // Interrupt, EOF and SIGTERM are all ignored.
     tx.send(wire::interrupt_request(&wire::request_id(2)))
@@ -1224,15 +1292,19 @@ async fn killpg_reaches_the_whole_group() {
     }
     assert!(!claude::group_alive(pgid), "the grandchild sleep survived");
     assert!(!claude::pid_alive(pgid));
+    assert!(!claude::pid_alive(grandchild));
     claude::killpg(pgid, libc::SIGTERM).expect("ESRCH is Ok");
     assert_eq!(claude::process_command(pgid).await, None);
 }
 
 #[test]
 fn killpg_refuses_our_own_group() {
-    for pgid in [-1, 0, 1] {
-        let err = claude::killpg(pgid, libc::SIGTERM).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    // Signal 0 only probes: a regression here cannot hit the test harness.
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    let own = unsafe { libc::getpgrp() };
+    for pgid in [-1, 0, 1, own] {
+        let err = claude::killpg(pgid, 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{pgid}");
     }
     assert!(!claude::pid_alive(0));
     assert!(!claude::group_alive(0));
@@ -1249,4 +1321,8 @@ fn spawn_error_is_io() {
         claude::spawn(&[], dir.path(), &env).unwrap_err().code,
         ErrorCode::Io
     );
+    // A relative argv[0] would run a file of the worktree: refused even when it exists.
+    write_script(dir.path(), "claude", "#!/bin/sh\n");
+    let err = claude::spawn(&["./claude".into()], dir.path(), &env).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Io);
 }

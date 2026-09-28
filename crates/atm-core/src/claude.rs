@@ -74,10 +74,19 @@ pub struct Discovered {
     pub version: String,
 }
 
-/// Environment of every child: `auth status` and agent turns alike (spec §7.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Environment of every child: `auth status` and agent turns alike (spec §7.2). `Debug`
+/// shows only the variable names: values are never logged (spec §10.2).
+#[derive(Clone, PartialEq, Eq)]
 pub struct ChildEnv {
     vars: BTreeMap<OsString, OsString>,
+}
+
+impl std::fmt::Debug for ChildEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildEnv")
+            .field("vars", &self.vars.keys().collect::<Vec<_>>())
+            .finish()
+    }
 }
 
 impl ChildEnv {
@@ -221,18 +230,23 @@ pub fn fixed_candidates(home: &Path) -> Vec<PathBuf> {
 }
 
 /// The candidates of [`discover`] in order, without running any of them; `PATH` entries are
-/// kept only if the file exists.
+/// kept only if the file exists. Every candidate is absolute, so a turn spawned in a worktree
+/// never resolves `argv[0]` against the repo: a relative override or `ATM_CLAUDE_PATH` is
+/// made absolute against the app's cwd; a relative `HOME` and relative or empty `PATH`
+/// entries are skipped.
 pub fn candidates(override_path: Option<&Path>, env: &ChildEnv) -> Vec<PathBuf> {
     let non_empty = |k| env.get(k).filter(|v| !v.is_empty());
-    let mut out: Vec<PathBuf> = override_path.map(Path::to_path_buf).into_iter().collect();
-    out.extend(non_empty(ATM_CLAUDE_PATH_ENV).map(PathBuf::from));
-    if let Some(home) = non_empty("HOME") {
-        out.extend(fixed_candidates(Path::new(home)));
+    let absolute = |p: &Path| std::path::absolute(p).ok();
+    let mut out: Vec<PathBuf> = override_path.and_then(absolute).into_iter().collect();
+    out.extend(non_empty(ATM_CLAUDE_PATH_ENV).and_then(|p| absolute(Path::new(p))));
+    if let Some(home) = non_empty("HOME").map(Path::new).filter(|h| h.is_absolute()) {
+        out.extend(fixed_candidates(home));
     }
     let tmpdir = non_empty("TMPDIR").map(Path::new);
     if let Some(path) = env.get("PATH") {
         out.extend(
             std::env::split_paths(path)
+                .filter(|dir| dir.is_absolute())
                 .map(|dir| dir.join("claude"))
                 .filter(|p| p.is_file())
                 .filter(|p| !tmpdir.is_some_and(|t| p.starts_with(t)))
@@ -343,7 +357,8 @@ pub struct TurnArgs {
 /// Exact argv of spec §7.3, `argv[0]` = the claude path; every value as `--flag=value`,
 /// `--permission-mode=` always present, never `--bare` nor the skip-permissions flag.
 /// The prompt goes only through stdin. The fixed flags keep their constant value as a
-/// separate word, as written in spec §7.3.
+/// separate word, as written in spec §7.3. Defence in depth: `BypassPermissions` without
+/// `allow_bypass` (the project opt-in) runs as `default`.
 pub fn build_argv(args: &TurnArgs) -> Vec<String> {
     let mut argv = vec![args.claude.to_string_lossy().into_owned()];
     argv.extend(
@@ -360,7 +375,11 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
         ]
         .map(String::from),
     );
-    argv.push(format!("--permission-mode={}", args.permission_mode));
+    let mode = match args.permission_mode {
+        PermissionMode::BypassPermissions if !args.allow_bypass => PermissionMode::Default,
+        mode => mode,
+    };
+    argv.push(format!("--permission-mode={mode}"));
     if args.allow_bypass {
         argv.push("--allow-dangerously-skip-permissions".into());
     }
@@ -546,11 +565,17 @@ pub struct Spawned {
 }
 
 /// `argv[0]` with `argv[1..]`, `current_dir(cwd)`, `process_group(0)`, `kill_on_drop(true)`,
-/// all three pipes, environment exactly `env`. Errors: `Io` (→ failed / spawn_error).
+/// all three pipes, environment exactly `env`. Errors: `Io` (→ failed / spawn_error), also
+/// for a relative `argv[0]`, which would resolve against `cwd` (the repo).
 pub fn spawn(argv: &[String], cwd: &Path, env: &ChildEnv) -> Result<Spawned, AppError> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| AppError::io("argv vuoto"))?;
+    if !Path::new(program).is_absolute() {
+        return Err(AppError::io(format!(
+            "path di claude non assoluto: {program}"
+        )));
+    }
     let mut cmd = Command::new(program);
     cmd.args(args)
         .current_dir(cwd)
@@ -581,10 +606,13 @@ pub fn spawn(argv: &[String], cwd: &Path, env: &ChildEnv) -> Result<Spawned, App
     })
 }
 
-/// `killpg(pgid, signal)`; `ESRCH` (group already gone) is `Ok`.
+/// `killpg(pgid, signal)`; `ESRCH` (group already gone) is `Ok`. Refuses `pgid <= 1` and the
+/// app's own group (`InvalidInput`).
 pub fn killpg(pgid: i32, signal: i32) -> std::io::Result<()> {
-    // 0 would signal our own group and 1 is launchd: never the group of a turn.
-    if pgid <= 1 {
+    // 0 would signal our own group and 1 is launchd: never the group of a turn, which leads
+    // its own group (`process_group(0)`).
+    // SAFETY: getpgrp has no preconditions and cannot fail.
+    if pgid <= 1 || pgid == unsafe { libc::getpgrp() } {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("invalid process group {pgid}"),

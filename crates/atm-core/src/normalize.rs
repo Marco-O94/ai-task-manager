@@ -26,6 +26,9 @@ pub const TYPING_INTERVAL_MS: Millis = 100;
 pub const MAX_REASON: usize = 512;
 /// Bash summaries keep the first line of the command, at most this many characters.
 pub const MAX_BASH_SUMMARY: usize = 200;
+/// `ToolCall.summary` and `ToolCall.name` cap: one-line fields cloned into every upsert. Fits
+/// a full Bash summary ("$ " + 200 four-byte chars).
+pub const MAX_SUMMARY: usize = 1 << 10;
 
 /// Case-insensitive substrings of a failed `result` (subtype, text) and their class, checked
 /// in order (spec §7.6: "Not logged in", "/login", "Login expired", "limit",
@@ -39,10 +42,9 @@ pub const LIMIT_PATTERNS: &[(&str, LimitKind)] = &[
     ("limit", LimitKind::UsageLimit),
 ];
 
-/// Case-insensitive substring of the CLI's stderr (or failed `result` text) when `--resume`
-/// names a session it cannot find (spec §7.9). The [`Normalizer`] itself then adds, once per
-/// turn, a warning Notice with [`NoticeAction::NewSession`]: the runner does not add another.
-/// M5 checks it against the real CLI.
+/// Case-insensitive substring of the CLI's stderr (or `result` text) when `--resume` names a
+/// session it cannot find (spec §7.9): the runner then adds a Notice with
+/// [`NoticeAction::NewSession`]. M5 checks it against the real CLI.
 pub const RESUME_FAILED_PATTERN: &str = "no conversation found";
 
 /// `apiKeySource` values of `system/init` that mean "no API key" (subscription login); any
@@ -51,8 +53,6 @@ pub const NO_API_KEY_SOURCES: &[&str] = &["none"];
 
 /// Notice texts (Italian, shown as is).
 pub const COMPACTED_NOTICE: &str = "Contesto compattato";
-pub const RESUME_FAILED_NOTICE: &str =
-    "La sessione precedente non è stata trovata dal CLI: avvia una nuova sessione.";
 
 const ELLIPSIS: &str = "…";
 const OUTPUT_SEPARATOR: &str = "\n…\n";
@@ -176,7 +176,7 @@ fn relative(path: &str, worktree: &str) -> String {
     }
 }
 
-/// The `RESUME_FAILED_PATTERN` test (case-insensitive).
+/// The [`RESUME_FAILED_PATTERN`] test (case-insensitive), for the runner's Notice.
 pub fn is_resume_failure(text: &str) -> bool {
     text.to_lowercase().contains(RESUME_FAILED_PATTERN)
 }
@@ -205,7 +205,7 @@ pub fn parse_result(line: &Value) -> Option<TurnResult> {
     if line["type"] != "result" {
         return None;
     }
-    let subtype = str_of(line, "subtype").unwrap_or_default().to_owned();
+    let subtype = cap(str_of(line, "subtype").unwrap_or_default(), MAX_TEXT);
     let is_error = line["is_error"].as_bool().unwrap_or(false);
     let text = match (&line["result"], line["errors"].as_array()) {
         (Value::String(s), _) => Some(s.clone()),
@@ -238,7 +238,8 @@ pub fn parse_result(line: &Value) -> Option<TurnResult> {
     })
 }
 
-/// One-line summary of a tool call (spec §7.6 table); paths relative to `worktree`.
+/// One-line summary of a tool call (spec §7.6 table), at most [`MAX_SUMMARY`] bytes; paths
+/// relative to `worktree`.
 pub fn tool_summary(name: &str, input: &Value, worktree: &str) -> String {
     let s = |key| str_of(input, key).unwrap_or_default();
     let path = |key| relative(s(key), worktree);
@@ -273,7 +274,7 @@ pub fn tool_summary(name: &str, input: &Value, worktree: &str) -> String {
             None => name.to_owned(),
         },
     };
-    one_line(&summary)
+    cap(&one_line(&summary), MAX_SUMMARY)
 }
 
 /// Tool input as JSON text within `max` bytes.
@@ -356,7 +357,6 @@ pub struct Normalizer {
     stderr: Option<OpenStderr>,
     typing: String,
     typing_at: Option<Millis>,
-    resume_failed: bool,
 }
 
 impl Normalizer {
@@ -373,7 +373,6 @@ impl Normalizer {
             stderr: None,
             typing: String::new(),
             typing_at: None,
-            resume_failed: false,
         }
     }
 
@@ -426,18 +425,6 @@ impl Normalizer {
         self.typing.clear();
         self.typing_at = None;
         EntryOp::Typing(None)
-    }
-
-    fn resume_failed_notice(&mut self, ts: Millis) -> Vec<EntryOp> {
-        if std::mem::replace(&mut self.resume_failed, true) {
-            return Vec::new();
-        }
-        self.on_notice(
-            Level::Warn,
-            RESUME_FAILED_NOTICE,
-            Some(NoticeAction::NewSession),
-            ts,
-        )
     }
 
     /// `UserMessage` for the prompt sent on stdin.
@@ -521,9 +508,10 @@ impl Normalizer {
     /// New `ToolCall{Running}`, or the merge into the one created by `can_use_tool`.
     fn tool_use(&mut self, block: &Value, parent: Option<String>, ts: Millis) -> Option<EntryOp> {
         let id = str_of(block, "id")?;
-        let name = str_of(block, "name").unwrap_or_default().to_owned();
+        let name = str_of(block, "name").unwrap_or_default();
         let input = &block["input"];
-        let summary = tool_summary(&name, input, &self.worktree);
+        let summary = tool_summary(name, input, &self.worktree);
+        let name = cap(name, MAX_SUMMARY);
         if let Some(t) = self.tools.get_mut(id) {
             let input = render_input(
                 input,
@@ -590,7 +578,8 @@ impl Normalizer {
     }
 
     fn session_init(&mut self, line: &Value, ts: Millis) -> EntryOp {
-        let api_key_source = str_of(line, "apiKeySource").map(str::to_owned);
+        let text = |key| str_of(line, key).map(|s| cap(s, MAX_TEXT));
+        let api_key_source = text("apiKeySource");
         let mut warnings = Vec::new();
         if let Some(source) = &api_key_source
             && !NO_API_KEY_SOURCES
@@ -611,13 +600,13 @@ impl Normalizer {
             ));
         }
         let body = EntryBody::SessionInit {
-            model: str_of(line, "model").map(str::to_owned),
-            permission_mode: str_of(line, "permissionMode").map(str::to_owned),
+            model: text("model"),
+            permission_mode: text("permissionMode"),
             api_key_source,
             mcp_servers: line["mcp_servers"]
                 .as_array()
                 .map_or(0, |s| u32::try_from(s.len()).unwrap_or(u32::MAX)),
-            warnings,
+            warnings: warnings.iter().map(|w| cap(w, MAX_TEXT)).collect(),
         };
         self.push(ts, None, body)
     }
@@ -657,7 +646,6 @@ impl Normalizer {
         let Some(r) = parse_result(line) else {
             return Vec::new();
         };
-        let resume_failed = r.is_error && r.text.as_deref().is_some_and(is_resume_failure);
         let body = EntryBody::TurnEnd {
             subtype: r.subtype,
             is_error: r.is_error,
@@ -668,18 +656,12 @@ impl Normalizer {
             text: r.text,
             limit: r.limit,
         };
-        let mut ops = vec![self.push(ts, None, body)];
-        if resume_failed {
-            ops.extend(self.resume_failed_notice(ts));
-        }
-        ops.push(self.clear_typing());
-        ops
+        vec![self.push(ts, None, body), self.clear_typing()]
     }
 
     /// One stderr line (ANSI stripped, merged with the previous one if < 2 s apart).
     pub fn on_stderr(&mut self, line: &str, ts: Millis) -> Vec<EntryOp> {
         let line = strip_ansi(line);
-        let mut ops = Vec::new();
         let open = self.stderr.as_mut().filter(|s| {
             ts - s.last < STDERR_MERGE_MS && s.text.len() + 1 + line.len() <= MAX_STDERR_ENTRY
         });
@@ -699,18 +681,13 @@ impl Normalizer {
                 last: ts,
             });
         } else {
-            return ops;
+            return Vec::new();
         }
-        if let Some(s) = &self.stderr {
-            let body = EntryBody::Stderr {
-                text: s.text.clone(),
-            };
-            ops.push(EntryOp::Upsert(self.entry(s.idx, s.rev, s.ts, None, body)));
-        }
-        if is_resume_failure(&line) {
-            ops.extend(self.resume_failed_notice(ts));
-        }
-        ops
+        let s = self.stderr.as_ref().expect("the open entry was just set");
+        let body = EntryBody::Stderr {
+            text: s.text.clone(),
+        };
+        vec![EntryOp::Upsert(self.entry(s.idx, s.rev, s.ts, None, body))]
     }
 
     /// The matching `ToolCall` → `AwaitingApproval`; created from `request` (the
@@ -738,14 +715,14 @@ impl Normalizer {
             (t.status, t.input, t.asked) = (status, rendered, true);
             t.rev += 1;
         } else {
-            let name = str_of(request, "tool_name").unwrap_or_default().to_owned();
+            let name = str_of(request, "tool_name").unwrap_or_default();
             let tool = Tool {
                 idx: self.alloc_idx(),
                 rev: 0,
                 ts,
                 parent: None,
-                summary: tool_summary(&name, input, &self.worktree),
-                name,
+                summary: tool_summary(name, input, &self.worktree),
+                name: cap(name, MAX_SUMMARY),
                 input: rendered,
                 status,
                 output: None,

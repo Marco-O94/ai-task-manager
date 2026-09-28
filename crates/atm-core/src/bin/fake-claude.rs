@@ -6,7 +6,8 @@
 //! - `-p …` (stream-json on stdin/stdout): appends one JSON line per call to
 //!   `$FAKE_CLAUDE_RECORD`: `{"kind":"call","argv":[…without argv0],"cwd":…,"pwd":…,
 //!   "env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for every
-//!   answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`).
+//!   answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`), and
+//!   `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`.
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
 //!   `[fake:NAME]` in its text, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
 //!   An interrupt is answered with success plus a `result` `error_during_execution`
@@ -236,7 +237,8 @@ impl Session {
                 exit(1);
             }
             "hang_ignore" => {
-                ignore_sigterm_with_grandchild();
+                let pid = ignore_sigterm_with_grandchild();
+                self.record(json!({"kind": "grandchild", "pid": pid}));
                 self.init();
             }
             _ => self.init(),
@@ -508,19 +510,26 @@ fn control_success(request_id: &str, response: Value) -> Value {
            "response": {"subtype": "success", "request_id": request_id, "response": response}})
 }
 
-/// Ignores SIGTERM, then starts `sleep 300` in the same process group: the ignore is
-/// inherited across exec, so only SIGKILL of the whole group ends both.
-fn ignore_sigterm_with_grandchild() {
+/// Ignores SIGTERM, then starts `sleep 300` in the same process group and returns its pid:
+/// the ignore is inherited across exec, so only SIGKILL of the whole group ends both.
+fn ignore_sigterm_with_grandchild() -> u32 {
     // SAFETY: changes this process's disposition of one signal; no handler code runs.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
-    let _ = Command::new("sleep")
+    let spawned = Command::new("sleep")
         .arg("300")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
+    match spawned {
+        Ok(child) => child.id(),
+        Err(e) => {
+            eprintln!("fake-claude: sleep not started: {e}");
+            exit(1);
+        }
+    }
 }
 
 /// Host frames, one JSON value per stdin line; the channel closes at EOF.

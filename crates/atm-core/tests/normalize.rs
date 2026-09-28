@@ -548,48 +548,44 @@ fn other_system_and_unknown_lines_yield_nothing() {
     }
 }
 
+/// The runner, not the normalizer, adds the `NewSession` Notice (M1 contract of
+/// `RESUME_FAILED_PATTERN`): the normalizer only records stderr and the `TurnEnd`.
 #[test]
-fn resume_failure_adds_one_new_session_notice() {
+fn resume_failure_is_detected_and_left_to_the_runner() {
+    let stderr = "No conversation found with session ID: 3f1c2b9e";
+    assert!(normalize::is_resume_failure(stderr));
+    assert!(!normalize::is_resume_failure("Error: rate limited"));
+
     let mut n = normalizer();
-    let mut ops = n.on_stderr("No conversation found with session ID: 3f1c2b9e", 1000);
+    let mut ops = n.on_stderr(stderr, 1000);
     ops.extend(n.on_line(
         &json!({"type":"result","subtype":"error_during_execution","is_error":true,
-                "result":"No conversation found with session ID: 3f1c2b9e"}),
+                "result":stderr}),
         1100,
     ));
-    insta::assert_json_snapshot!(view(ops));
-    let notices: Vec<_> = n
-        .on_stderr("no conversation found again", 5000)
-        .into_iter()
-        .filter(|op| {
-            matches!(
-                op,
-                EntryOp::Upsert(Entry {
-                    body: EntryBody::Notice { .. },
-                    ..
-                })
-            )
+    let kinds: Vec<_> = upserts(&ops)
+        .iter()
+        .map(|e| match e.body {
+            EntryBody::Stderr { .. } => "Stderr",
+            EntryBody::TurnEnd { .. } => "TurnEnd",
+            _ => "other",
         })
         .collect();
-    assert!(notices.is_empty());
+    assert_eq!(kinds, ["Stderr", "TurnEnd"]);
 
-    // A successful result that merely mentions the phrase is not a failure.
-    let mut n = normalizer();
-    let ops = n.on_line(
-        &json!({"type":"result","subtype":"success","is_error":false,
-                "result":"I added the 'No conversation found' error message."}),
-        1000,
+    let ops = n.on_notice(
+        Level::Warn,
+        "Sessione non trovata",
+        Some(NoticeAction::NewSession),
+        1200,
     );
-    assert!(!ops.iter().any(|op| matches!(
-        op,
-        EntryOp::Upsert(Entry {
-            body: EntryBody::Notice {
-                action: Some(NoticeAction::NewSession),
-                ..
-            },
+    assert!(matches!(
+        &upserts(&ops)[0].body,
+        EntryBody::Notice {
+            action: Some(NoticeAction::NewSession),
             ..
-        })
-    )));
+        }
+    ));
 }
 
 #[test]
@@ -672,6 +668,67 @@ fn tool_summaries() {
     let bash = &summaries[1].1;
     assert_eq!(bash.chars().count(), 2 + normalize::MAX_BASH_SUMMARY);
     assert!(summaries.iter().all(|(_, s)| !s.contains('\n')));
+
+    // A full Bash summary of four-byte chars still fits.
+    let emoji = "\u{1F600}".repeat(300);
+    let bash = normalize::tool_summary("Bash", &json!({"command":emoji}), WT);
+    assert_eq!(bash.chars().count(), 2 + normalize::MAX_BASH_SUMMARY);
+}
+
+#[test]
+fn oversized_summaries_names_and_init_fields_are_capped() {
+    let huge = "a".repeat(1 << 20);
+    for (name, input) in [
+        ("Grep", json!({"pattern":huge})),
+        ("Glob", json!({"pattern":huge})),
+        ("WebFetch", json!({"url":huge})),
+        ("WebSearch", json!({"query":huge})),
+        ("Task", json!({"description":huge})),
+        ("Read", json!({"file_path":huge})),
+        (huge.as_str(), json!({})),
+    ] {
+        let summary = normalize::tool_summary(name, &input, WT);
+        assert!(summary.len() <= normalize::MAX_SUMMARY, "{}", &name[..4]);
+        assert!(summary.ends_with('…'));
+    }
+
+    let mut n = normalizer();
+    let ops = n.on_line(&tool_use("t1", &huge, json!({"pattern":huge})), 1000);
+    let EntryBody::ToolCall { name, summary, .. } = &upserts(&ops)[0].body else {
+        panic!()
+    };
+    assert!(name.len() <= normalize::MAX_SUMMARY && summary.len() <= normalize::MAX_SUMMARY);
+    let ops = n.on_approval_requested(
+        "a1",
+        &can_use_tool("t2", &huge, json!({}), Value::Null),
+        false,
+        1000,
+    );
+    let EntryBody::ToolCall { name, .. } = &upserts(&ops)[0].body else {
+        panic!()
+    };
+    assert!(name.len() <= normalize::MAX_SUMMARY);
+
+    let huge_text = "b".repeat(normalize::MAX_TEXT * 2);
+    let init = json!({"type":"system","subtype":"init","cwd":huge_text,"session_id":"s",
+        "model":huge_text,"permissionMode":huge_text,"apiKeySource":huge_text});
+    let ops = n.on_line(&init, 1000);
+    let EntryBody::SessionInit {
+        model,
+        permission_mode,
+        api_key_source,
+        warnings,
+        ..
+    } = &upserts(&ops)[0].body
+    else {
+        panic!()
+    };
+    let fields = [model, permission_mode, api_key_source].map(|f| f.as_ref().unwrap());
+    assert!(fields.iter().all(|f| f.len() <= normalize::MAX_TEXT));
+    assert_eq!(warnings.len(), 2);
+    assert!(warnings.iter().all(|w| w.len() <= normalize::MAX_TEXT));
+    let result = json!({"type":"result","subtype":huge_text,"is_error":false});
+    assert!(normalize::parse_result(&result).unwrap().subtype.len() <= normalize::MAX_TEXT);
 }
 
 // ---- whole fixture turns, routed as the runner does -------------------------------------------

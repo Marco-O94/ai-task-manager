@@ -17,6 +17,7 @@ pub const STDIN_CHANNEL: usize = 64;
 pub const DENY_PREFIX: &str = "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: ";
 /// Deny message for `AskUserQuestion`, which is disallowed in v1 but may still arrive.
 pub const ASK_USER_QUESTION_DENY: &str = "Ask your question in plain text in your reply instead.";
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
 
 /// Outcome of [`read_line_capped`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,9 @@ pub enum Line {
 
 /// Reads one line into `buf` (cleared first) using `fill_buf`/`consume`; past `max` bytes
 /// discards the rest of the line and returns `TooLong` so the caller keeps reading.
+///
+/// Not cancel-safe: bytes are consumed as they are read, so dropping the future mid-line
+/// loses that line's head. Drive it from a dedicated reader task, never from a `select!` arm.
 pub async fn read_line_capped<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
@@ -284,7 +288,7 @@ pub fn can_remember(suggestions: &Value) -> bool {
 /// [`ASK_USER_QUESTION_DENY`]. `remember` is ignored unless [`can_remember`] holds, so a
 /// whole-tool rule is never sent.
 pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Value {
-    let response = if pending.tool_name == "AskUserQuestion" {
+    let response = if pending.tool_name == ASK_USER_QUESTION {
         json!({"behavior": "deny", "message": ASK_USER_QUESTION_DENY, "interrupt": false})
     } else {
         match decision {
@@ -310,9 +314,9 @@ pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Valu
 }
 
 /// `Tool(ruleContent)` strings added to `attempts.allow_rules` on "Consenti sempre"; empty
-/// unless [`can_remember`] holds.
+/// unless [`can_remember`] holds, and always for `AskUserQuestion` (always denied).
 pub fn remembered_rules(pending: &Pending) -> Vec<String> {
-    if !can_remember(&pending.suggestions) {
+    if pending.tool_name == ASK_USER_QUESTION || !can_remember(&pending.suggestions) {
         return Vec::new();
     }
     let rules = pending.suggestions.as_array().into_iter().flatten();
