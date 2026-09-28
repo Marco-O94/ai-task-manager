@@ -1,7 +1,7 @@
 //! End-to-end flows of `Core` (spec §11.2 M3-CORE): fake-claude as the CLI (configured per
 //! Core through `CoreConfig::extra_env`), temporary repos, and sinks that record every app
 //! event and transcript message. Waits are event-driven with generous bounds; only process
-//! reaping by launchd, which no event announces, is polled.
+//! deaths and reaping, which no event announces, are polled.
 
 mod common;
 
@@ -129,15 +129,14 @@ struct Flow {
 impl Flow {
     /// Hermetic git configuration plus `extra`.
     async fn new(extra: &[(&str, &str)]) -> Flow {
-        let mut env = vars(&[
-            ("GIT_CONFIG_GLOBAL", "/dev/null"),
-            ("GIT_CONFIG_NOSYSTEM", "1"),
-        ]);
-        env.extend(vars(extra));
-        Flow::setup(common::tempdir(), env).await
+        Flow::setup(common::tempdir(), hermetic(extra), common::fake_claude()).await
     }
 
-    async fn setup(dir: tempfile::TempDir, mut env: Vec<(OsString, OsString)>) -> Flow {
+    async fn setup(
+        dir: tempfile::TempDir,
+        mut env: Vec<(OsString, OsString)>,
+        claude: PathBuf,
+    ) -> Flow {
         let repo = common::init_repo(&dir.path().join("repo"));
         env.push((
             "FAKE_CLAUDE_RECORD".into(),
@@ -146,7 +145,7 @@ impl Flow {
         let config = CoreConfig {
             data_dir: dir.path().join("data"),
             cache_dir: dir.path().join("cache"),
-            claude_path: Some(common::fake_claude()),
+            claude_path: Some(claude),
             path_env: Some(std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into())),
             extra_env: env,
         };
@@ -213,10 +212,18 @@ impl Flow {
     }
 
     async fn try_start(&self, task: &Task) -> Result<AttemptView, AppError> {
+        self.try_start_as(task, PermissionMode::AcceptEdits).await
+    }
+
+    async fn try_start_as(
+        &self,
+        task: &Task,
+        permission_mode: PermissionMode,
+    ) -> Result<AttemptView, AppError> {
         let req = StartAttemptReq {
             task_id: task.id.clone(),
             target_branch: "main".into(),
-            permission_mode: PermissionMode::AcceptEdits,
+            permission_mode,
             model: None,
             effort: None,
         };
@@ -307,6 +314,16 @@ fn vars(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
     pairs.iter().map(|(k, v)| (k.into(), v.into())).collect()
 }
 
+/// No user or system gitconfig, plus `extra`.
+fn hermetic(extra: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    let mut env = vars(&[
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    env.extend(vars(extra));
+    env
+}
+
 /// Value of `--flag=value` in an argv.
 fn flag<'a>(argv: &'a [String], name: &str) -> Option<&'a str> {
     argv.iter().find_map(|a| a.strip_prefix(name))
@@ -368,6 +385,31 @@ async fn eventually(what: &str, limit: Duration, cond: impl Fn() -> bool) {
     }
 }
 
+/// Blocking [`eventually`], for code outside any runtime.
+fn eventually_blocking(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + limit;
+    while !cond() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Reaps our child `pid` that a dropped or leaked runtime left behind: its pid, or -1 if
+/// tokio's orphan reaper got it first. Panics if it is still alive after 10 s.
+fn reap(pid: i32) -> i32 {
+    let mut reaped = 0;
+    eventually_blocking("the agent to be killed", Duration::from_secs(10), || {
+        let mut status = 0;
+        // SAFETY: a non-blocking wait for our own child; `status` outlives the call.
+        reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        reaped != 0
+    });
+    reaped
+}
+
 // ---- flows --------------------------------------------------------------------------------
 
 /// start → worktree → Snapshot → entries → pending approval → Allow{remember} → allow_rules
@@ -377,7 +419,7 @@ async fn eventually(what: &str, limit: Duration, cond: impl Fn() -> bool) {
 async fn ordered_flow_from_start_to_merge() {
     let dir = common::tempdir();
     let hostile = common::Hostile::new(&dir.path().join("hostile"));
-    let f = Flow::setup(dir, hostile.env.clone()).await;
+    let f = Flow::setup(dir, hostile.env.clone(), common::fake_claude()).await;
     let task = f
         .task("Crea hello", "Scrivi hello.txt [fake:approval]")
         .await;
@@ -791,17 +833,42 @@ async fn usage_limit_pauses_new_turns_until_resumed() {
     assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
 }
 
-/// A login failure in `result`: failed / auth_failure, the auth cache is dropped and
-/// `env_changed` carries a status checked again after the turn.
+/// A login failure in `result`: failed / auth_failure, and `auth status` runs again for the
+/// `env_changed` after the turn, while a normal turn reuses the cached status (60 s). The CLI
+/// is a wrapper around fake-claude that counts the `auth status` calls.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auth_failure_invalidates_the_env() {
-    let f = Flow::new(&[]).await;
+    let dir = common::tempdir();
+    let calls = dir.path().join("auth-status.calls");
+    let claude = dir.path().join("bin/claude");
+    common::script(
+        &claude,
+        &format!(
+            "[ \"$1 $2\" = 'auth status' ] && echo >> '{}'\nexec '{}' \"$@\"",
+            calls.display(),
+            common::fake_claude().display()
+        ),
+    );
+    let f = Flow::setup(dir, hermetic(&[]), claude).await;
+    let auth_checks = || std::fs::read_to_string(&calls).map_or(0, |s| s.lines().count());
+    let checked_at_startup = auth_checks();
+    assert!(checked_at_startup >= 1);
+    let envs = || -> Vec<EnvStatus> {
+        let events = f.seen.events();
+        events
+            .into_iter()
+            .filter_map(|e| match e {
+                AppEvent::EnvChanged(env) => Some(env),
+                AppEvent::Changed(_) => None,
+            })
+            .collect()
+    };
+
     let task = f.task("Login", "[fake:auth_fail]").await;
     let attempt = f.start(&task).await;
     let d = f.turn_end(&task.id, 1, TURN).await;
-    let turn = &d.processes[0];
     assert_eq!(
-        state(turn),
+        state(&d.processes[0]),
         (ProcessStatus::Failed, Some(StopReason::AuthFailure))
     );
     let entries = f.entries(&attempt.id).await;
@@ -812,21 +879,25 @@ async fn auth_failure_invalidates_the_env() {
             ..
         }
     )));
-    let last_env = || {
-        f.seen.events().into_iter().rev().find_map(|e| match e {
-            AppEvent::EnvChanged(env) => Some(env),
-            AppEvent::Changed(_) => None,
-        })
-    };
     f.seen
         .until("env_changed after the turn", TURN, async || {
-            last_env().is_some_and(|env| env.running == 0)
+            envs().iter().map(|env| env.running).eq([1, 0])
         })
         .await;
-    let env = last_env().unwrap();
-    assert!(env.checked_at >= turn.finished_at.unwrap());
+    assert_eq!(auth_checks(), checked_at_startup + 1);
+    let env = envs().pop().unwrap();
     assert!(matches!(env.auth, AuthState::LoggedIn { .. }));
     assert_eq!(env.paused, None);
+
+    f.follow_up(&attempt.id, "Riprova [fake:simple]", false)
+        .await;
+    f.turn_end(&task.id, 2, TURN).await;
+    f.seen
+        .until("env_changed after the second turn", TURN, async || {
+            envs().iter().map(|env| env.running).eq([1, 0, 1, 0])
+        })
+        .await;
+    assert_eq!(auth_checks(), checked_at_startup + 1);
 }
 
 /// `max_running = 2`: the third start is refused before any worktree; shutdown stops both
@@ -878,6 +949,72 @@ async fn logged_out_refuses_to_start_without_spawning() {
     assert_eq!((d.task.status, d.attempt), (TaskStatus::Todo, None));
 }
 
+/// Bypass needs the project's `allow_bypass` on every path, and a revoked one also stops the
+/// attempt's next turns. The agent's environment lacks the credentials, nesting and git
+/// variables of the app's own, and its `PWD` is the worktree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bypass_needs_the_project_setting_and_the_env_is_scrubbed() {
+    let f = Flow::new(&[
+        ("ANTHROPIC_API_KEY", "sk-ant-test"),
+        ("CLAUDECODE", "1"),
+        ("GIT_DIR", "/nonexistent"),
+    ])
+    .await;
+    let bypass = PermissionMode::BypassPermissions;
+    let task = f.task("Autonomo", "[fake:simple]").await;
+    let err = f.try_start_as(&task, bypass).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert_eq!(f.worktrees(), 0);
+    let update = UpdateProjectReq {
+        id: f.project.id.clone(),
+        name: f.project.name.clone(),
+        default_target_branch: f.project.default_target_branch.clone(),
+        default_permission_mode: bypass,
+        default_model: None,
+    };
+    let err = f.core.update_project(update).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+
+    let security = |allow_bypass| SetProjectSecurityReq {
+        id: f.project.id.clone(),
+        config_policy: ConfigPolicy::Isolated,
+        allow_bypass,
+    };
+    f.core.set_project_security(security(true)).await.unwrap();
+    let attempt = f.try_start_as(&task, bypass).await.unwrap();
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    let call = f
+        .record()
+        .into_iter()
+        .find(|r| r["kind"] == "call")
+        .unwrap();
+    let argv: Vec<String> = serde_json::from_value(call["argv"].clone()).unwrap();
+    assert!(
+        argv.contains(&"--permission-mode=bypassPermissions".to_owned()),
+        "{argv:?}"
+    );
+    for var in ["ANTHROPIC_API_KEY", "CLAUDECODE", "GIT_DIR"] {
+        assert_eq!(call["env"][var], false, "{var} reached the agent");
+    }
+    assert_eq!(call["pwd"], attempt.worktree_path.as_str());
+    let env = f.core.get_env(GetEnvReq { force: false }).await.unwrap();
+    assert!(env.api_key_in_env);
+
+    f.core.set_project_security(security(false)).await.unwrap();
+    for permission_mode in [None, Some(bypass)] {
+        let req = SendFollowUpReq {
+            attempt_id: attempt.id.clone(),
+            prompt: "Ancora [fake:simple]".into(),
+            permission_mode,
+            fresh_session: false,
+        };
+        let err = f.core.send_follow_up(req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{permission_mode:?}");
+    }
+    assert_eq!(f.calls().len(), 1);
+}
+
 /// A failed `--resume` offers "Nuova sessione" once; `fresh_session` starts a new session
 /// with the task and the attempt's commits in the prompt.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -925,12 +1062,66 @@ async fn failed_resume_offers_a_fresh_session() {
     assert!(prompt.ends_with("Da capo [fake:simple]"), "{prompt}");
 }
 
+/// The runtime is dropped mid-turn: the turn's future kills the agent's whole group, the
+/// grandchild `sleep` included (the leader alone would get `kill_on_drop`). The next Core
+/// marks the turn failed/app_restart and moves the task to inreview.
+#[test]
+fn runtime_dropped_mid_turn_kills_the_group() {
+    let first = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (f, task, pgid, grandchild) = first.block_on(async {
+        let f = Flow::new(&[]).await;
+        let task = f.task("Interrotto", "[fake:hang_ignore]").await;
+        let attempt = f.start(&task).await;
+        f.subscribe(&attempt.id).await;
+        f.entry("system/init", is_session_init).await;
+        let pgid = f.db().attempt_processes(&attempt.id).unwrap()[0]
+            .pid
+            .unwrap();
+        let grandchild = f
+            .record()
+            .iter()
+            .find_map(|r| (r["kind"] == "grandchild").then(|| r["pid"].as_i64()))
+            .flatten()
+            .unwrap() as i32;
+        (f, task, pgid, grandchild)
+    });
+    assert!(claude::group_alive(pgid) && claude::pid_alive(grandchild));
+    drop(first);
+    reap(pgid);
+    eventually_blocking("the group to vanish", Duration::from_secs(5), || {
+        !claude::group_alive(pgid) && !claude::pid_alive(grandchild)
+    });
+
+    let second = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    second.block_on(async {
+        let core = Core::new(f.config.clone(), Seen::new().notify()).unwrap();
+        core.startup().await.unwrap();
+        let d = core
+            .get_task_detail(IdReq {
+                id: task.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            state(&d.processes[0]),
+            (ProcessStatus::Failed, Some(StopReason::AppRestart))
+        );
+        assert_eq!(d.task.status, TaskStatus::InReview);
+    });
+}
+
 /// The app vanishes mid-turn without running any destructor (its runtime is leaked, never
 /// polled again: its agent keeps running). The next Core marks the turn failed/app_restart,
 /// kills the group after verifying it with `ps`, moves the task to inreview, and "Continua"
 /// resumes the session.
 #[test]
-fn runtime_dropped_mid_turn_is_recovered_by_the_next_core() {
+fn app_vanished_mid_turn_is_recovered_by_the_next_core() {
     let first = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -969,13 +1160,9 @@ fn runtime_dropped_mid_turn_is_recovered_by_the_next_core() {
             (ProcessStatus::Failed, Some(StopReason::AppRestart))
         );
         // The leaked runtime never reaps its child: do it here, then the whole group is gone.
-        let reaped = tokio::task::spawn_blocking(move || {
-            let mut status = 0;
-            // SAFETY: waits for our own child process; `status` outlives the call.
-            unsafe { libc::waitpid(pgid, &mut status, 0) }
-        })
-        .await
-        .unwrap();
+        let reaped = tokio::task::spawn_blocking(move || reap(pgid))
+            .await
+            .unwrap();
         assert_eq!(reaped, pgid);
         eventually("the orphan group to vanish", Duration::from_secs(5), || {
             !claude::group_alive(pgid)

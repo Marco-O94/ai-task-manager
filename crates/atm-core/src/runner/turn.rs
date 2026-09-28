@@ -7,7 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use atm_types::{ApprovalDecision, Level, LimitKind, NoticeAction, ProcessStatus, StopReason};
+use atm_types::{
+    AppError, ApprovalDecision, Level, LimitKind, NoticeAction, ProcessStatus, StopReason,
+};
 use serde_json::Value;
 use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc;
@@ -16,7 +18,7 @@ use tokio::time::{Instant, sleep_until};
 
 use super::{
     CappedLog, Cmd, EXIT_AFTER_RESULT, INIT_TIMEOUT, MAX_STDERR_LOG, MAX_STDOUT_LOG, StopCause,
-    StopTimings, TurnOutcome, TurnParts, TurnPlan, classify, log_dir, not_pending,
+    StopTimings, TurnHandle, TurnOutcome, TurnPlan, classify, log_dir, not_pending,
 };
 use crate::claude;
 use crate::db::ProcessFinish;
@@ -43,6 +45,19 @@ enum Io {
     StderrTooLong(usize),
 }
 
+/// SIGKILL to the turn's group if `drive` never completes: its future dropped (runtime
+/// shutdown) or unwinding. `kill_on_drop` reaches the leader only, and startup recovery
+/// verifies the leader, which is dead by then.
+struct KillGroupOnDrop(Option<i32>);
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            let _ = claude::killpg(pgid, libc::SIGKILL);
+        }
+    }
+}
+
 /// Stop sequence phases (spec §7.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
@@ -54,7 +69,12 @@ enum Step {
 
 /// Body of the task spawned by `Inner::launch`: runs the turn, finalizes it, leaves the
 /// registry.
-pub(super) async fn run_turn(inner: Arc<Inner>, plan: TurnPlan, parts: TurnParts) {
+pub(super) async fn run_turn(
+    inner: Arc<Inner>,
+    plan: TurnPlan,
+    handle: Arc<TurnHandle>,
+    cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+) {
     let normalizer = Normalizer::new(
         plan.process.id.clone(),
         plan.next_idx,
@@ -64,7 +84,8 @@ pub(super) async fn run_turn(inner: Arc<Inner>, plan: TurnPlan, parts: TurnParts
         inner,
         plan,
         normalizer,
-        parts,
+        handle,
+        cmd_rx,
         stdout_log: None,
         stderr_log: None,
         requests: 0,
@@ -105,7 +126,8 @@ struct Turn {
     inner: Arc<Inner>,
     plan: TurnPlan,
     normalizer: Normalizer,
-    parts: TurnParts,
+    handle: Arc<TurnHandle>,
+    cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     stdout_log: Option<CappedLog>,
     stderr_log: Option<CappedLog>,
     /// Host requests sent so far (`atm_<n>_…` ids).
@@ -278,6 +300,9 @@ impl Turn {
             stdout,
             stderr,
         } = spawned;
+        // Declared after `child`, so dropped before it: the pgid is still held by the unreaped
+        // leader, or by the residual group while it has members.
+        let mut group = KillGroupOnDrop(Some(pgid));
         let process = &self.plan.process;
         if let Err(e) =
             self.inner
@@ -322,12 +347,13 @@ impl Turn {
                     // The agent's background jobs end with the turn (spec §7.4 step 4).
                     let _ = claude::killpg(pgid, libc::SIGTERM);
                 }
-                Some(cmd) = self.parts.cmd_rx.recv() => self.on_cmd(cmd, &mut d),
+                Some(cmd) = self.cmd_rx.recv() => self.on_cmd(cmd, &mut d),
                 () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
                     self.on_deadline(&mut d);
                 }
             }
         }
+        group.0 = None;
         for reader in readers {
             reader.abort();
         }
@@ -418,7 +444,7 @@ impl Turn {
             }
             Inbound::ControlCancel { request_id } => {
                 let cancelled = {
-                    let mut pending = guard(&self.parts.handle.pending);
+                    let mut pending = guard(&self.handle.pending);
                     let id = pending
                         .values()
                         .find(|p| p.request_id == request_id)
@@ -440,7 +466,7 @@ impl Turn {
             }
             Inbound::Message(line) => {
                 if let Some(session) = normalize::init_session_id(&line) {
-                    self.on_session(session.to_owned(), d);
+                    self.on_session(session, d);
                 }
                 let result = normalize::parse_result(&line);
                 let ops = self.normalizer.on_line(&line, now_ms());
@@ -452,18 +478,24 @@ impl Turn {
         }
     }
 
-    /// `system/init`: `session_started = 1`, with the observed id if it differs.
-    fn on_session(&mut self, session: String, d: &mut Driver) {
+    /// `system/init`: `session_started = 1`, with the observed id if it differs. Only a UUID
+    /// is taken: it becomes the next `--resume=` and the proof of an orphan (spec §7.9).
+    fn on_session(&mut self, observed: &str, d: &mut Driver) {
         if std::mem::replace(&mut d.init_seen, true) {
             return;
         }
-        if session != self.plan.process.session_id {
-            let text = format!(
-                "Claude Code ha aperto la sessione {session} invece di {}",
-                self.plan.process.session_id
-            );
+        let expected = self.plan.process.session_id.clone();
+        let session = if observed == expected {
+            expected
+        } else if uuid::Uuid::parse_str(observed).is_ok() {
+            let text = format!("Claude Code ha aperto la sessione {observed} invece di {expected}");
             self.notice(Level::Warn, &text);
-        }
+            observed.to_owned()
+        } else {
+            let text = format!("Claude Code ha indicato una sessione non valida: resta {expected}");
+            self.notice(Level::Warn, &text);
+            expected
+        };
         if let Err(e) = self
             .inner
             .db
@@ -511,7 +543,7 @@ impl Turn {
         let ask = req.tool_name == ASK_USER_QUESTION;
         if !ask {
             // Registered before the entry is visible, so the card counts it at once.
-            guard(&self.parts.handle.pending).insert(approval_id.clone(), pending.clone());
+            guard(&self.handle.pending).insert(approval_id.clone(), pending.clone());
         }
         let can_remember = wire::can_remember(&req.permission_suggestions);
         let ops = self.normalizer.on_approval_requested(
@@ -544,12 +576,19 @@ impl Turn {
                 reply,
             } => (approval_id, decision, reply),
         };
-        let pending = guard(&self.parts.handle.pending).remove(&approval_id);
+        let pending = guard(&self.handle.pending).remove(&approval_id);
         let Some(pending) = pending.filter(|_| d.stdin.is_some()) else {
             let _ = reply.send(Err(not_pending()));
             return;
         };
-        d.send(wire::approval_response(&pending, &decision));
+        if !d.send(wire::approval_response(&pending, &decision)) {
+            // The CLI is not reading stdin: the approval stays pending for another try.
+            guard(&self.handle.pending).insert(approval_id, pending);
+            let _ = reply.send(Err(AppError::busy(
+                "Claude Code non sta ricevendo risposte: riprova tra poco",
+            )));
+            return;
+        }
         let ops = self
             .normalizer
             .on_approval_resolved(&approval_id, &decision);
@@ -628,7 +667,7 @@ impl Turn {
     /// Spec §7.7 step 8: open tools cancelled, auto-commit, HEAD check, process row, task,
     /// pause / auth, registry, events.
     async fn finalize(mut self, outcome: TurnOutcome) {
-        guard(&self.parts.handle.pending).clear();
+        guard(&self.handle.pending).clear();
         let ops = self.normalizer.finish(now_ms());
         self.publish(ops);
         let (status, stop_reason) = classify(&outcome);
@@ -693,10 +732,9 @@ impl Turn {
             Some(LimitKind::AuthFailure) => *inner.probe.lock().await = None,
             _ => {}
         }
-        inner.release(&ctx.attempt.id, &self.parts.handle);
+        inner.release(&ctx.attempt.id, &self.handle);
         inner.emit_changed(Some(&ctx.project.id), Some(&ctx.task.id));
         inner.emit_env().await;
-        let _ = self.parts.done_tx.send(true);
     }
 }
 

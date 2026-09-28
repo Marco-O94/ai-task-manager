@@ -177,8 +177,13 @@ impl Core {
     /// finalizes them (auto-commit included) within `deadline`. Best effort, never fails.
     pub async fn shutdown(&self, deadline: Duration) {
         let s = &self.inner;
-        s.closing.store(true, Ordering::SeqCst);
-        let turns: Vec<Arc<TurnHandle>> = guard(&s.turns).values().cloned().collect();
+        // Set under the registry lock that `reserve` checks it under: every slot is either in
+        // this snapshot or refused.
+        let turns: Vec<Arc<TurnHandle>> = {
+            let turns = guard(&s.turns);
+            s.closing.store(true, Ordering::SeqCst);
+            turns.values().cloned().collect()
+        };
         for turn in &turns {
             turn.stop(StopCause::Shutdown, StopTimings::SHUTDOWN);
         }
@@ -378,6 +383,12 @@ impl Core {
         let row = s.db.project(&req.id)?;
         let fingerprint = match req.config_policy {
             ConfigPolicy::Trusted => {
+                // Its fingerprint would read `~/.claude`, which the app never reads (§10.1).
+                if s.is_home(Path::new(&row.repo_path)) {
+                    return Err(AppError::invalid(
+                        "Un repository nella cartella home non può essere considerato attendibile",
+                    ));
+                }
                 Some(git::config_fingerprint(Path::new(&row.repo_path)).await?)
             }
             ConfigPolicy::Isolated => None,
@@ -408,18 +419,31 @@ impl Core {
     pub async fn remove_project(&self, req: IdReq) -> Result<(), AppError> {
         let s = &self.inner;
         let project = s.db.project(&req.id)?;
-        if guard(&s.turns).values().any(|t| t.project_id == req.id) {
-            return Err(AppError::busy(
-                "Ferma gli agenti del progetto prima di rimuoverlo",
-            ));
+        let busy = || AppError::busy("Ferma gli agenti del progetto prima di rimuoverlo");
+        let running =
+            |turns: &HashMap<Id, Arc<TurnHandle>>| turns.values().any(|t| t.project_id == req.id);
+        if running(&guard(&s.turns)) {
+            return Err(busy());
         }
         let git = s.git().await;
         for attempt in s.db.attempts_with_worktree(Some(&req.id))? {
             let _attempt = s.lock(attempt_key(&attempt.id)).await;
+            // A follow-up may have launched a turn while this waited for the lock.
+            if s.turn(&attempt.id).is_some() {
+                return Err(busy());
+            }
             let _repo = s.lock(repo_key(&project.repo_path)).await;
             tolerate_missing(s.remove_worktree(&git, &project.repo_path, &attempt).await)?;
         }
-        s.db.delete_project(&req.id)?;
+        {
+            // `start_attempt` reserves its slot before writing any row: checked together with
+            // the deletion, a new turn is either seen here or finds no project.
+            let turns = guard(&s.turns);
+            if running(&turns) {
+                return Err(busy());
+            }
+            s.db.delete_project(&req.id)?;
+        }
         s.emit_changed(None, None);
         Ok(())
     }
@@ -483,10 +507,12 @@ impl Core {
     pub async fn delete_task(&self, req: IdReq) -> Result<(), AppError> {
         let s = &self.inner;
         let task = s.db.task(&req.id)?;
+        let busy = || AppError::busy("Il task è in esecuzione: ferma l'agente prima di eliminarlo");
+        // Serialized with `start_attempt`; a follow-up is caught under its attempt's lock, and
+        // none can start on a removed worktree.
+        let _task = s.lock(task_key(&task.id)).await;
         if s.task_running(&task.id) {
-            return Err(AppError::busy(
-                "Il task è in esecuzione: ferma l'agente prima di eliminarlo",
-            ));
+            return Err(busy());
         }
         let project = s.db.project(&task.project_id)?;
         let git = s.git().await;
@@ -495,6 +521,9 @@ impl Core {
                 continue;
             }
             let _attempt = s.lock(attempt_key(&attempt.id)).await;
+            if s.turn(&attempt.id).is_some() {
+                return Err(busy());
+            }
             let _repo = s.lock(repo_key(&project.repo_path)).await;
             tolerate_missing(s.remove_worktree(&git, &project.repo_path, &attempt).await)?;
         }
@@ -532,7 +561,7 @@ impl Core {
         let task = s.db.task(&req.task_id)?;
         let project = s.db.project(&task.project_id)?;
         check_bypass(req.permission_mode, &project)?;
-        let _task = s.lock(format!("task:{}", task.id)).await;
+        let _task = s.lock(task_key(&task.id)).await;
         if s.db.active_attempt(&task.id)?.is_some() {
             return Err(AppError::conflict("Il task ha già un tentativo attivo"));
         }
@@ -559,6 +588,20 @@ impl Core {
                 .add_worktree(repo, &path, &branch, &base, &attempt_id)
                 .await?;
             (branch, worktree)
+        };
+        // The security settings as they are now, not as before the preflight and `worktree
+        // add`: a bypass revoked meanwhile must not reach the argv.
+        let fresh = s.db.project(&project.id).and_then(|p| {
+            check_bypass(req.permission_mode, &p)?;
+            Ok(p)
+        });
+        let project = match fresh {
+            Ok(project) => project,
+            Err(e) => {
+                s.undo_worktree(&git, &project.repo_path, &worktree, &branch)
+                    .await;
+                return Err(e);
+            }
         };
         let now = now_ms();
         let attempt = AttemptRow {
@@ -604,10 +647,8 @@ impl Core {
             })
             .await;
         if let Err(e) = s.db.begin_attempt(&ctx.attempt, &plan.process, now) {
-            let repo = Path::new(&ctx.project.repo_path);
-            let _repo = s.lock(repo_key(&ctx.project.repo_path)).await;
-            let _ = git.remove_worktree(repo, &worktree).await;
-            let _ = git.delete_branch(repo, &ctx.attempt.branch).await;
+            let (repo, branch) = (&ctx.project.repo_path, &ctx.attempt.branch);
+            s.undo_worktree(&git, repo, &worktree, branch).await;
             return Err(e);
         }
         s.emit_changed(Some(&ctx.project.id), Some(&ctx.task.id));
@@ -640,6 +681,9 @@ impl Core {
             .await?;
         let git = s.git().await;
         s.check_worktree(&git, &ctx).await?;
+        // The security settings as they are after the preflight (see `start_attempt`).
+        ctx.project = s.db.project(&ctx.project.id)?;
+        check_bypass(mode, &ctx.project)?;
         let worktree = Path::new(&ctx.attempt.worktree_path);
         let head_before = git.head(worktree).await.ok();
         let resume = ctx.attempt.session_started && !req.fresh_session;
@@ -828,6 +872,10 @@ impl Core {
             return Err(busy_turn());
         }
         let ctx = s.db.attempt_ctx(&req.attempt_id)?;
+        // A merge or another discard may have closed it while this waited.
+        if ctx.attempt.state != AttemptState::Active {
+            return Err(AppError::invalid("Il tentativo è già chiuso"));
+        }
         if ctx.attempt.worktree_state != WorktreeState::Removed {
             let git = s.git().await;
             let _repo = s.lock(repo_key(&ctx.project.repo_path)).await;
@@ -869,7 +917,7 @@ impl Core {
             OpenTarget::Terminal => vec!["-a".into(), "Terminal".into(), worktree],
             OpenTarget::Editor => vec!["-a".into(), s.db.settings()?.editor_app, worktree],
         };
-        open(&args).await
+        s.open(&args).await
     }
 
     /// `open <url>`. Errors: `Invalid` unless `http(s)`.
@@ -882,7 +930,7 @@ impl Core {
                 "Si possono aprire solo indirizzi http(s)",
             ));
         }
-        open(&[url.to_owned()]).await
+        self.inner.open(&[url.to_owned()]).await
     }
 }
 
@@ -1003,8 +1051,55 @@ impl Inner {
     }
 
     async fn lock(&self, key: String) -> OwnedMutexGuard<()> {
-        let mutex = Arc::clone(guard(&self.locks).entry(key).or_default());
+        let mutex = {
+            let mut locks = guard(&self.locks);
+            // Holders and waiters keep a clone: a key only the map owns is unused.
+            locks.retain(|_, m| Arc::strong_count(m) > 1);
+            Arc::clone(locks.entry(key).or_default())
+        };
         mutex.lock_owned().await
+    }
+
+    /// `dir` is the home directory (`HOME` as given or canonical).
+    fn is_home(&self, dir: &Path) -> bool {
+        let home = self.home();
+        dir == home || std::fs::canonicalize(&home).is_ok_and(|h| h == dir)
+    }
+
+    /// Removes the worktree and branch of an attempt whose rows were never written.
+    async fn undo_worktree(&self, git: &Git, repo: &str, worktree: &Path, branch: &str) {
+        let _repo = self.lock(repo_key(repo)).await;
+        let _ = git.remove_worktree(Path::new(repo), worktree).await;
+        let _ = git.delete_branch(Path::new(repo), branch).await;
+    }
+
+    /// `/usr/bin/open <args>` (argv, no shell). An app it launches inherits this environment
+    /// (open(1)), so credentials, nesting and git variables are removed as for every child.
+    async fn open(&self, args: &[String]) -> Result<(), AppError> {
+        let allow_api_key = self.db.settings()?.allow_env_api_key;
+        let scrubbed = |k: &str| {
+            claude::CLAUDE_NESTING_VARS.contains(&k)
+                || git::is_scrubbed_git_var(k)
+                || (!allow_api_key && claude::API_KEY_VARS.contains(&k))
+        };
+        let env = self
+            .base_env()
+            .into_iter()
+            .filter(|(k, _)| !k.to_str().is_some_and(scrubbed));
+        let status = tokio::process::Command::new("/usr/bin/open")
+            .env_clear()
+            .envs(env)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(AppError::io(format!("open non riuscito ({status})")))
+        }
     }
 
     fn turn(&self, attempt_id: &str) -> Option<Arc<TurnHandle>> {
@@ -1174,6 +1269,10 @@ fn guard<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+fn task_key(task_id: &str) -> String {
+    format!("task:{task_id}")
+}
+
 fn attempt_key(attempt_id: &str) -> String {
     format!("attempt:{attempt_id}")
 }
@@ -1236,20 +1335,4 @@ fn fresh_prompt(title: &str, description: &str, log: &str, text: &str) -> String
     prompt.push_str("\n\n");
     prompt.push_str(text);
     prompt
-}
-
-/// `/usr/bin/open <args>` (argv, no shell).
-async fn open(args: &[String]) -> Result<(), AppError> {
-    let status = tokio::process::Command::new("/usr/bin/open")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(AppError::io(format!("open non riuscito ({status})")))
-    }
 }

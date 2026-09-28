@@ -41,7 +41,7 @@ pub struct Live {
 
 #[derive(Default)]
 struct State {
-    /// Only while the attempt has subscribers or a typing preview.
+    /// While the attempt has subscribers or a typing preview (pruned lazily).
     attempts: HashMap<Id, Channel>,
     forwarders: HashMap<Id, AbortHandle>,
 }
@@ -110,13 +110,20 @@ impl Live {
         attempt_id: &str,
         sink: TranscriptSink,
     ) -> Result<Id, AppError> {
-        let rx = self
-            .lock()
-            .attempts
-            .entry(attempt_id.to_owned())
-            .or_insert_with(Channel::new)
-            .tx
-            .subscribe();
+        let rx = {
+            let mut state = self.lock();
+            // Channels of ended forwarders (unsubscribed, aborted, unknown attempts) go here:
+            // an aborted forwarder releases its receiver only when its task is dropped.
+            state
+                .attempts
+                .retain(|_, c| c.tx.receiver_count() > 0 || c.typing.is_some());
+            state
+                .attempts
+                .entry(attempt_id.to_owned())
+                .or_insert_with(Channel::new)
+                .tx
+                .subscribe()
+        };
         let page = db.entries_tail(attempt_id, SNAPSHOT_TAIL)?;
         let typing = self.typing(attempt_id);
         let id = crate::new_id();

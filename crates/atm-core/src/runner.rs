@@ -223,6 +223,10 @@ pub(crate) fn not_pending() -> AppError {
     AppError::not_found("L'approvazione non è più in attesa")
 }
 
+fn closing() -> AppError {
+    AppError::busy("L'app si sta chiudendo")
+}
+
 impl TurnHandle {
     pub(crate) fn pending_count(&self) -> u32 {
         guard(&self.pending).len() as u32
@@ -259,10 +263,11 @@ impl TurnHandle {
     }
 }
 
-/// What the turn task owns of its registry entry.
+/// What the turn task and its supervisor own of the registry entry.
 struct TurnParts {
     handle: Arc<TurnHandle>,
     cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    /// Set by the supervisor once the turn is finalized (or cleaned up after a panic).
     done_tx: watch::Sender<bool>,
 }
 
@@ -330,7 +335,7 @@ impl Inner {
         settings: &Settings,
     ) -> Result<Preflight, AppError> {
         if self.closing.load(Ordering::SeqCst) {
-            return Err(AppError::busy("L'app si sta chiudendo"));
+            return Err(closing());
         }
         let probe = self.probe(false).await;
         let claude = probe.claude.clone().ok_or_else(claude_not_found)?;
@@ -379,6 +384,10 @@ impl Inner {
             done,
         });
         let mut turns = guard(&self.turns);
+        // `Core::shutdown` sets it under this lock (the preflight may have taken seconds).
+        if self.closing.load(Ordering::SeqCst) {
+            return Err(closing());
+        }
         if turns.contains_key(attempt_id) {
             return Err(crate::busy_turn());
         }
@@ -493,24 +502,37 @@ impl Inner {
     pub(crate) async fn launch(self: &Arc<Self>, preflight: Preflight, plan: TurnPlan) {
         self.emit_env().await;
         let mut slot = preflight.slot;
-        let Some(parts) = slot.parts.take() else {
+        let Some(TurnParts {
+            handle,
+            cmd_rx,
+            done_tx,
+        }) = slot.parts.take()
+        else {
             return;
         };
         let (attempt_id, process_id) = (plan.ctx.attempt.id.clone(), plan.process.id.clone());
-        let handle = Arc::clone(&parts.handle);
-        let task = tokio::spawn(turn::run_turn(Arc::clone(self), plan, parts));
+        let task = tokio::spawn(turn::run_turn(
+            Arc::clone(self),
+            plan,
+            Arc::clone(&handle),
+            cmd_rx,
+        ));
         let inner = Arc::clone(self);
-        // A panicking turn must not keep its slot and a `running` row forever.
         tokio::spawn(async move {
+            // A panicking turn must not keep its slot and a `running` row forever.
             if let Err(e) = task.await
                 && e.is_panic()
             {
                 inner.turn_panicked(&attempt_id, &process_id, &handle).await;
             }
+            let _ = done_tx.send(true);
         });
     }
 
+    /// The unwinding already killed the agent's group (`turn::drive`); the rest of finalize.
     async fn turn_panicked(&self, attempt_id: &str, process_id: &str, handle: &Arc<TurnHandle>) {
+        guard(&handle.pending).clear();
+        self.cancel_open_tools(attempt_id, process_id);
         let fin = ProcessFinish {
             status: ProcessStatus::Failed,
             stop_reason: Some(StopReason::Crash),
@@ -553,6 +575,18 @@ impl Inner {
         }
         for text in typing {
             self.live.send(attempt_id, LiveMsg::Typing(text));
+        }
+    }
+
+    /// Open tool calls of a turn that died without its finalize → `Cancelled`, broadcast.
+    fn cancel_open_tools(&self, attempt_id: &str, process_id: &str) {
+        match self.db.cancel_open_tools(attempt_id, process_id) {
+            Ok(entries) => {
+                for entry in entries {
+                    self.live.send(attempt_id, LiveMsg::Upsert(Arc::new(entry)));
+                }
+            }
+            Err(e) => eprintln!("process {process_id}: open tools not cancelled: {e}"),
         }
     }
 
@@ -610,15 +644,7 @@ impl Inner {
             Err(e) => return eprintln!("recovery of process {}: {e}", p.id),
         };
         let _attempt = self.lock(attempt_key(&ctx.attempt.id)).await;
-        match self.db.cancel_open_tools(&ctx.attempt.id, &p.id) {
-            Ok(entries) => {
-                for entry in entries {
-                    self.live
-                        .send(&ctx.attempt.id, LiveMsg::Upsert(Arc::new(entry)));
-                }
-            }
-            Err(e) => eprintln!("recovery of process {}: {e}", p.id),
-        }
+        self.cancel_open_tools(&ctx.attempt.id, &p.id);
         let next_idx = match self.db.next_entry_idx(&ctx.attempt.id) {
             Ok(idx) => idx,
             Err(e) => return eprintln!("recovery of process {}: {e}", p.id),
@@ -663,6 +689,9 @@ async fn is_our_orphan(p: &ProcessRow, pgid: i32) -> bool {
     let Some(claude) = claude else {
         return false;
     };
+    if uuid::Uuid::parse_str(&p.session_id).is_err() {
+        return false;
+    }
     claude::pid_alive(pgid)
         && claude::process_command(pgid)
             .await
