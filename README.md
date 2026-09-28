@@ -41,12 +41,14 @@ cargo tauri build --debug --no-bundle        # → target/debug/ai-task-manager 
 ## Selftest (solo build di debug)
 
 ```bash
+cargo build -p atm-core --bin fake-claude   # il selftest usa fake-claude, mai il claude reale
 cargo tauri build --debug --no-bundle
 out=$(ATM_SELFTEST=1 ./target/debug/ai-task-manager) && echo "$out" && grep -qF '"csp_violations":0' <<<"$out"
 ```
 
 La UI esegue da sola le prove IPC (`debug_ping`, errore tipizzato, 50 messaggi su `Channel` di cui tre da 20 KiB),
-guida il dialog portato e conta le violazioni CSP; l'app stampa il report JSON su stdout ed esce con 0 se tutto passa,
+guida il dialog portato, prova `subscribe_transcript`/unsubscribe e un reload della pagina (`transcript_subscribe_ok`,
+`forwarder_unsub_ok`, `forwarder_reload_ok`, `reload_ok`) e conta le violazioni CSP; l'app stampa il report JSON su stdout ed esce con 0 se tutto passa,
 altrimenti con 1 (anche se la UI non risponde entro 90 s). Funziona anche con `ATM_SELFTEST=1 cargo tauri dev`,
 ma lì `csp_enforced` vale `null`: Tauri applica la CSP solo agli asset incorporati, non alla pagina di `trunk serve`.
 In selftest il plugin single-instance non viene registrato, così la prova gira anche con un'altra istanza aperta;

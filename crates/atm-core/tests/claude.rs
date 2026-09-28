@@ -1287,7 +1287,10 @@ async fn killpg_reaches_the_whole_group() {
     let status = child.wait().await.unwrap();
     assert!(status.code().is_none());
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while claude::group_alive(pgid) && std::time::Instant::now() < deadline {
+    // The reparented grandchild can linger as a zombie until launchd reaps it: poll it too.
+    while (claude::group_alive(pgid) || claude::pid_alive(grandchild))
+        && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(!claude::group_alive(pgid), "the grandchild sleep survived");
