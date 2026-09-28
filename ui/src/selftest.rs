@@ -1,20 +1,25 @@
-//! IPC and CSP selftest (spec §11.2 M0). Runs only when the debug backend reports
+//! IPC and CSP selftest (spec §11.2 M0, M3-TAURI). Runs only when the debug backend reports
 //! `ATM_SELFTEST=1`; in release the probe commands do not exist and this is a no-op.
-//! Not compiled with `--features mock` (there is no backend to probe). Owner after M1:
-//! M3-TAURI (subscribe, unsubscribe and reload with `debug_forwarder_count`).
+//! Not compiled with `--features mock` (there is no backend to probe).
+//!
+//! Two page loads: the first runs the checks, leaves a transcript subscription open, keeps
+//! its partial report in `sessionStorage` and reloads; the second checks that the reload
+//! dropped that forwarder (`on_page_load` → `drop_subscriptions`) and sends the report.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use atm_types::debug::{
-    DebugChannelProbe, DebugPing, DebugSelftestEnabled, DebugSelftestReport, PingReq, ProbeMsg,
-    ReportReq,
+    DebugChannelProbe, DebugForwarderCount, DebugPing, DebugSelftestEnabled, DebugSelftestReport,
+    PingReq, ProbeMsg, ReportReq,
 };
-use atm_types::{AppError, Empty, ErrorCode};
+use atm_types::{
+    AppError, Empty, ErrorCode, Id, TranscriptMsg, UnsubscribeTranscript, UnsubscribeTranscriptReq,
+};
 use leptos::prelude::*;
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
-use web_sys::SecurityPolicyViolationEvent;
+use web_sys::{SecurityPolicyViolationEvent, Storage};
 
 use crate::ipc;
 use crate::ui::dialog::{
@@ -25,6 +30,14 @@ use crate::ui::dialog::{
 const PROBE_COUNT: usize = 50;
 const PROBE_BIG: [u32; 3] = [7, 23, 41];
 const PROBE_BIG_LEN: usize = 20 * 1024;
+/// `sessionStorage` key carrying the first load's results across the reload.
+const STAGE_KEY: &str = "atm-selftest-first-load";
+/// No attempt has this id: subscribing to it must yield an empty `Snapshot`.
+const UNKNOWN_ATTEMPT: &str = "00000000-0000-4000-8000-000000000000";
+
+/// A check that needs the M3 core: `None` (null in the report) while the core is the M1
+/// stub and answers `NotImplemented`. The backend requires it only with `ATM_SELFTEST_FULL=1`.
+type CoreCheck = Option<bool>;
 
 thread_local! {
     static CSP_VIOLATIONS: Cell<u32> = const { Cell::new(0) };
@@ -59,6 +72,20 @@ pub async fn run_if_enabled() {
     {
         return;
     }
+    let storage = window().session_storage().ok().flatten();
+    let saved = storage
+        .as_ref()
+        .and_then(|s| s.get_item(STAGE_KEY).ok().flatten());
+    match (storage, saved) {
+        (Some(storage), Some(saved)) => {
+            let _ = storage.remove_item(STAGE_KEY);
+            after_reload(&saved).await;
+        }
+        (storage, _) => first_load(storage).await,
+    }
+}
+
+async fn first_load(storage: Option<Storage>) {
     let ping_ok = ping_ok().await;
     let ping_err_typed = ping_err_typed().await;
     let channel_50_in_order = channel_in_order().await;
@@ -71,18 +98,135 @@ pub async fn run_if_enabled() {
         .host()
         .is_ok_and(|h| h == "localhost:1420");
     let csp_enforced = (!dev_server).then(|| js_sys::eval("1").is_err());
+    let (transcript_subscribe_ok, forwarder_unsub_ok) = subscribe_unsubscribe().await;
+    let left_open = leave_subscribed().await;
     sleep(300).await; // let late violation events arrive
-    let report: Value = json!({
+    let mut report: Value = json!({
         "ping_ok": ping_ok,
         "ping_err_typed": ping_err_typed,
         "channel_50_in_order": channel_50_in_order,
         "dialog_ok": dialog_ok,
         "csp_enforced": csp_enforced,
+        "transcript_subscribe_ok": transcript_subscribe_ok,
+        "forwarder_unsub_ok": forwarder_unsub_ok,
         "csp_violations": CSP_VIOLATIONS.with(Cell::get),
     });
+    let stage = json!({ "report": report, "left_open": left_open }).to_string();
+    let stored = storage.is_some_and(|s| s.set_item(STAGE_KEY, &stage).is_ok());
+    if !(stored && window().location().reload().is_ok()) {
+        report["reload_ok"] = false.into();
+        send_report(report).await;
+    }
+}
+
+/// Second load: the forwarder left open by [`first_load`] must be gone before anything
+/// subscribes again, and subscribing must still work.
+async fn after_reload(saved: &str) {
+    let saved: Value = serde_json::from_str(saved).unwrap_or_default();
+    let mut report = saved["report"].clone();
+    let forwarder_reload_ok: CoreCheck = match saved["left_open"].as_bool() {
+        Some(true) => {
+            let dropped = forwarders_reach(0).await;
+            let (subscribed, unsubscribed) = subscribe_unsubscribe().await;
+            Some(dropped && subscribed == Some(true) && unsubscribed == Some(true))
+        }
+        left_open => left_open,
+    };
+    sleep(300).await; // let late violation events arrive
+    let csp_violations = report["csp_violations"]
+        .as_u64()
+        .map(|first| first + u64::from(CSP_VIOLATIONS.with(Cell::get)));
+    report["forwarder_reload_ok"] = forwarder_reload_ok.into();
+    report["reload_ok"] = true.into();
+    report["csp_violations"] = csp_violations.into();
+    send_report(report).await;
+}
+
+async fn send_report(report: Value) {
     if let Err(e) = ipc::call::<DebugSelftestReport>(&ReportReq { report }).await {
         leptos::logging::error!("selftest report failed: {e:?}");
     }
+}
+
+/// A live subscription to [`UNKNOWN_ATTEMPT`].
+struct Subscription {
+    id: Id,
+    /// The first message was an empty `Snapshot` with `has_more: false`.
+    snapshot_ok: bool,
+    _handles: (ipc::Channel, Closure<dyn FnMut(JsValue)>),
+}
+
+async fn subscribe() -> Result<Subscription, ErrorCode> {
+    let first: Rc<RefCell<Option<TranscriptMsg>>> = Rc::default();
+    let sink = first.clone();
+    let (id, channel, closure) =
+        ipc::subscribe_transcript(&UNKNOWN_ATTEMPT.to_owned(), move |msg| {
+            sink.borrow_mut().get_or_insert(msg);
+        })
+        .await
+        .map_err(|e| e.code)?;
+    for _ in 0..40 {
+        if first.borrow().is_some() {
+            break;
+        }
+        sleep(50).await;
+    }
+    let snapshot_ok = matches!(
+        first.borrow().as_ref(),
+        Some(TranscriptMsg::Snapshot { entries, has_more: false, .. }) if entries.is_empty()
+    );
+    Ok(Subscription {
+        id,
+        snapshot_ok,
+        _handles: (channel, closure),
+    })
+}
+
+/// Subscribe (empty `Snapshot`, 1 forwarder), unsubscribe (0 forwarders):
+/// `(transcript_subscribe_ok, forwarder_unsub_ok)`.
+async fn subscribe_unsubscribe() -> (CoreCheck, CoreCheck) {
+    let sub = match subscribe().await {
+        Ok(sub) => sub,
+        Err(ErrorCode::NotImplemented) => return (None, None),
+        Err(_) => return (Some(false), Some(false)),
+    };
+    let counted = forwarders_reach(1).await;
+    let req = UnsubscribeTranscriptReq {
+        subscription_id: sub.id.clone(),
+    };
+    let unsubscribed = ipc::call::<UnsubscribeTranscript>(&req).await.is_ok();
+    let dropped = forwarders_reach(0).await;
+    (
+        Some(sub.snapshot_ok),
+        Some(counted && unsubscribed && dropped),
+    )
+}
+
+/// Subscribes and leaks the handles until the reload, which must drop the forwarder.
+async fn leave_subscribed() -> CoreCheck {
+    match subscribe().await {
+        Ok(sub) => {
+            let ok = sub.snapshot_ok && forwarders_reach(1).await;
+            std::mem::forget(sub);
+            Some(ok)
+        }
+        Err(ErrorCode::NotImplemented) => None,
+        Err(_) => Some(false),
+    }
+}
+
+/// Polls `debug_forwarder_count` for up to 1 s: a forwarder may deregister asynchronously.
+async fn forwarders_reach(n: u32) -> bool {
+    for _ in 0..20 {
+        if ipc::call::<DebugForwarderCount>(&Empty {})
+            .await
+            .is_ok_and(|c| c == n)
+        {
+            return true;
+        }
+        sleep(50).await;
+    }
+    false
 }
 
 async fn ping_ok() -> bool {
