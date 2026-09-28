@@ -1,0 +1,147 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_ok",
+        "name": "Bash",
+        "summary": "$ ls",
+        "input": "{\"command\":\"ls\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 11,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_err",
+        "name": "Bash",
+        "summary": "$ false",
+        "input": "{\"command\":\"false\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 12,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_blocks",
+        "name": "Read",
+        "summary": "Read logo.png",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/logo.png\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_ok",
+        "name": "Bash",
+        "summary": "$ ls",
+        "input": "{\"command\":\"ls\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "a.txt\nb.txt",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 11,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_err",
+        "name": "Bash",
+        "summary": "$ false",
+        "input": "{\"command\":\"false\"}",
+        "status": {
+          "state": "Failed"
+        },
+        "output": {
+          "text": "exit code 1",
+          "truncated_bytes": 0,
+          "is_error": true
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 12,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_blocks",
+        "name": "Read",
+        "summary": "Read logo.png",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/logo.png\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "Image read\n[image]\ndone",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  }
+]

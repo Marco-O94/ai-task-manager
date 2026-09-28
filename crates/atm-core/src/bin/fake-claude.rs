@@ -1,15 +1,607 @@
 //! Test double of the Claude CLI (spec §12.1); never bundled, never calls any API.
-//! M1 stub: only `--version`. Owner: M2-CLAUDE (auth status, `-p` scenarios).
+//!
+//! - `--version` / `-v`: `<CLAUDE_TESTED_VERSION> (Claude Code)`.
+//! - `auth status [--json|--text]`: `FAKE_CLAUDE_AUTH=in` (default) → exit 0, `out` → exit 1,
+//!   anything else → exit 2. `auth login …` prints one line and exits 0.
+//! - `-p …` (stream-json on stdin/stdout): appends one JSON line per call to
+//!   `$FAKE_CLAUDE_RECORD`: `{"kind":"call","argv":[…without argv0],"cwd":…,"pwd":…,
+//!   "env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for every
+//!   answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`).
+//!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
+//!   `[fake:NAME]` in its text, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
+//!   An interrupt is answered with success plus a `result` `error_during_execution`
+//!   (except `hang_ignore`).
+//!
+//! Scenarios: simple, approval, slow, hang, hang_ignore, crash, noinit, big, flood, control,
+//! usage_limit, auth_fail, resolve_merge (`$FAKE_CLAUDE_TARGET`), resume_fail. Counts:
+//! `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
+
+use std::io::{BufRead as _, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio, exit};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+/// Variables whose presence is recorded (never their values).
+const RECORDED_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "GIT_DIR",
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("--version" | "-v") => {
-            println!("{} (Claude Code)", atm_types::CLAUDE_TESTED_VERSION)
-        }
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["--version" | "-v", ..] => println!("{} (Claude Code)", atm_types::CLAUDE_TESTED_VERSION),
+        ["auth", "status", rest @ ..] => auth_status(rest.contains(&"--text")),
+        ["auth", "login", ..] => println!("fake-claude: login simulato, nessun account toccato"),
+        _ if words.iter().any(|&a| a == "-p" || a == "--print") => Session::start(&args).run(),
         _ => {
-            eprintln!("fake-claude: {args:?} not implemented yet (M2-CLAUDE)");
-            std::process::exit(2);
+            eprintln!("fake-claude: unsupported arguments {args:?}");
+            exit(2);
         }
+    }
+}
+
+fn auth_status(text: bool) {
+    let logged_in = match std::env::var("FAKE_CLAUDE_AUTH").as_deref() {
+        Ok("in") | Err(_) => true,
+        Ok("out") => false,
+        Ok(other) => {
+            eprintln!("fake-claude: FAKE_CLAUDE_AUTH={other}");
+            exit(2);
+        }
+    };
+    if text {
+        let status = if logged_in {
+            "Logged in"
+        } else {
+            "Not logged in"
+        };
+        println!("{status}");
+    } else if logged_in {
+        let status = json!({
+            "loggedIn": true,
+            "authMethod": "claude.ai",
+            "apiProvider": "firstParty",
+            "email": "fake@example.com",
+            "orgId": "fake-org-id",
+            "orgName": "Fake Org",
+            "subscriptionType": "max",
+        });
+        println!("{status}");
+    } else {
+        println!("{}", json!({"loggedIn": false, "authMethod": "none"}));
+    }
+    exit(if logged_in { 0 } else { 1 });
+}
+
+/// Why a scenario stopped early.
+enum Stop {
+    /// Interrupt with this request id (not answered yet).
+    Interrupted(String),
+    Eof,
+}
+
+type Step = Result<(), Stop>;
+
+struct Session {
+    rx: Receiver<Value>,
+    session_id: String,
+    cwd: PathBuf,
+    permission_mode: String,
+    record: Option<PathBuf>,
+    counter: u64,
+}
+
+impl Session {
+    fn start(args: &[String]) -> Session {
+        let flag = |name: &str| {
+            args.iter()
+                .find_map(|a| a.strip_prefix(name))
+                .map(str::to_owned)
+        };
+        let session = Session {
+            rx: spawn_stdin_reader(),
+            session_id: flag("--session-id=")
+                .or_else(|| flag("--resume="))
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            cwd: std::env::current_dir().unwrap_or_default(),
+            permission_mode: flag("--permission-mode=").unwrap_or_else(|| "default".into()),
+            record: std::env::var_os("FAKE_CLAUDE_RECORD").map(PathBuf::from),
+            counter: 0,
+        };
+        let env: serde_json::Map<String, Value> = RECORDED_VARS
+            .iter()
+            .map(|&k| (k.to_owned(), std::env::var_os(k).is_some().into()))
+            .collect();
+        session.record(json!({
+            "kind": "call",
+            "argv": args,
+            "cwd": session.cwd,
+            "pwd": std::env::var_os("PWD").map(|p| p.to_string_lossy().into_owned()),
+            "env": env,
+        }));
+        session
+    }
+
+    fn record(&self, line: Value) {
+        let Some(path) = &self.record else { return };
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("open FAKE_CLAUDE_RECORD");
+        // One write per line: concurrent fakes may share the file.
+        file.write_all(format!("{line}\n").as_bytes())
+            .expect("write FAKE_CLAUDE_RECORD");
+    }
+
+    fn run(mut self) -> ! {
+        if std::env::var("FAKE_CLAUDE_SCENARIO").as_deref() == Ok("noinit") {
+            exit(1);
+        }
+        loop {
+            let Ok(msg) = self.rx.recv() else { exit(0) };
+            match msg["type"].as_str() {
+                Some("control_request") => self.answer(&msg),
+                Some("user") => {
+                    let scenario = pick_scenario(&user_text(&msg));
+                    match self.play(&scenario) {
+                        Ok(()) => {}
+                        Err(Stop::Interrupted(request_id)) => {
+                            self.send(control_success(&request_id, json!({})));
+                            self.result("error_during_execution", true, None);
+                        }
+                        Err(Stop::Eof) => exit(0),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A host request outside a scenario wait (interrupt while idle included).
+    fn answer(&mut self, msg: &Value) {
+        let request_id = msg["request_id"].as_str().unwrap_or_default();
+        let reply = match msg["request"]["subtype"].as_str().unwrap_or_default() {
+            "initialize" => control_success(request_id, json!({"commands": []})),
+            "interrupt" => control_success(request_id, json!({})),
+            other => json!({"type": "control_response", "response": {
+                "subtype": "error",
+                "request_id": request_id,
+                "error": format!("Unsupported control request subtype: {other}"),
+            }}),
+        };
+        self.send(reply);
+    }
+
+    /// The next host response to a request of the fake, `None` at `deadline`. Answers other
+    /// requests; an interrupt or EOF ends the scenario.
+    fn next_response(&mut self, deadline: Option<Instant>) -> Result<Option<Value>, Stop> {
+        loop {
+            let msg = match deadline {
+                None => self.rx.recv().map_err(|_| Stop::Eof)?,
+                Some(at) => match self
+                    .rx
+                    .recv_timeout(at.saturating_duration_since(Instant::now()))
+                {
+                    Ok(msg) => msg,
+                    Err(RecvTimeoutError::Timeout) => return Ok(None),
+                    Err(RecvTimeoutError::Disconnected) => return Err(Stop::Eof),
+                },
+            };
+            match msg["type"].as_str() {
+                Some("control_request") if msg["request"]["subtype"] == "interrupt" => {
+                    let id = msg["request_id"].as_str().unwrap_or_default();
+                    return Err(Stop::Interrupted(id.to_owned()));
+                }
+                Some("control_request") => self.answer(&msg),
+                Some("control_response") => {
+                    let response = msg["response"].clone();
+                    self.record(json!({"kind": "control_response", "response": response}));
+                    return Ok(Some(response));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn pause(&mut self, duration: Duration) -> Step {
+        let deadline = Instant::now() + duration;
+        while self.next_response(Some(deadline))?.is_some() {}
+        Ok(())
+    }
+
+    fn await_response(&mut self, request_id: &str) -> Result<Value, Stop> {
+        loop {
+            if let Some(r) = self.next_response(None)?
+                && r["request_id"] == request_id
+            {
+                return Ok(r);
+            }
+        }
+    }
+
+    fn play(&mut self, scenario: &str) -> Step {
+        match scenario {
+            "noinit" => exit(1),
+            "resume_fail" => {
+                eprintln!("No conversation found with session ID: {}", self.session_id);
+                exit(1);
+            }
+            "hang_ignore" => {
+                ignore_sigterm_with_grandchild();
+                self.init();
+            }
+            _ => self.init(),
+        }
+        match scenario {
+            "simple" => self.simple(),
+            "approval" => self.approval()?,
+            "slow" => {
+                let n = count_env("FAKE_CLAUDE_SLOW_EVENTS", 20);
+                for i in 1..=n {
+                    self.pause(Duration::from_secs(1))?;
+                    self.text(&format!("Passo {i}/{n}"));
+                }
+                self.result("success", false, Some("Lavoro lento completato."));
+            }
+            "hang" => loop {
+                self.next_response(None)?;
+            },
+            "hang_ignore" => self.hang_ignore(),
+            "crash" => {
+                eprintln!("fake-claude: crash simulato");
+                exit(1);
+            }
+            "big" => {
+                let path = self.cwd.join("big.txt");
+                let id = self.tool_use("Read", json!({"file_path": path}));
+                let output: String = (0..3200).map(|i| format!("riga {i:010}\n")).collect();
+                self.tool_result(&id, &output, false);
+                self.text(&"x".repeat(20 << 20));
+                self.text("Dopo la riga gigante.");
+                self.result("success", false, Some("Output grande completato."));
+            }
+            "flood" => {
+                for i in 0..count_env("FAKE_CLAUDE_FLOOD_EVENTS", 10_000) {
+                    self.text(&format!("Evento {i}"));
+                }
+                self.result("success", false, Some("Flood completato."));
+            }
+            "control" => {
+                let request_id = self.next_id("fake_req");
+                self.send(
+                    json!({"type": "control_request", "request_id": request_id, "request": {
+                        "subtype": "hook_callback",
+                        "callback_id": "fake_hook",
+                        "input": {"hook_event_name": "PreToolUse", "tool_name": "Bash"},
+                        "tool_use_id": null,
+                    }}),
+                );
+                let response = self.await_response(&request_id)?;
+                self.text(&format!("Risposta al hook: {}", response["subtype"]));
+                self.result("success", false, Some("Hook inviato."));
+            }
+            "usage_limit" => self.result(
+                "success",
+                true,
+                Some("Claude AI usage limit reached. Your limit will reset at 5pm (Europe/Rome)."),
+            ),
+            "auth_fail" => self.result("success", true, Some("Not logged in · Please run /login")),
+            "resolve_merge" => self.resolve_merge(),
+            other => self.result(
+                "error_during_execution",
+                true,
+                Some(&format!("fake-claude: unknown scenario {other}")),
+            ),
+        }
+        Ok(())
+    }
+
+    /// Streams a short text, writes `hello.txt` with a Write tool call, then succeeds.
+    fn simple(&mut self) {
+        self.stream_text("Creo hello.txt nel worktree.");
+        let path = self.cwd.join("hello.txt");
+        let id = self.tool_use("Write", json!({"file_path": path, "content": "hello\n"}));
+        match std::fs::write(&path, "hello\n") {
+            Ok(()) => {
+                let msg = format!("File created successfully at: {}", path.display());
+                self.tool_result(&id, &msg, false);
+            }
+            Err(e) => self.tool_result(&id, &e.to_string(), true),
+        }
+        self.text("Fatto: hello.txt creato.");
+        self.result("success", false, Some("Fatto: hello.txt creato."));
+    }
+
+    fn approval(&mut self) -> Step {
+        let input = json!({"command": "echo hello", "description": "Print hello"});
+        let tool_use_id = self.tool_use("Bash", input.clone());
+        let request_id = self.next_id("fake_req");
+        self.send(
+            json!({"type": "control_request", "request_id": request_id, "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": input,
+                "tool_use_id": tool_use_id,
+                "permission_suggestions": [{
+                    "type": "addRules",
+                    "rules": [{"toolName": "Bash", "ruleContent": "echo hello"}],
+                    "behavior": "allow",
+                    "destination": "localSettings",
+                }],
+                "decision_reason": "Bash richiede un'approvazione in questa modalità",
+            }}),
+        );
+        let response = match self.await_response(&request_id) {
+            Err(Stop::Interrupted(id)) => {
+                self.send(json!({"type": "control_cancel_request", "request_id": request_id}));
+                return Err(Stop::Interrupted(id));
+            }
+            other => other?,
+        };
+        let decision = &response["response"];
+        if response["subtype"] == "success" && decision["behavior"] == "allow" {
+            self.tool_result(&tool_use_id, "hello\n", false);
+        } else {
+            let message = decision["message"].as_str().or(response["error"].as_str());
+            self.tool_result(&tool_use_id, message.unwrap_or("denied"), true);
+            if decision["interrupt"] == true {
+                self.result("error_during_execution", true, None);
+                return Ok(());
+            }
+        }
+        self.simple();
+        Ok(())
+    }
+
+    /// Ignores interrupts and EOF (SIGTERM is already ignored): only SIGKILL ends it.
+    fn hang_ignore(&mut self) -> ! {
+        loop {
+            if let Err(Stop::Eof) = self.next_response(None) {
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        }
+    }
+
+    /// `git merge $FAKE_CLAUDE_TARGET`, conflicts resolved by concatenating ours + theirs.
+    fn resolve_merge(&mut self) {
+        let Ok(target) = std::env::var("FAKE_CLAUDE_TARGET") else {
+            let text = "fake-claude: FAKE_CLAUDE_TARGET non impostata";
+            return self.result("error_during_execution", true, Some(text));
+        };
+        let id = self.tool_use("Bash", json!({"command": format!("git merge {target}")}));
+        match merge_concatenating(&self.cwd, &target) {
+            Ok(log) => {
+                self.tool_result(&id, &log, false);
+                self.result("success", false, Some("Merge risolto."));
+            }
+            Err(log) => {
+                self.tool_result(&id, &log, true);
+                self.result("error_during_execution", true, Some("Merge non riuscito."));
+            }
+        }
+    }
+
+    // ---- output frames -------------------------------------------------------------------
+
+    fn send(&self, frame: Value) {
+        let mut out = std::io::stdout().lock();
+        if writeln!(out, "{frame}").and_then(|()| out.flush()).is_err() {
+            exit(1);
+        }
+    }
+
+    fn next_id(&mut self, prefix: &str) -> String {
+        self.counter += 1;
+        format!("{prefix}_{}", self.counter)
+    }
+
+    fn envelope(&self, kind: &str, mut body: Value) -> Value {
+        body["type"] = kind.into();
+        body["session_id"] = self.session_id.clone().into();
+        body["uuid"] = uuid::Uuid::new_v4().to_string().into();
+        body
+    }
+
+    fn init(&mut self) {
+        let frame = self.envelope(
+            "system",
+            json!({
+                "subtype": "init",
+                "cwd": self.cwd,
+                "tools": ["Bash", "Read", "Write", "Edit"],
+                "mcp_servers": [],
+                "model": "claude-fake",
+                "permissionMode": self.permission_mode,
+                "apiKeySource": "none",
+                "claude_code_version": atm_types::CLAUDE_TESTED_VERSION,
+            }),
+        );
+        self.send(frame);
+    }
+
+    fn stream_text(&mut self, text: &str) {
+        let events = [json!({"type": "content_block_start", "index": 0,
+                             "content_block": {"type": "text", "text": ""}})]
+        .into_iter()
+        .chain(text.split_inclusive(' ').map(|chunk| {
+            json!({"type": "content_block_delta", "index": 0,
+                   "delta": {"type": "text_delta", "text": chunk}})
+        }))
+        .chain([json!({"type": "content_block_stop", "index": 0})]);
+        for event in events {
+            let frame = self.envelope(
+                "stream_event",
+                json!({"event": event, "parent_tool_use_id": null}),
+            );
+            self.send(frame);
+        }
+        self.text(text);
+    }
+
+    fn assistant(&mut self, content: Value) {
+        let id = self.next_id("msg_fake");
+        let frame = self.envelope("assistant", json!({
+            "message": {"id": id, "type": "message", "role": "assistant", "model": "claude-fake",
+                        "content": content, "stop_reason": null,
+                        "usage": {"input_tokens": 1, "output_tokens": 1}},
+            "parent_tool_use_id": null,
+        }));
+        self.send(frame);
+    }
+
+    fn text(&mut self, text: &str) {
+        self.assistant(json!([{"type": "text", "text": text}]));
+    }
+
+    fn tool_use(&mut self, name: &str, input: Value) -> String {
+        let id = self.next_id("toolu_fake");
+        self.assistant(json!([{"type": "tool_use", "id": id, "name": name, "input": input}]));
+        id
+    }
+
+    fn tool_result(&mut self, tool_use_id: &str, content: &str, is_error: bool) {
+        let frame = self.envelope(
+            "user",
+            json!({
+                "message": {"role": "user", "content": [{"type": "tool_result",
+                    "tool_use_id": tool_use_id, "content": content, "is_error": is_error}]},
+                "parent_tool_use_id": null,
+            }),
+        );
+        self.send(frame);
+    }
+
+    fn result(&mut self, subtype: &str, is_error: bool, text: Option<&str>) {
+        let mut frame = self.envelope(
+            "result",
+            json!({
+                "subtype": subtype,
+                "is_error": is_error,
+                "duration_ms": 1200,
+                "duration_api_ms": 900,
+                "num_turns": 1,
+                "total_cost_usd": 0.0123,
+                "usage": {"input_tokens": 10, "output_tokens": 20},
+                "permission_denials": [],
+            }),
+        );
+        if let Some(text) = text {
+            frame["result"] = text.into();
+        }
+        self.send(frame);
+    }
+}
+
+fn control_success(request_id: &str, response: Value) -> Value {
+    json!({"type": "control_response",
+           "response": {"subtype": "success", "request_id": request_id, "response": response}})
+}
+
+/// Ignores SIGTERM, then starts `sleep 300` in the same process group: the ignore is
+/// inherited across exec, so only SIGKILL of the whole group ends both.
+fn ignore_sigterm_with_grandchild() {
+    // SAFETY: changes this process's disposition of one signal; no handler code runs.
+    unsafe {
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+    }
+    let _ = Command::new("sleep")
+        .arg("300")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Host frames, one JSON value per stdin line; the channel closes at EOF.
+fn spawn_stdin_reader() -> Receiver<Value> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if let Ok(v) = serde_json::from_str(&line)
+                && tx.send(v).is_err()
+            {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn user_text(msg: &Value) -> String {
+    match &msg["message"]["content"] {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|b| b["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn pick_scenario(text: &str) -> String {
+    text.split_once("[fake:")
+        .and_then(|(_, rest)| rest.split_once(']'))
+        .map(|(name, _)| name.trim().to_owned())
+        .or_else(|| std::env::var("FAKE_CLAUDE_SCENARIO").ok())
+        .unwrap_or_else(|| "simple".into())
+}
+
+fn count_env(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Runs git in `cwd` (hooks off: the fake stands for the agent, not for the app's git).
+fn git(cwd: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("git")
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("git {args:?}: {e}"))
+}
+
+fn merge_concatenating(cwd: &Path, target: &str) -> Result<String, String> {
+    let merge = git(cwd, &["merge", "--no-edit", target])?;
+    let mut log = String::from_utf8_lossy(&merge.stdout).into_owned();
+    log.push_str(&String::from_utf8_lossy(&merge.stderr));
+    if merge.status.success() {
+        return Ok(log);
+    }
+    let conflicted = git(cwd, &["diff", "--name-only", "-z", "--diff-filter=U"])?.stdout;
+    let conflicted = String::from_utf8_lossy(&conflicted).into_owned();
+    let paths: Vec<&str> = conflicted.split('\0').filter(|p| !p.is_empty()).collect();
+    if paths.is_empty() {
+        return Err(log);
+    }
+    for path in paths {
+        let ours = git(cwd, &["show", &format!(":2:{path}")])?.stdout;
+        let theirs = git(cwd, &["show", &format!(":3:{path}")])?.stdout;
+        std::fs::write(cwd.join(path), [ours, theirs].concat()).map_err(|e| e.to_string())?;
+        git(cwd, &["add", "--", path])?;
+    }
+    let commit = git(cwd, &["commit", "--no-edit"])?;
+    log.push_str(&String::from_utf8_lossy(&commit.stdout));
+    log.push_str(&String::from_utf8_lossy(&commit.stderr));
+    if commit.status.success() {
+        Ok(log)
+    } else {
+        Err(log)
     }
 }

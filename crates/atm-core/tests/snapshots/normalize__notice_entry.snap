@@ -1,0 +1,21 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: "view(n.on_notice(Level::Error, \"Esecuzione interrotta dal riavvio dell'app\",\nNone, 1000))"
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "Notice",
+        "level": "Error",
+        "text": "Esecuzione interrotta dal riavvio dell'app",
+        "action": null
+      }
+    }
+  }
+]

@@ -1,0 +1,310 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 0,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "UserMessage",
+        "text": "# Crea hello\n\nScrivi hello.txt"
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 1,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1040,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "SessionInit",
+        "model": "claude-opus-5-5",
+        "permission_mode": "acceptEdits",
+        "api_key_source": "none",
+        "mcp_servers": 0,
+        "warnings": []
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 2,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1080,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_11",
+        "name": "Bash",
+        "summary": "$ npm test",
+        "input": "{\"command\":\"npm test\",\"description\":\"Run the test suite\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 2,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1080,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_11",
+        "name": "Bash",
+        "summary": "$ npm test",
+        "input": "{\"command\":\"npm test\",\"description\":\"Run the test suite\"}",
+        "status": {
+          "state": "AwaitingApproval",
+          "approval_id": "approval-cli-req-1",
+          "can_remember": true,
+          "reason": "Bash commands need approval in this mode"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 2,
+      "rev": 2,
+      "process_id": "proc-1",
+      "ts": 1080,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_11",
+        "name": "Bash",
+        "summary": "$ npm test",
+        "input": "{\"command\":\"npm test\",\"description\":\"Run the test suite\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 2,
+      "rev": 3,
+      "process_id": "proc-1",
+      "ts": 1080,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_11",
+        "name": "Bash",
+        "summary": "$ npm test",
+        "input": "{\"command\":\"npm test\",\"description\":\"Run the test suite\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "3 passing",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 3,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1200,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_12",
+        "name": "Bash",
+        "summary": "$ rm -rf build",
+        "input": "{\"command\":\"rm -rf build\",\"description\":\"Clean\"}",
+        "status": {
+          "state": "AwaitingApproval",
+          "approval_id": "approval-cli-req-2",
+          "can_remember": false,
+          "reason": "matches ask rule Bash(rm *)"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 3,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1200,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_12",
+        "name": "Bash",
+        "summary": "$ rm -rf build",
+        "input": "{\"command\":\"rm -rf build\",\"description\":\"Clean\"}",
+        "status": {
+          "state": "Denied",
+          "message": "no"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 3,
+      "rev": 2,
+      "process_id": "proc-1",
+      "ts": 1200,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_12",
+        "name": "Bash",
+        "summary": "$ rm -rf build",
+        "input": "{\"command\":\"rm -rf build\",\"description\":\"Clean\"}",
+        "status": {
+          "state": "Denied",
+          "message": "no"
+        },
+        "output": {
+          "text": "The user doesn't want to proceed with this tool use.",
+          "truncated_bytes": 0,
+          "is_error": true
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 4,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1320,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_13",
+        "name": "Edit",
+        "summary": "Edit src/main.rs",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/main.rs\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+        "status": {
+          "state": "AwaitingApproval",
+          "approval_id": "approval-cli-req-3",
+          "can_remember": false,
+          "reason": null
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 4,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1320,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_13",
+        "name": "Edit",
+        "summary": "Edit src/main.rs",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/src/main.rs\",\"new_string\":\"b\",\"old_string\":\"a\"}",
+        "status": {
+          "state": "Cancelled"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 5,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1400,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_14",
+        "name": "WebFetch",
+        "summary": "https://example.com/docs",
+        "input": "{\"prompt\":\"summarize\",\"url\":\"https://example.com/docs\"}",
+        "status": {
+          "state": "AwaitingApproval",
+          "approval_id": "approval-cli-req-4",
+          "can_remember": false,
+          "reason": null
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 6,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1440,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "TurnEnd",
+        "subtype": "error_during_execution",
+        "is_error": true,
+        "duration_ms": 900,
+        "num_turns": 2,
+        "cost_usd_estimate": 0.01,
+        "permission_denials": 1,
+        "text": null,
+        "limit": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 5,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1400,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_14",
+        "name": "WebFetch",
+        "summary": "https://example.com/docs",
+        "input": "{\"prompt\":\"summarize\",\"url\":\"https://example.com/docs\"}",
+        "status": {
+          "state": "Cancelled"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  }
+]

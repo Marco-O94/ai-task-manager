@@ -1,0 +1,273 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: "view(replay(\"simple.jsonl\", |_| None))"
+---
+[
+  {
+    "Upsert": {
+      "idx": 0,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "UserMessage",
+        "text": "# Crea hello\n\nScrivi hello.txt"
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 1,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1040,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "SessionInit",
+        "model": "claude-opus-5-5",
+        "permission_mode": "acceptEdits",
+        "api_key_source": "none",
+        "mcp_servers": 0,
+        "warnings": []
+      }
+    }
+  },
+  {
+    "Typing": "The user wants "
+  },
+  {
+    "Upsert": {
+      "idx": 2,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1280,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "Thinking",
+        "text": "The user wants a hello file."
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Typing": "I'll create "
+  },
+  {
+    "Upsert": {
+      "idx": 3,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1480,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "AssistantText",
+        "text": "I'll create hello.txt."
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 4,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1520,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_01",
+        "name": "Write",
+        "summary": "Write hello.txt",
+        "input": "{\"content\":\"hello\\n\",\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/hello.txt\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 4,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1520,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_01",
+        "name": "Write",
+        "summary": "Write hello.txt",
+        "input": "{\"content\":\"hello\\n\",\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/hello.txt\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "File created successfully at: /Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/hello.txt",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 5,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1720,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_02",
+        "name": "Task",
+        "summary": "Subagent: Check the file",
+        "input": "{\"description\":\"Check the file\",\"prompt\":\"Read hello.txt\",\"subagent_type\":\"general-purpose\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 6,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1760,
+      "parent_tool_use_id": "toolu_02",
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_03",
+        "name": "Read",
+        "summary": "Read hello.txt",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/hello.txt\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 6,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1760,
+      "parent_tool_use_id": "toolu_02",
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_03",
+        "name": "Read",
+        "summary": "Read hello.txt",
+        "input": "{\"file_path\":\"/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello/hello.txt\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "     1\thello",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 7,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1840,
+      "parent_tool_use_id": "toolu_02",
+      "body": {
+        "type": "AssistantText",
+        "text": "The file contains hello."
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 5,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1720,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_02",
+        "name": "Task",
+        "summary": "Subagent: Check the file",
+        "input": "{\"description\":\"Check the file\",\"prompt\":\"Read hello.txt\",\"subagent_type\":\"general-purpose\"}",
+        "status": {
+          "state": "Succeeded"
+        },
+        "output": {
+          "text": "The file contains hello.",
+          "truncated_bytes": 0,
+          "is_error": false
+        }
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 8,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1920,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "AssistantText",
+        "text": "Done: hello.txt contains hello."
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 9,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1960,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "TurnEnd",
+        "subtype": "success",
+        "is_error": false,
+        "duration_ms": 5123,
+        "num_turns": 3,
+        "cost_usd_estimate": 0.0421,
+        "permission_denials": 0,
+        "text": "Done: hello.txt contains hello.",
+        "limit": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Typing": null
+  }
+]
