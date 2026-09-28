@@ -1,0 +1,122 @@
+{
+  "base": "3f2a9c1d7e5b4a60c8d1e2f3a4b5c6d7e8f90a1b",
+  "snapshot_tree": "8b1e4d2c9a7f6e5d4c3b2a1f0e9d8c7b6a5f4e3d",
+  "files": [
+    {
+      "path": "tests/parser.rs",
+      "old_path": null,
+      "status": "Modified",
+      "additions": 3,
+      "deletions": 2,
+      "binary": false,
+      "too_large": false,
+      "omitted": false,
+      "lines": [
+        { "kind": "Hunk", "old_no": null, "new_no": null, "text": "@@ -10,9 +10,10 @@ use std::time::Duration;" },
+        { "kind": "Context", "old_no": 10, "new_no": 10, "text": "" },
+        { "kind": "Context", "old_no": 11, "new_no": 11, "text": "#[tokio::test]" },
+        { "kind": "Context", "old_no": 12, "new_no": 12, "text": "async fn parses_in_background() {" },
+        { "kind": "Context", "old_no": 13, "new_no": 13, "text": "    let handle = spawn_parser(\"a + b\");" },
+        { "kind": "Del", "old_no": 14, "new_no": null, "text": "    tokio::time::sleep(Duration::from_millis(100)).await;" },
+        { "kind": "Del", "old_no": 15, "new_no": null, "text": "    assert!(handle.is_finished());" },
+        { "kind": "Add", "old_no": null, "new_no": 14, "text": "    let ast = handle.await.expect(\"parser task\");" },
+        { "kind": "Add", "old_no": null, "new_no": 15, "text": "    assert_eq!(ast.to_string(), \"(+ a b)\");" },
+        { "kind": "Add", "old_no": null, "new_no": 16, "text": "    assert!(ast.spans().all(|s| !s.is_empty()));" },
+        { "kind": "Context", "old_no": 16, "new_no": 17, "text": "}" },
+        { "kind": "Context", "old_no": 17, "new_no": 18, "text": "" },
+        { "kind": "Context", "old_no": 18, "new_no": 19, "text": "#[tokio::test]" },
+        { "kind": "Meta", "old_no": null, "new_no": null, "text": "\\ No newline at end of file" }
+      ]
+    },
+    {
+      "path": "tests/support/mod.rs",
+      "old_path": null,
+      "status": "Added",
+      "additions": 6,
+      "deletions": 0,
+      "binary": false,
+      "too_large": false,
+      "omitted": false,
+      "lines": [
+        { "kind": "Hunk", "old_no": null, "new_no": null, "text": "@@ -0,0 +1,6 @@" },
+        { "kind": "Add", "old_no": null, "new_no": 1, "text": "//! Shared helpers for the parser tests." },
+        { "kind": "Add", "old_no": null, "new_no": 2, "text": "" },
+        { "kind": "Add", "old_no": null, "new_no": 3, "text": "pub fn spawn_parser(src: &str) -> tokio::task::JoinHandle<Ast> {" },
+        { "kind": "Add", "old_no": null, "new_no": 4, "text": "    let src = src.to_owned();" },
+        { "kind": "Add", "old_no": null, "new_no": 5, "text": "    tokio::spawn(async move { parse(&src).unwrap() })" },
+        { "kind": "Add", "old_no": null, "new_no": 6, "text": "}" }
+      ]
+    },
+    {
+      "path": "tests/legacy_timing.rs",
+      "old_path": null,
+      "status": "Deleted",
+      "additions": 0,
+      "deletions": 4,
+      "binary": false,
+      "too_large": false,
+      "omitted": false,
+      "lines": [
+        { "kind": "Hunk", "old_no": null, "new_no": null, "text": "@@ -1,4 +0,0 @@" },
+        { "kind": "Del", "old_no": 1, "new_no": null, "text": "#[test]" },
+        { "kind": "Del", "old_no": 2, "new_no": null, "text": "fn sleeps_long_enough() {" },
+        { "kind": "Del", "old_no": 3, "new_no": null, "text": "    std::thread::sleep(std::time::Duration::from_millis(250));" },
+        { "kind": "Del", "old_no": 4, "new_no": null, "text": "}" }
+      ]
+    },
+    {
+      "path": "src/parsing.rs",
+      "old_path": "src/parse.rs",
+      "status": "Renamed",
+      "additions": 1,
+      "deletions": 1,
+      "binary": false,
+      "too_large": false,
+      "omitted": false,
+      "lines": [
+        { "kind": "Hunk", "old_no": null, "new_no": null, "text": "@@ -1,4 +1,4 @@" },
+        { "kind": "Del", "old_no": 1, "new_no": null, "text": "//! Parser (module `parse`)." },
+        { "kind": "Add", "old_no": null, "new_no": 1, "text": "//! Parser (module `parsing`)." },
+        { "kind": "Context", "old_no": 2, "new_no": 2, "text": "" },
+        { "kind": "Context", "old_no": 3, "new_no": 3, "text": "use crate::lexer::Token;" },
+        { "kind": "Context", "old_no": 4, "new_no": 4, "text": "use crate::ast::Ast;" }
+      ]
+    },
+    {
+      "path": "docs/parser-states.png",
+      "old_path": null,
+      "status": "Added",
+      "additions": 0,
+      "deletions": 0,
+      "binary": true,
+      "too_large": false,
+      "omitted": false,
+      "lines": []
+    },
+    {
+      "path": "tests/fixtures/corpus.json",
+      "old_path": null,
+      "status": "Modified",
+      "additions": 5210,
+      "deletions": 4980,
+      "binary": false,
+      "too_large": true,
+      "omitted": false,
+      "lines": []
+    },
+    {
+      "path": "vendor/unicode-tables.csv",
+      "old_path": null,
+      "status": "Added",
+      "additions": 20000,
+      "deletions": 0,
+      "binary": false,
+      "too_large": false,
+      "omitted": true,
+      "lines": []
+    }
+  ],
+  "additions": 0,
+  "deletions": 0,
+  "truncated": true
+}
