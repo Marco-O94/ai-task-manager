@@ -97,10 +97,14 @@ pub fn MergeDialog(
                 Ok(MergeOutcome::Conflicts { files }) => Some(Blocked::Conflicts(files)),
                 Err(e) => Some(Blocked::Failed(e)),
             };
-            blocked.try_set(outcome);
-            if let Some(d) = diff {
+            // After a merge the `changed` event swaps the panel to the closed attempt, whose
+            // worktree may be gone: refetch only for the outcomes that leave it open.
+            if outcome.is_some()
+                && let Some(d) = diff
+            {
                 d.refresh.try_update(|n| *n += 1);
             }
+            blocked.try_set(outcome);
         });
     };
 

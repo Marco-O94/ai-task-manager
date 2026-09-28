@@ -13,6 +13,8 @@
 //! Query parameters, next to `?task=`: `fixture=simple|approval|flood` (the running turn
 //! defaults to `approval`, the finished history and new turns to `simple`) and
 //! `merge=clean|conflicts|dirty|nothing` (branch status and `merge_attempt` outcome).
+//! `lagged=1` resends the `Snapshot` to every view at each approval request, as the backend
+//! does after a `Lagged` (spec §6.5).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -149,6 +151,16 @@ struct Attempt {
 }
 
 impl Attempt {
+    /// The last [`SNAPSHOT_TAIL`] entries and the typing preview.
+    fn snapshot(&self) -> TranscriptMsg {
+        let start = self.entries.len().saturating_sub(SNAPSHOT_TAIL);
+        TranscriptMsg::Snapshot {
+            entries: self.entries[start..].to_vec(),
+            has_more: start > 0,
+            typing: self.typing.clone(),
+        }
+    }
+
     fn new(task: &Task, target_branch: String, fixture: Fixture, merge: Merge) -> Self {
         let id = new_id();
         let branch = format!("atm/{}-{}", &id[..8], slug(&task.title));
@@ -435,12 +447,7 @@ pub fn on_subscribe(sub_id: &str, attempt_id: &str) {
     let found = STATE.with_borrow_mut(|s| {
         s.subs.insert(sub_id.to_owned(), attempt_id.to_owned());
         let a = find_mut(s, attempt_id)?;
-        let start = a.entries.len().saturating_sub(SNAPSHOT_TAIL);
-        let snapshot = TranscriptMsg::Snapshot {
-            entries: a.entries[start..].to_vec(),
-            has_more: start > 0,
-            typing: a.typing.clone(),
-        };
+        let snapshot = a.snapshot();
         let deferred = mem::take(&mut a.deferred_start).then_some(a.turn);
         Some((snapshot, deferred))
     });
@@ -969,9 +976,16 @@ async fn wait_decision(
     })
     .map_err(|_| End::Abandoned)?;
     changed(attempt_id);
+    let mut lagged = query("lagged").is_some();
     let decision = loop {
         sleep(POLL_MS).await;
         check(attempt_id, turn)?;
+        // Once the views have rendered the request.
+        if mem::take(&mut lagged)
+            && let Ok(snapshot) = with_attempt(attempt_id, |a| a.snapshot())
+        {
+            broadcast(attempt_id, &snapshot);
+        }
         let answer = with_attempt(attempt_id, |a| a.approvals.get(approval_id).cloned())
             .ok()
             .flatten()

@@ -6,6 +6,8 @@ use atm_types::{
     DiffResult, FileDiff, FileStatus, GetBranchStatus, GetDiff, Id, LineKind, SendFollowUp,
     SendFollowUpReq, Task,
 };
+use std::collections::HashMap;
+
 use icons::{ChevronRight, GitBranch, GitMerge, RefreshCw, Trash2, Wrench};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -24,7 +26,7 @@ use crate::views::transcript::ON_DESTRUCTIVE;
 
 /// Lines of a file shown before "Mostra tutto" (spec §9.2).
 const MAX_LINES: usize = 2_000;
-/// Files expanded when the diff is (re)loaded.
+/// Files that start expanded (the first ones of a diff).
 const OPEN_FILES: usize = 20;
 
 /// Provided by [`DiffView`] to its merge dialog: the latest branch status and a refresh.
@@ -33,6 +35,34 @@ pub struct DiffCtx {
     pub status: RwSignal<Option<BranchStatus>>,
     /// Bump to refetch the diff and the branch status.
     pub refresh: RwSignal<u64>,
+}
+
+/// Expanded and "Mostra tutto" of a file, kept by path across refetches. `Arc` signals, so
+/// that they outlive the file views rebuilt with each new diff.
+#[derive(Clone)]
+struct FileUi {
+    open: ArcRwSignal<bool>,
+    show_all: ArcRwSignal<bool>,
+}
+
+impl FileUi {
+    fn new(open: bool) -> Self {
+        Self {
+            open: ArcRwSignal::new(open),
+            show_all: ArcRwSignal::new(false),
+        }
+    }
+}
+
+/// Keeps the state of the files still in the diff; the first [`OPEN_FILES`] new ones start open.
+fn reconcile(ui: &mut HashMap<String, FileUi>, files: &[FileDiff]) {
+    let mut old = std::mem::take(ui);
+    for (i, f) in files.iter().enumerate() {
+        let state = old
+            .remove(&f.path)
+            .unwrap_or_else(|| FileUi::new(i < OPEN_FILES));
+        ui.insert(f.path.clone(), state);
+    }
 }
 
 /// Follow-up of "Risolvi con l'agente" (spec §8.7).
@@ -69,7 +99,10 @@ pub fn resolve_with_agent(ctx: AppCtx, attempt_id: Id, target: &str, files: &[St
 pub fn DiffView(attempt_id: Id, #[prop(into)] task: Signal<Task>) -> impl IntoView {
     let ctx = use_app();
     let diff = RwSignal::new(None::<Result<DiffResult, AppError>>);
+    let files_ui = StoredValue::new(HashMap::<String, FileUi>::new());
     let status = RwSignal::new(None::<BranchStatus>);
+    // Inline rather than a toast: it would repeat on every `changed` (e.g. a missing worktree).
+    let status_error = RwSignal::new(None::<AppError>);
     let refresh = RwSignal::new(0u64);
     let loading = RwSignal::new(false);
     let merge_open = RwSignal::new(false);
@@ -95,19 +128,34 @@ pub fn DiffView(attempt_id: Id, #[prop(into)] task: Signal<Task>) -> impl IntoVi
         let status_req = req.clone();
         spawn_local(async move {
             let res = ipc::call::<GetDiff>(&req).await;
-            if current() {
-                diff.try_set(Some(res));
-                loading.try_set(false);
+            if !current() {
+                return;
             }
+            loading.try_set(false);
+            // An unchanged diff (e.g. an approval during a turn) keeps the rendered files.
+            let unchanged = diff.try_with_untracked(
+                |old| matches!((old, &res), (Some(Ok(old)), Ok(new)) if old == new),
+            );
+            if unchanged != Some(false) {
+                return;
+            }
+            if let Ok(d) = &res {
+                files_ui.try_update_value(|ui| reconcile(ui, &d.files));
+            }
+            diff.try_set(Some(res));
         });
         spawn_local(async move {
-            match ipc::call::<GetBranchStatus>(&status_req).await {
-                Ok(s) if current() => {
-                    status.try_set(Some(s));
-                }
-                Ok(_) => {}
-                Err(e) => ctx.toasts.app_error(&e),
+            let res = ipc::call::<GetBranchStatus>(&status_req).await;
+            if !current() {
+                return;
             }
+            // No status disables Merge.
+            let (ok, err) = match res {
+                Ok(s) => (Some(s), None),
+                Err(e) => (None, Some(e)),
+            };
+            status.try_set(ok);
+            status_error.try_set(err);
         });
     });
 
@@ -160,7 +208,19 @@ pub fn DiffView(attempt_id: Id, #[prop(into)] task: Signal<Task>) -> impl IntoVi
                 </div>
             </div>
             {move || status.with(|s| s.as_ref().map(status_alerts))}
-            {move || diff.with(|d| files_view(d.as_ref()))}
+            {move || {
+                status_error
+                    .get()
+                    .map(|e| {
+                        view! {
+                            <Alert class="border-destructive/50 text-destructive">
+                                <AlertTitle>"Stato del branch non disponibile"</AlertTitle>
+                                <AlertDescription>{e.to_string()}</AlertDescription>
+                            </Alert>
+                        }
+                    })
+            }}
+            {move || diff.with(|d| files_view(d.as_ref(), files_ui))}
             <MergeDialog open=merge_open attempt_id task />
         </div>
     }
@@ -236,7 +296,10 @@ fn status_alerts(s: &BranchStatus) -> AnyView {
         .into_any()
 }
 
-fn files_view(diff: Option<&Result<DiffResult, AppError>>) -> AnyView {
+fn files_view(
+    diff: Option<&Result<DiffResult, AppError>>,
+    files_ui: StoredValue<HashMap<String, FileUi>>,
+) -> AnyView {
     match diff {
         None => view! {
             <div class="flex flex-col gap-2">
@@ -278,8 +341,13 @@ fn files_view(diff: Option<&Result<DiffResult, AppError>>) -> AnyView {
             let files = d
                 .files
                 .iter()
-                .enumerate()
-                .map(|(i, f)| view! { <FileBlock file=f.clone() expanded=i < OPEN_FILES /> })
+                .map(|f| {
+                    let ui = files_ui
+                        .try_with_value(|ui| ui.get(&f.path).cloned())
+                        .flatten()
+                        .unwrap_or_else(|| FileUi::new(true));
+                    view! { <FileBlock file=f.clone() ui /> }
+                })
                 .collect_view();
             view! {
                 {truncated}
@@ -291,7 +359,7 @@ fn files_view(diff: Option<&Result<DiffResult, AppError>>) -> AnyView {
 }
 
 #[component]
-fn FileBlock(file: FileDiff, expanded: bool) -> impl IntoView {
+fn FileBlock(file: FileDiff, ui: FileUi) -> impl IntoView {
     let placeholder = if file.binary {
         Some("File binario: contenuto non mostrato.")
     } else if file.too_large {
@@ -301,8 +369,8 @@ fn FileBlock(file: FileDiff, expanded: bool) -> impl IntoView {
     } else {
         None
     };
-    let open = RwSignal::new(expanded);
-    let show_all = RwSignal::new(false);
+    let open = RwSignal::from(ui.open);
+    let show_all = RwSignal::from(ui.show_all);
     let (letter, label, variant) = status_badge(file.status);
     let path = match &file.old_path {
         Some(old) => format!("{old} → {}", file.path),
@@ -470,5 +538,43 @@ pub fn ClosedAttempt(attempt: AttemptView) -> impl IntoView {
                     }
                 })}
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file(path: &str) -> FileDiff {
+        FileDiff {
+            path: path.into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            additions: 1,
+            deletions: 0,
+            binary: false,
+            too_large: false,
+            omitted: false,
+            lines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_the_state_of_the_files_still_in_the_diff() {
+        let mut ui = HashMap::new();
+        reconcile(&mut ui, &[file("a"), file("b")]);
+        ui["a"].open.set(false);
+        ui["b"].show_all.set(true);
+
+        let files: Vec<_> = (0..=OPEN_FILES).map(|i| file(&format!("n{i}"))).collect();
+        reconcile(&mut ui, &[&[file("b"), file("a")], &files[..]].concat());
+        assert!(!ui["a"].open.get_untracked());
+        assert!(ui["b"].show_all.get_untracked());
+        // New files open by position; the ones past [`OPEN_FILES`] start collapsed.
+        assert!(ui["n0"].open.get_untracked());
+        assert!(!ui[&format!("n{}", OPEN_FILES - 2)].open.get_untracked());
+
+        reconcile(&mut ui, &[file("b")]);
+        assert_eq!(ui.len(), 1);
     }
 }

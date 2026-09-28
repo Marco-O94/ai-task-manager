@@ -57,6 +57,8 @@ const MODES: &[(PermissionMode, &str)] = &[
 struct Options {
     branches: Vec<String>,
     allow_bypass: bool,
+    /// The project's default model when it is not one of [`MODELS`] (e.g. a full model id).
+    other_model: Option<String>,
 }
 
 /// Open while `task_id` is `Some`; closing or starting sets it to `None`. Used by the board
@@ -204,6 +206,9 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
                                                 .iter()
                                                 .map(|(v, l)| option((*v).into(), (*l).into(), model))
                                                 .collect_view()}
+                                            {opts
+                                                .other_model
+                                                .map(|m| option(m.clone(), format!("Progetto: {m}"), model))}
                                         </SelectNative>
                                     </div>
                                     <div class="grid gap-2">
@@ -331,14 +336,16 @@ async fn load_options(
         .map(|p| p.default_permission_mode)
         .filter(|m| *m != PermissionMode::BypassPermissions || allow_bypass)
         .unwrap_or(PermissionMode::AcceptEdits);
-    let defaults = Defaults {
-        target,
-        model: project.and_then(|p| p.default_model).unwrap_or_default(),
-        mode,
-    };
+    let model = project.and_then(|p| p.default_model).unwrap_or_default();
     let options = Options {
         branches: list.branches,
         allow_bypass,
+        other_model: Some(model.clone()).filter(|m| MODELS.iter().all(|(v, _)| v != m)),
+    };
+    let defaults = Defaults {
+        target,
+        model,
+        mode,
     };
     Ok((options, defaults))
 }

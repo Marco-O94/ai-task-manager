@@ -137,7 +137,7 @@ pub fn Transcript(attempt_id: Id) -> impl IntoView {
         }
     };
     let on_key = move |ev: web_sys::KeyboardEvent| {
-        if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home") {
+        if matches!(ev.key().as_str(), "ArrowUp" | "PageUp" | "Home") && !in_text_field(&ev) {
             leave_bottom();
         }
     };
@@ -321,6 +321,16 @@ fn anchor_top(scroller: &web_sys::HtmlDivElement, idx: u32) -> Option<f64> {
         .query_selector(&format!("[data-entry=\"{idx}\"]"))
         .ok()??;
     Some(row.get_bounding_client_rect().top())
+}
+
+/// The key goes to a field inside a row (e.g. the deny message), not to the scroller.
+fn in_text_field(ev: &web_sys::KeyboardEvent) -> bool {
+    ev.target()
+        .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+        .is_some_and(|el| {
+            el.is_content_editable()
+                || matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
+        })
 }
 
 fn tail(text: &str, max: usize) -> String {

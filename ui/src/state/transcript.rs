@@ -62,7 +62,8 @@ impl TranscriptStore {
         }
     }
 
-    /// `Snapshot` replaces the store; `Upsert` applies per `idx` only if `rev` is greater;
+    /// `Snapshot` replaces the window (rows still in it keep their `Row`); `Upsert` applies per
+    /// `idx` only if `rev` is greater;
     /// `Typing` sets the preview.
     pub fn apply(&self, msg: TranscriptMsg) {
         match msg {
@@ -72,10 +73,31 @@ impl TranscriptStore {
                 typing,
             } => {
                 let skip = entries.len().saturating_sub(MAX_ROWS);
-                let rows = entries.into_iter().skip(skip).map(Row::new).collect();
-                if let Some(old) = self.rows.try_get_untracked() {
-                    dispose(old);
-                }
+                // `<For key=idx>` keeps the views of the idx still present, bound to their row:
+                // reuse it and update its entry instead of creating a new signal.
+                let mut old: HashMap<u32, Row> = self
+                    .rows
+                    .try_get_untracked()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| (r.idx, r))
+                    .collect();
+                let rows = entries
+                    .into_iter()
+                    .skip(skip)
+                    .map(|entry| match old.remove(&entry.idx) {
+                        Some(row) => {
+                            if row.entry.try_with_untracked(|cur| cur.rev != entry.rev)
+                                == Some(true)
+                            {
+                                row.entry.try_set(entry);
+                            }
+                            row
+                        }
+                        None => Row::new(entry),
+                    })
+                    .collect();
+                dispose(old.into_values());
                 self.set_rows(rows);
                 self.has_more.try_set(has_more || skip > 0);
                 self.newer_hidden.try_set(false);
@@ -239,6 +261,25 @@ mod tests {
         snapshot(&store, range(5, 7), true);
         assert_eq!(window(&store), (5, 6, 2));
         assert!(store.has_more.get_untracked());
+    }
+
+    #[test]
+    fn a_second_snapshot_keeps_the_rows_still_in_the_window() {
+        let store = TranscriptStore::new();
+        snapshot(&store, range(0, 10), false);
+        let row = |store: &TranscriptStore, idx| {
+            let pos = store.index.with_value(|i| i[&idx]);
+            store.rows.with_untracked(|rows| rows[pos])
+        };
+        let (kept, dropped) = (row(&store, 7), row(&store, 2));
+
+        snapshot(&store, vec![entry(5, 1), entry(6, 3), entry(7, 1)], false);
+        assert_eq!(text(&store, 6), "6.3");
+        assert!(dropped.entry.try_get_untracked().is_none());
+        upsert(&store, vec![entry(7, 2)]);
+        // The row a mounted view is bound to sees the update.
+        assert_eq!(kept.entry.with_untracked(|e| e.rev), 2);
+        assert_eq!(text(&store, 7), "7.2");
     }
 
     #[test]
