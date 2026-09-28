@@ -2,20 +2,26 @@
 //!
 //! - `--version` / `-v`: `<CLAUDE_TESTED_VERSION> (Claude Code)`.
 //! - `auth status [--json|--text]`: `FAKE_CLAUDE_AUTH=in` (default) → exit 0, `out` → exit 1,
-//!   anything else → exit 2. `auth login …` prints one line and exits 0.
+//!   anything else → exit 2. The content of the file `$FAKE_CLAUDE_AUTH_FILE` (`in`/`out`), when
+//!   it exists, takes precedence: a running app can be logged out and in (M4 E2E).
+//!   `auth login …` prints one line and exits 0.
 //! - `-p …` (stream-json on stdin/stdout): appends one JSON line per call to
 //!   `$FAKE_CLAUDE_RECORD`: `{"kind":"call","argv":[…without argv0],"cwd":…,"pwd":…,
-//!   "env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for every
-//!   answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`), and
-//!   `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`.
+//!   "pid":…,"env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for
+//!   every answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`),
+//!   and `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`.
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
-//!   `[fake:NAME]` in its text, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
+//!   `[fake:NAME]` in its text, else `resolve_merge` for the app's "Risolvi con l'agente"
+//!   prompt, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
 //!   An interrupt is answered with success plus a `result` `error_during_execution`
 //!   (except `hang_ignore`).
 //!
 //! Scenarios: simple, approval, slow, hang, hang_ignore, crash, noinit, big, flood, control,
-//! usage_limit, auth_fail, resolve_merge (`$FAKE_CLAUDE_TARGET`), resume_fail. Counts:
-//! `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
+//! usage_limit, auth_fail (also writes `out` to `$FAKE_CLAUDE_AUTH_FILE`), resolve_merge
+//! (`$FAKE_CLAUDE_TARGET`, else the target named by the app's conflict prompt), resume_fail.
+//! Counts: `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
+//! `FAKE_CLAUDE_DELTA_MS` (default 0): pause between the text deltas of a streamed text, so a
+//! UI can be seen rendering it progressively.
 
 use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
@@ -49,11 +55,20 @@ fn main() {
     }
 }
 
+/// Where a running app's tests keep the login state (`in`/`out`), see [`auth_status`].
+const AUTH_FILE_ENV: &str = "FAKE_CLAUDE_AUTH_FILE";
+/// First words of the app's "Risolvi con l'agente" follow-up (spec §8.7).
+const CONFLICT_PROMPT: &str = "This branch conflicts with `";
+
 fn auth_status(text: bool) {
-    let logged_in = match std::env::var("FAKE_CLAUDE_AUTH").as_deref() {
-        Ok("in") | Err(_) => true,
-        Ok("out") => false,
-        Ok(other) => {
+    let from_file = std::env::var_os(AUTH_FILE_ENV)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|s| s.trim().to_owned());
+    let state = from_file.or_else(|| std::env::var("FAKE_CLAUDE_AUTH").ok());
+    let logged_in = match state.as_deref() {
+        Some("in") | None => true,
+        Some("out") => false,
+        Some(other) => {
             eprintln!("fake-claude: FAKE_CLAUDE_AUTH={other}");
             exit(2);
         }
@@ -98,6 +113,8 @@ struct Session {
     permission_mode: String,
     record: Option<PathBuf>,
     counter: u64,
+    /// Text of the user message being played.
+    prompt: String,
 }
 
 impl Session {
@@ -116,6 +133,7 @@ impl Session {
             permission_mode: flag("--permission-mode=").unwrap_or_else(|| "default".into()),
             record: std::env::var_os("FAKE_CLAUDE_RECORD").map(PathBuf::from),
             counter: 0,
+            prompt: String::new(),
         };
         let env: serde_json::Map<String, Value> = RECORDED_VARS
             .iter()
@@ -126,6 +144,8 @@ impl Session {
             "argv": args,
             "cwd": session.cwd,
             "pwd": std::env::var_os("PWD").map(|p| p.to_string_lossy().into_owned()),
+            // Lets a test find its own agents among other fake-claude processes.
+            "pid": std::process::id(),
             "env": env,
         }));
         session
@@ -152,7 +172,8 @@ impl Session {
             match msg["type"].as_str() {
                 Some("control_request") => self.answer(&msg),
                 Some("user") => {
-                    let scenario = pick_scenario(&user_text(&msg));
+                    self.prompt = user_text(&msg);
+                    let scenario = pick_scenario(&self.prompt);
                     match self.play(&scenario) {
                         Ok(()) => {}
                         Err(Stop::Interrupted(request_id)) => {
@@ -296,7 +317,13 @@ impl Session {
                 true,
                 Some("Claude AI usage limit reached. Your limit will reset at 5pm (Europe/Rome)."),
             ),
-            "auth_fail" => self.result("success", true, Some("Not logged in · Please run /login")),
+            "auth_fail" => {
+                // The CLI's login is gone: its `auth status` says so from now on.
+                if let Some(path) = std::env::var_os(AUTH_FILE_ENV) {
+                    let _ = std::fs::write(path, "out");
+                }
+                self.result("success", true, Some("Not logged in · Please run /login"));
+            }
             "resolve_merge" => self.resolve_merge(),
             other => self.result(
                 "error_during_execution",
@@ -375,10 +402,14 @@ impl Session {
         }
     }
 
-    /// `git merge $FAKE_CLAUDE_TARGET`, conflicts resolved by concatenating ours + theirs.
+    /// `git merge <target>`, conflicts resolved by concatenating ours + theirs. The target is
+    /// `$FAKE_CLAUDE_TARGET`, else the branch named by the app's conflict prompt.
     fn resolve_merge(&mut self) {
-        let Ok(target) = std::env::var("FAKE_CLAUDE_TARGET") else {
-            let text = "fake-claude: FAKE_CLAUDE_TARGET non impostata";
+        let target = std::env::var("FAKE_CLAUDE_TARGET")
+            .ok()
+            .or_else(|| conflict_target(&self.prompt));
+        let Some(target) = target else {
+            let text = "fake-claude: FAKE_CLAUDE_TARGET non impostata e nessun target nel prompt";
             return self.result("error_during_execution", true, Some(text));
         };
         let id = self.tool_use("Bash", json!({"command": format!("git merge {target}")}));
@@ -441,7 +472,11 @@ impl Session {
                    "delta": {"type": "text_delta", "text": chunk}})
         }))
         .chain([json!({"type": "content_block_stop", "index": 0})]);
+        let delay = Duration::from_millis(count_env("FAKE_CLAUDE_DELTA_MS", 0).into());
         for event in events {
+            if event["type"] == "content_block_delta" && !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
             let frame = self.envelope(
                 "stream_event",
                 json!({"event": event, "parent_tool_use_id": null}),
@@ -560,10 +595,21 @@ fn user_text(msg: &Value) -> String {
     }
 }
 
+/// The target branch of the app's "Risolvi con l'agente" prompt: "This branch conflicts with
+/// `<target>` in: …".
+fn conflict_target(text: &str) -> Option<String> {
+    let (target, _) = text.strip_prefix(CONFLICT_PROMPT)?.split_once('`')?;
+    (!target.is_empty() && !target.starts_with('-')).then(|| target.to_owned())
+}
+
 fn pick_scenario(text: &str) -> String {
     text.split_once("[fake:")
         .and_then(|(_, rest)| rest.split_once(']'))
         .map(|(name, _)| name.trim().to_owned())
+        .or_else(|| {
+            text.starts_with(CONFLICT_PROMPT)
+                .then(|| "resolve_merge".to_owned())
+        })
         .or_else(|| std::env::var("FAKE_CLAUDE_SCENARIO").ok())
         .unwrap_or_else(|| "simple".into())
 }
@@ -612,5 +658,25 @@ fn merge_concatenating(cwd: &Path, target: &str) -> Result<String, String> {
         Ok(log)
     } else {
         Err(log)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_conflict_prompt_plays_resolve_merge_on_its_target() {
+        let prompt = "This branch conflicts with `release/1.2` in: hello.txt. Run `git merge \
+                      release/1.2`, resolve every conflict.";
+        assert_eq!(pick_scenario(prompt), "resolve_merge");
+        assert_eq!(conflict_target(prompt).as_deref(), Some("release/1.2"));
+        assert_eq!(pick_scenario("Crea hello [fake:approval]"), "approval");
+        assert_eq!(conflict_target("Merge `main` please"), None);
+        assert_eq!(conflict_target("This branch conflicts with `` in: x"), None);
+        assert_eq!(
+            conflict_target("This branch conflicts with `--all` in: x"),
+            None
+        );
     }
 }

@@ -456,9 +456,9 @@ fn TaskCardView(
 fn card_badges(ctx: AppCtx, card: &TaskCard) -> impl IntoView + use<> {
     let active = card.attempt_state == Some(AttemptState::Active);
     let idle = active && !card.running;
-    let interrupted = idle && card.last_stop_reason == Some(StopReason::AppRestart);
+    let interrupted = idle && interrupted_by_app(card.last_stop_reason);
     let failed = idle && !interrupted && card.last_status == Some(ProcessStatus::Failed);
-    let stopped = idle && card.last_status == Some(ProcessStatus::Killed);
+    let stopped = idle && !interrupted && card.last_status == Some(ProcessStatus::Killed);
     let missing = card.worktree_state == Some(WorktreeState::Missing);
     let closed = match card.attempt_state {
         Some(AttemptState::Merged) => Some((BadgeVariant::Success, "Mergiato")),
@@ -559,6 +559,16 @@ fn card_badges(ctx: AppCtx, card: &TaskCard) -> impl IntoView + use<> {
     (badges, branch)
 }
 
+/// A turn cut by the app's lifecycle rather than by the user or the agent: stopped by the
+/// quit (`app_shutdown`: Cmd+Q finalizes the running turns) or found running by the recovery
+/// after a crash (`app_restart`). Both offer "Interrotto – Continua" (spec §7.9, §12.2 step 8).
+pub fn interrupted_by_app(reason: Option<StopReason>) -> bool {
+    matches!(
+        reason,
+        Some(StopReason::AppShutdown | StopReason::AppRestart)
+    )
+}
+
 /// "Continua" on a turn interrupted by an app restart: follow-up with `CONTINUE_PROMPT`,
 /// which resumes the session (spec §7.9).
 fn continue_attempt(ctx: AppCtx, attempt_id: Id) {
@@ -645,5 +655,20 @@ fn QuickCreate(board: BoardState, status: TaskStatus) -> impl IntoView {
                 </form>
             </Show>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interrupted_by_app;
+    use atm_types::StopReason;
+
+    #[test]
+    fn quit_and_crash_recovery_offer_continua_user_stop_does_not() {
+        assert!(interrupted_by_app(Some(StopReason::AppShutdown)));
+        assert!(interrupted_by_app(Some(StopReason::AppRestart)));
+        assert!(!interrupted_by_app(Some(StopReason::UserStop)));
+        assert!(!interrupted_by_app(Some(StopReason::Crash)));
+        assert!(!interrupted_by_app(None));
     }
 }

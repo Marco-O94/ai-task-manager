@@ -1,4 +1,6 @@
 mod app;
+#[cfg(not(feature = "mock"))]
+mod e2e;
 #[rustfmt::skip] // vendored Rust/UI code, kept byte-identical to upstream
 mod hooks;
 mod ipc;
@@ -40,7 +42,10 @@ fn main() {
     apply_color_scheme();
     leptos::mount::mount_to_body(app::App);
     #[cfg(not(feature = "mock"))]
-    leptos::task::spawn_local(selftest::run_if_enabled());
+    {
+        leptos::task::spawn_local(selftest::run_if_enabled());
+        leptos::task::spawn_local(e2e::run_if_enabled());
+    }
 }
 
 /// Sets `dark` on `<html>` from the OS preference (manual toggle deferred, spec §9.2).

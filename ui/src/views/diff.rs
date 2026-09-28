@@ -93,10 +93,17 @@ pub fn resolve_with_agent(ctx: AppCtx, attempt_id: Id, target: &str, files: &[St
     });
 }
 
-/// Fetches `get_diff` and `get_branch_status` on open, on `changed` of the task while
-/// visible, and on "Aggiorna". `task` feeds the merge dialog's default message.
+/// Fetches `get_diff` and `get_branch_status` on open, on "Aggiorna" and after each refetch of
+/// the panel's detail (`changed` of the task) while visible. `active` is read from that
+/// detail: once it says the attempt is closed (merged, discarded) nothing is fetched, as its
+/// worktree is gone and the panel is about to show the closed attempt instead. `task` feeds
+/// the merge dialog's default message.
 #[component]
-pub fn DiffView(attempt_id: Id, #[prop(into)] task: Signal<Task>) -> impl IntoView {
+pub fn DiffView(
+    attempt_id: Id,
+    #[prop(into)] task: Signal<Task>,
+    #[prop(into)] active: Signal<bool>,
+) -> impl IntoView {
     let ctx = use_app();
     let diff = RwSignal::new(None::<Result<DiffResult, AppError>>);
     let files_ui = StoredValue::new(HashMap::<String, FileUi>::new());
@@ -110,10 +117,14 @@ pub fn DiffView(attempt_id: Id, #[prop(into)] task: Signal<Task>) -> impl IntoVi
     provide_context(DiffCtx { status, refresh });
     let id = StoredValue::new(attempt_id.clone());
 
-    // Mounted only while the tab is visible: mount = "on open".
+    // Mounted only while the tab is visible: mount = "on open". Tracking the panel's detail
+    // rather than `detail_version` orders the refetch after it: a `changed` that closes the
+    // attempt never fetches the diff of a removed worktree.
     Effect::new(move |_| {
         refresh.track();
-        ctx.detail_version.track();
+        if !active.get() {
+            return;
+        }
         let seq = fetches
             .try_update_value(|n| {
                 *n += 1;

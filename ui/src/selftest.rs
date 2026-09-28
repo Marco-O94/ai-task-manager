@@ -65,6 +65,11 @@ pub fn count_csp_violations() {
     on_violation.forget();
 }
 
+/// `securitypolicyviolation` events counted on this page load so far (the E2E reports them).
+pub fn csp_violations() -> u32 {
+    CSP_VIOLATIONS.with(Cell::get)
+}
+
 pub async fn run_if_enabled() {
     if !ipc::call::<DebugSelftestEnabled>(&Empty {})
         .await
@@ -242,7 +247,9 @@ async fn ping_err_typed() -> bool {
     )
 }
 
-async fn channel_in_order() -> bool {
+/// `debug_channel_probe`: 50 messages in order, the three of 20 KiB intact (also the E2E's
+/// check of Channel messages over 8 KiB).
+pub async fn channel_in_order() -> bool {
     let received: Rc<RefCell<Vec<Option<ProbeMsg>>>> = Rc::default();
     let sink = received.clone();
     let result = ipc::call_with_channel::<DebugChannelProbe, ProbeMsg>(&Empty {}, move |m| {
@@ -351,7 +358,7 @@ fn probe_intact(idx: usize, m: &ProbeMsg) -> bool {
     }
 }
 
-async fn sleep(ms: i32) {
+pub async fn sleep(ms: i32) {
     let promise = js_sys::Promise::new(&mut |resolve, _| {
         let _ = window().set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms);
     });

@@ -5,7 +5,7 @@
 use atm_types::{
     AppError, AttemptIdReq, AttemptView, CONTINUE_PROMPT, GetTaskDetail, Id, IdReq, MoveTask,
     MoveTaskReq, OpenAttempt, OpenAttemptReq, OpenTarget, ProcessStatus, SendFollowUp,
-    SendFollowUpReq, StopAttempt, StopReason, Task, TaskDetail, TaskStatus, WorktreeState,
+    SendFollowUpReq, StopAttempt, Task, TaskDetail, TaskStatus, WorktreeState,
 };
 use icons::{Code, FolderOpen, GitBranch, Play, RotateCw, Square, SquareTerminal, Trash2, X};
 use leptos::prelude::*;
@@ -22,6 +22,7 @@ use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
 use crate::ui::tabs::{Tabs, TabsContent, TabsList, TabsTrigger, TabsVariant};
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
+use crate::views::board::interrupted_by_app;
 use crate::views::composer::Composer;
 use crate::views::diff::{ClosedAttempt, DiffView};
 use crate::views::merge_dialog::DiscardDialog;
@@ -150,7 +151,7 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
         active.with(|a| a.as_ref().is_some_and(|a| !a.running))
             && last_process.with(|p| {
                 p.as_ref()
-                    .is_some_and(|p| p.stop_reason == Some(StopReason::AppRestart))
+                    .is_some_and(|p| interrupted_by_app(p.stop_reason))
             })
     });
     let tab = RwSignal::new(TAB_AGENT);
@@ -184,7 +185,18 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
     // Mounted only while the tab is visible: the diff is fetched on open (spec §9.2).
     let changes = move || {
         (tab.get() == TAB_CHANGES).then(|| match active_id.get() {
-            Some(attempt_id) => view! { <DiffView attempt_id task /> }.into_any(),
+            Some(attempt_id) => {
+                let id = attempt_id.clone();
+                // Not memoized: every refetch of the detail notifies it.
+                let active = Signal::derive(move || {
+                    detail.with(|d| {
+                        d.as_ref()
+                            .and_then(|d| d.attempt.as_ref())
+                            .is_some_and(|a| a.id == id)
+                    })
+                });
+                view! { <DiffView attempt_id task active /> }.into_any()
+            }
             None => match closed.get() {
                 Some(attempt) => view! { <ClosedAttempt attempt /> }.into_any(),
                 None => view! {
@@ -232,7 +244,7 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                                 })
                         }}
                         <Show when=move || {
-                            !running.get()
+                            !running.get() && !interrupted.get()
                                 && last_process
                                     .with(|p| p.as_ref().is_some_and(|p| p.status == ProcessStatus::Failed))
                         }>

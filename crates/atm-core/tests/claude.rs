@@ -561,6 +561,34 @@ async fn auth_status_against_fake_claude() {
     ));
 }
 
+/// `FAKE_CLAUDE_AUTH_FILE` (the M4 E2E) wins over `FAKE_CLAUDE_AUTH` while it exists.
+#[tokio::test]
+async fn fake_claude_auth_file_overrides_the_env() {
+    let fake = common::fake_claude();
+    let dir = common::tempdir();
+    let file = dir.path().join("auth");
+    let file_str = file.to_string_lossy().into_owned();
+    let env = ChildEnv::new(
+        base_env(&[
+            ("FAKE_CLAUDE_AUTH", "in"),
+            ("FAKE_CLAUDE_AUTH_FILE", &file_str),
+        ]),
+        &test_path(),
+        false,
+    );
+    assert!(matches!(
+        claude::auth_status(&fake, &env).await,
+        AuthState::LoggedIn { .. }
+    ));
+    std::fs::write(&file, "out\n").unwrap();
+    assert_eq!(claude::auth_status(&fake, &env).await, AuthState::LoggedOut);
+    std::fs::write(&file, "in").unwrap();
+    assert!(matches!(
+        claude::auth_status(&fake, &env).await,
+        AuthState::LoggedIn { .. }
+    ));
+}
+
 #[test]
 fn login_script_content() {
     let claude = Path::new("/Users/me/.local/bin/claude");

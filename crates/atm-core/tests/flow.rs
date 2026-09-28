@@ -148,6 +148,7 @@ impl Flow {
             claude_path: Some(claude),
             path_env: Some(std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into())),
             extra_env: env,
+            open_log: None,
         };
         let seen = Seen::new();
         let core = Core::new(config.clone(), seen.notify()).unwrap();
@@ -1378,6 +1379,58 @@ async fn unknown_attempt_snapshot_and_reload() {
     assert_eq!(
         f.core.open_url(url).await.unwrap_err().code,
         ErrorCode::Invalid
+    );
+}
+
+/// With `open_log` (debug builds, the M4 E2E) the login script is still written but `open` is
+/// only recorded: no Terminal, Finder or browser is launched. Release builds ignore `open_log`,
+/// so there the test would really open Terminal and a browser: it only runs in debug.
+#[tokio::test]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "open_log is honoured only in debug builds"
+)]
+async fn open_calls_are_recorded_with_open_log() {
+    let dir = common::tempdir();
+    let log = dir.path().join("open.jsonl");
+    let config = CoreConfig {
+        data_dir: dir.path().join("data"),
+        cache_dir: dir.path().join("cache"),
+        claude_path: Some(common::fake_claude()),
+        path_env: Some(std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into())),
+        extra_env: hermetic(&[]),
+        open_log: Some(log.clone()),
+    };
+    let core = Core::new(config, Seen::new().notify()).unwrap();
+    let req = OpenLoginTerminalReq {
+        method: LoginMethod::Sso,
+    };
+    core.open_login_terminal(req).await.unwrap();
+    let script = dir.path().join("cache").join(claude::LOGIN_SCRIPT_NAME);
+    assert!(
+        std::fs::read_to_string(&script)
+            .unwrap()
+            .contains(" auth login --sso\n")
+    );
+    let url = OpenUrlReq {
+        url: "https://example.com/docs".into(),
+    };
+    core.open_url(url).await.unwrap();
+    let calls: Vec<Vec<String>> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            vec![
+                "-a".to_owned(),
+                "Terminal".into(),
+                script.display().to_string()
+            ],
+            vec!["https://example.com/docs".into()],
+        ]
     );
 }
 

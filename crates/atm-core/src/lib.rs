@@ -76,6 +76,10 @@ pub struct CoreConfig {
     /// through `ChildEnv`, git through `Git::with_env`). Tests: `FAKE_CLAUDE_*` per Core,
     /// without `std::env::set_var`.
     pub extra_env: Vec<(OsString, OsString)>,
+    /// Debug builds only (the E2E of M4): every `/usr/bin/open` the core would run (Terminal for
+    /// the login, Finder, editor, URLs) is appended to this file as a JSON array of its
+    /// arguments instead. Ignored in release builds.
+    pub open_log: Option<PathBuf>,
 }
 
 /// Unix time in milliseconds.
@@ -226,7 +230,14 @@ impl Core {
         let probe = s.probe(false).await;
         let claude = probe.claude.as_ref().ok_or_else(claude_not_found)?;
         let script = claude::write_login_script(&s.config.cache_dir, &claude.path, req.method)?;
-        claude::open_login_terminal(&script).await?;
+        let args = [
+            "-a".to_owned(),
+            "Terminal".into(),
+            script.display().to_string(),
+        ];
+        if !s.record_open(&args).await? {
+            claude::open_login_terminal(&script).await?;
+        }
         tokio::spawn(async move {
             tokio::time::sleep(LOGIN_SCRIPT_TTL).await;
             let _ = tokio::fs::remove_file(script).await;
@@ -1073,9 +1084,39 @@ impl Inner {
         let _ = git.delete_branch(Path::new(repo), branch).await;
     }
 
+    /// With `CoreConfig::open_log` (debug builds): appends `args` to it and returns `true`, the
+    /// `open` must not run. Errors: `Io`.
+    async fn record_open(&self, args: &[String]) -> Result<bool, AppError> {
+        use tokio::io::AsyncWriteExt as _;
+        let Some(log) = self
+            .config
+            .open_log
+            .as_ref()
+            .filter(|_| cfg!(debug_assertions))
+        else {
+            return Ok(false);
+        };
+        let line = serde_json::to_string(args)? + "\n";
+        let io_err = |e: std::io::Error| AppError::io(format!("{}: {e}", log.display()));
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .await
+            .map_err(io_err)?;
+        // One write per line, as the recorded calls may overlap.
+        file.write_all(line.as_bytes()).await.map_err(io_err)?;
+        // tokio's `File` finishes a write in the background: done before the caller reads.
+        file.flush().await.map_err(io_err)?;
+        Ok(true)
+    }
+
     /// `/usr/bin/open <args>` (argv, no shell). An app it launches inherits this environment
     /// (open(1)), so credentials, nesting and git variables are removed as for every child.
     async fn open(&self, args: &[String]) -> Result<(), AppError> {
+        if self.record_open(args).await? {
+            return Ok(());
+        }
         let allow_api_key = self.db.settings()?.allow_env_api_key;
         let scrubbed = |k: &str| {
             claude::CLAUDE_NESTING_VARS.contains(&k)

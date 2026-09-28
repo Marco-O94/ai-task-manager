@@ -4,6 +4,8 @@
 mod commands;
 mod confirm;
 #[cfg(debug_assertions)]
+mod e2e;
+#[cfg(debug_assertions)]
 mod selftest;
 
 use std::fs::{File, OpenOptions, TryLockError};
@@ -30,10 +32,10 @@ const LOCK_FILE: &str = "atm.lock";
 const LOCK_MARGIN: Duration = Duration::from_secs(2);
 
 pub fn run() {
-    // A selftest run must not hand off to an instance that is already open (debug and release
-    // share the socket): the plugin would exit 0 before anything was tested.
+    // A selftest or E2E run must not hand off to an instance that is already open (debug and
+    // release share the socket): the plugin would exit 0 before anything was tested.
     #[cfg(debug_assertions)]
-    let single_instance = !selftest::selftest_enabled();
+    let single_instance = !selftest::selftest_enabled() && !e2e::enabled();
     #[cfg(not(debug_assertions))]
     let single_instance = true;
 
@@ -56,7 +58,10 @@ pub fn run() {
         .plugin(nav_guard())
         .setup(|app| {
             #[cfg(debug_assertions)]
-            selftest::start_watchdog();
+            {
+                selftest::start_watchdog();
+                e2e::start_watchdog();
+            }
             let handle = app.handle().clone();
             match start_core(&handle) {
                 Ok(core) => {
@@ -123,6 +128,32 @@ pub fn run() {
             selftest::debug_forwarder_count,
             #[cfg(debug_assertions)]
             selftest::debug_selftest_report,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_setup,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_set_auth,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_queue_pick,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_login_script,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_record,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_git,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_write_file,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_exists,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_agents,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_failures,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_quit,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_report,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_gatekeeper,
         ])
         .build(tauri::generate_context!())
         .expect("error while building AI Task Manager");
@@ -160,6 +191,10 @@ fn dirs_config(app: &AppHandle) -> tauri::Result<CoreConfig> {
     if selftest::selftest_enabled() {
         return Ok(selftest::core_config());
     }
+    #[cfg(debug_assertions)]
+    if e2e::enabled() {
+        return Ok(e2e::core_config());
+    }
     Ok(CoreConfig {
         data_dir: app.path().app_data_dir()?,
         cache_dir: app.path().app_cache_dir()?,
@@ -169,7 +204,7 @@ fn dirs_config(app: &AppHandle) -> tauri::Result<CoreConfig> {
 
 /// `dir` and its missing parents are created 0700, an existing `dir` is tightened to 0700:
 /// the DB, logs and login script inside (created 0600/0700 by the core) stay the user's.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -251,6 +286,9 @@ fn on_run_event(app: &AppHandle, event: RunEvent) {
             if EXIT_REQUESTED.swap(true, Ordering::SeqCst) {
                 return;
             }
+            // Debug builds: which branch ran the shutdown (the E2E checks both are taken).
+            #[cfg(debug_assertions)]
+            eprintln!("exit: RunEvent::ExitRequested");
             api.prevent_exit();
             let app = app.clone();
             tauri::async_runtime::spawn(async move {
@@ -259,6 +297,8 @@ fn on_run_event(app: &AppHandle, event: RunEvent) {
             });
         }
         RunEvent::Exit => {
+            #[cfg(debug_assertions)]
+            eprintln!("exit: RunEvent::Exit");
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.hide();
             }

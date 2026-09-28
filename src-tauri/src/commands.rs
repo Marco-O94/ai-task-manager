@@ -22,6 +22,8 @@ type CoreState<'a> = State<'a, Arc<Core>>;
 fn logged<T>(cmd: &str, result: Result<T, AppError>) -> Result<T, AppError> {
     if let Err(e) = &result {
         eprintln!("command {cmd} failed: {e}");
+        #[cfg(debug_assertions)]
+        crate::e2e::note_failure(cmd, e);
     }
     result
 }
@@ -32,7 +34,36 @@ fn cancelled() -> AppError {
 
 #[tauri::command]
 pub async fn get_env(core: CoreState<'_>, req: Req<GetEnv>) -> Result<Res<GetEnv>, AppError> {
-    logged(GetEnv::NAME, core.get_env(req).await)
+    let result = core.get_env(req).await;
+    #[cfg(debug_assertions)]
+    if let Ok(env) = &result {
+        log_env(env);
+    }
+    logged(GetEnv::NAME, result)
+}
+
+/// Debug builds: which CLI and login state `get_env` reports (never the email or the org).
+#[cfg(debug_assertions)]
+fn log_env(env: &EnvStatus) {
+    let auth = match &env.auth {
+        AuthState::LoggedIn {
+            auth_method,
+            subscription_type,
+            ..
+        } => format!(
+            "loggedIn (authMethod {}, subscription {})",
+            auth_method.as_deref().unwrap_or("?"),
+            subscription_type.as_deref().unwrap_or("?")
+        ),
+        AuthState::LoggedOut => "loggedOut".into(),
+        AuthState::Unknown { reason } => format!("unknown ({reason})"),
+    };
+    eprintln!(
+        "get_env: claude {} version {} supported={} auth {auth}",
+        env.claude.path.as_deref().unwrap_or("<not found>"),
+        env.claude.version.as_deref().unwrap_or("?"),
+        env.claude.supported
+    );
 }
 
 #[tauri::command]
@@ -87,6 +118,11 @@ pub async fn list_projects(core: CoreState<'_>) -> Result<Res<ListProjects>, App
 /// Native folder picker, blocking call moved off the async runtime.
 #[tauri::command]
 pub async fn pick_repo_folder(app: AppHandle) -> Result<Res<PickRepoFolder>, AppError> {
+    // The E2E cannot drive the native picker: it queues the folder instead.
+    #[cfg(debug_assertions)]
+    if let Some(picked) = crate::e2e::take_pick() {
+        return Ok(picked);
+    }
     let result = async {
         let picked = tauri::async_runtime::spawn_blocking(move || {
             app.dialog().file().blocking_pick_folder()

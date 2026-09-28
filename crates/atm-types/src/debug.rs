@@ -20,7 +20,8 @@ pub struct ProbeMsg {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportReq {
-    /// `{ping_ok, ping_err_typed, channel_50_in_order, csp_enforced, dialog_ok, csp_violations}`.
+    /// Selftest: `{ping_ok, ping_err_typed, channel_50_in_order, csp_enforced, dialog_ok,
+    /// csp_violations, …}`. E2E: `{step_1 … step_12, …, csp_violations, details}`.
     pub report: serde_json::Value,
 }
 
@@ -41,3 +42,122 @@ cmd!(
     /// Prints the report on stdout and exits 0 if it passed, 1 otherwise.
     DebugSelftestReport, "debug_selftest_report", ReportReq => ()
 );
+
+// ---- in-app E2E (spec §11.2 M4, §12.2): `ATM_E2E=1`, debug builds only -----------------------
+
+/// The run the backend prepared: its phase and the temporary repositories (all under `dir`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct E2eSetup {
+    /// `"1"` (until the quit of step 8), `"2"` (after the relaunch) or `"gatekeeper"`.
+    pub phase: String,
+    pub dir: String,
+    /// A repository with one commit on `main`, checked out.
+    pub repo: String,
+    /// A plain folder.
+    pub not_git: String,
+    /// A bare repository.
+    pub bare: String,
+    /// A repository without commits.
+    pub empty: String,
+    /// A repository with one commit and a `.mcp.json` (warning, not rejection).
+    pub mcp_repo: String,
+    pub fake_claude: String,
+    /// What phase 1 handed over with `debug_e2e_quit`.
+    pub phase1: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eAuthReq {
+    pub logged_in: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2ePathReq {
+    pub path: String,
+}
+
+/// The login `.command` written by `open_login_terminal`, the `open` calls recorded instead of
+/// run, and the script run with `/bin/sh` (it calls fake-claude's `auth login`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eLoginScript {
+    pub path: String,
+    pub content: String,
+    pub mode: u32,
+    pub opened: Vec<Vec<String>>,
+    pub run_code: Option<i32>,
+    pub run_output: String,
+}
+
+/// `git <args>` in `repo` (a directory of the run).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eGitReq {
+    pub repo: String,
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eGitOut {
+    pub code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eWriteReq {
+    pub path: String,
+    pub content: String,
+}
+
+/// The real login script (`write_login_script`, in a folder of `app_cache_dir`) opened with the
+/// real `open_login_terminal`; its `claude` is a wrapper that records its arguments in a
+/// marker, then runs fake-claude. `marker_ok`: Terminal ran it (Gatekeeper let it through)
+/// and it called `claude auth login`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eGatekeeper {
+    pub script: String,
+    /// The script carries `com.apple.quarantine` (it must not).
+    pub quarantined: bool,
+    pub marker_ok: bool,
+    /// What the wrapper recorded (its arguments).
+    pub marker: String,
+    pub waited_ms: u64,
+}
+
+cmd!(
+    /// `None` unless `ATM_E2E=1`; phase 1 has created the repositories before the core started.
+    DebugE2eSetup, "debug_e2e_setup", Empty => Option<E2eSetup>
+);
+cmd!(
+    /// What fake-claude's `auth status` answers from now on (`FAKE_CLAUDE_AUTH_FILE`).
+    DebugE2eSetAuth, "debug_e2e_set_auth", E2eAuthReq => ()
+);
+cmd!(
+    /// The next `pick_repo_folder` returns this path instead of opening the native picker.
+    DebugE2eQueuePick, "debug_e2e_queue_pick", E2ePathReq => ()
+);
+cmd!(DebugE2eLoginScript, "debug_e2e_login_script", Empty => E2eLoginScript);
+cmd!(
+    /// The lines of `FAKE_CLAUDE_RECORD`, one per fake-claude call or answer.
+    DebugE2eRecord, "debug_e2e_record", Empty => Vec<serde_json::Value>
+);
+cmd!(DebugE2eGit, "debug_e2e_git", E2eGitReq => E2eGitOut);
+cmd!(DebugE2eWriteFile, "debug_e2e_write_file", E2eWriteReq => ());
+cmd!(DebugE2eExists, "debug_e2e_exists", E2ePathReq => bool);
+cmd!(
+    /// Pids of the run's agents still alive: the fake-claude calls and `hang_ignore`
+    /// grandchildren recorded in its `FAKE_CLAUDE_RECORD` (never other processes).
+    DebugE2eAgents, "debug_e2e_agents", Empty => Vec<i32>
+);
+cmd!(
+    /// `"<command>: <code>"` of every IPC command that failed since the app started.
+    DebugE2eFailures, "debug_e2e_failures", Empty => Vec<String>
+);
+cmd!(
+    /// Stores the partial report for phase 2 and quits as Cmd+Q does (`NSApp terminate:`).
+    DebugE2eQuit, "debug_e2e_quit", ReportReq => ()
+);
+cmd!(
+    /// Prints the report on stdout and exits 0 if every check passed, 1 otherwise.
+    DebugE2eReport, "debug_e2e_report", ReportReq => ()
+);
+cmd!(DebugE2eGatekeeper, "debug_e2e_gatekeeper", Empty => E2eGatekeeper);
