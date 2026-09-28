@@ -1,0 +1,13 @@
+---
+source: crates/atm-core/tests/git.rs
+expression: rendered
+---
+Hunk None None |@@ -2,7 +2,7 @@ a
+Context Some(2) Some(2) |b
+Context Some(3) Some(3) |
+Context Some(4) Some(4) |c
+Del Some(5) None |d
+Add None Some(5) |D
+Context Some(6) Some(6) |e
+Context Some(7) Some(7) |f
+Context Some(8) Some(8) |g

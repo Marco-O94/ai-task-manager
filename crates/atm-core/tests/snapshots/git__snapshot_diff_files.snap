@@ -1,0 +1,12 @@
+---
+source: crates/atm-core/tests/git.rs
+expression: summary
+---
+Added big.txt +10000 -0 too_large lines=0
+Added bin.dat +0 -0 binary lines=0
+Added committed.txt +1 -0 lines=2
+Deleted del.txt +0 -1 lines=2
+Modified mod.txt +1 -1 lines=9
+Renamed ren_src.txt -> moved/renamed.txt +0 -0 lines=0
+Added new.txt +1 -0 lines=2
+Added staged.txt +1 -0 lines=2
