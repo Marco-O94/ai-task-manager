@@ -29,9 +29,10 @@ use atm_types::debug::{
     E2eGitReq, E2ePathReq, E2eSetup, E2eWriteReq, ReportReq,
 };
 use atm_types::{
-    AttemptIdReq, CONTINUE_PROMPT, Empty, Entry, EntryBody, GetBoard, GetBranchStatus, GetEntries,
-    GetEntriesReq, GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, ProjectIdReq,
-    StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus,
+    AttemptIdReq, AttemptState, CONTINUE_PROMPT, Empty, Entry, EntryBody, FileStatus, GetBoard,
+    GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq, GetTaskDetail, IdReq,
+    ListProjects, ProcessInfo, ProcessStatus, ProjectIdReq, StopReason, TaskCard, TaskDetail,
+    TaskStatus, ToolStatus, WorktreeState,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use leptos::prelude::*;
@@ -217,7 +218,7 @@ async fn phase1(run: &mut Run) -> R<Next> {
         run.check("step_4_reload", r)?;
         let r = step_5(run).await;
         run.check("step_5", r)?;
-        let r = step_6().await;
+        let r = step_6(run).await;
         run.check("step_6", r)?;
         let r = step_7(run).await;
         run.check("step_7", r)?;
@@ -666,7 +667,9 @@ async fn bash_call(attempt: &str) -> R<ToolStatus> {
         .ok_or_else(|| "no Bash entry".into())
 }
 
-async fn step_6() -> R<String> {
+/// The Modifiche tab lists hello.txt as added, as `get_diff` does; the file is in the branch,
+/// committed by the end-of-turn auto-commit (spec §8.5).
+async fn step_6(run: &Run) -> R<String> {
     tab("Modifiche").await?;
     let file = until("hello.txt in the diff", UI, || {
         q("[data-view=diff] [data-file=\"hello.txt\"]")
@@ -677,7 +680,36 @@ async fn step_6() -> R<String> {
         return Err(format!("hello.txt row {:?}", text(&file)));
     }
     let summary = wait_q("[data-diff-summary]").await?;
-    Ok(format!("hello.txt added ({})", text(&summary)))
+    let attempt = detail(&run.st.t1).await?.attempt.ok_or("no attempt")?;
+    let diff = ipc::call::<GetDiff>(&AttemptIdReq {
+        attempt_id: attempt.id.clone(),
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let files: Vec<_> = diff
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f.status, f.additions, f.deletions))
+        .collect();
+    if files != [("hello.txt", FileStatus::Added, 1, 0)] {
+        return Err(format!("get_diff files {files:?}"));
+    }
+    let repo = &run.setup.repo;
+    let branch = &attempt.branch;
+    let content = git(repo, &["show", &format!("{branch}:hello.txt")]).await?;
+    let subject = git(repo, &["log", "-1", "--format=%s", branch]).await?;
+    if content.stdout != "hello\n" || !subject.stdout.starts_with("atm: turn 1:") {
+        return Err(format!(
+            "{branch}: hello.txt {:?}, last commit {:?}",
+            content.stdout, subject.stdout
+        ));
+    }
+    Ok(format!(
+        "hello.txt added ({}), as get_diff says; committed on {branch} by the auto-commit \
+         «{}»",
+        text(&summary),
+        subject.stdout.trim()
+    ))
 }
 
 /// Follow-up `[fake:simple]` resumes the session; `[fake:slow]` is stopped within 5 s.
@@ -872,7 +904,7 @@ async fn step_9(run: &mut Run) -> R<String> {
     .await?;
     let repo = run.setup.repo.clone();
     closed_cleanly("Mergiato in main con il commit").await?;
-    worktree_gone(&repo, &attempt.1).await?;
+    worktree_gone(&repo, &attempt.2).await?;
     let log = git(&repo, &["log", "-1", "--format=%H%n%s", "main"]).await?;
     let mut lines = log.stdout.lines();
     let (head, subject) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
@@ -885,7 +917,7 @@ async fn step_9(run: &mut Run) -> R<String> {
     }
     let files = git(&repo, &["show", "--name-only", "--format=", "main"]).await?;
     let status = git(&repo, &["status", "--porcelain"]).await?;
-    let branch = git(&repo, &["branch", "--list", &attempt.0]).await?;
+    let branch = git(&repo, &["branch", "--list", &attempt.1]).await?;
     if !files.stdout.contains("hello.txt") || !status.stdout.is_empty() {
         return Err(format!(
             "squash files {:?}, checkout {:?}",
@@ -893,13 +925,13 @@ async fn step_9(run: &mut Run) -> R<String> {
         ));
     }
     if branch.stdout.trim().is_empty() {
-        return Err(format!("branch {} deleted", attempt.0));
+        return Err(format!("branch {} deleted", attempt.1));
     }
     Ok(format!(
         "squash {head} \"{subject}\" on main (fast-forward of the checkout), worktree removed \
          (directory and `git worktree list`), branch {} kept; the panel shows the merged \
          attempt with no failed command",
-        attempt.0
+        attempt.1
     ))
 }
 
@@ -1011,7 +1043,7 @@ async fn step_11(run: &mut Run) -> R<String> {
     let t2 = run.st.t2.clone();
     start_attempt(&t2, "acceptEdits").await?;
     wait_turn(&t2, "inreview").await?;
-    let (branch, worktree) = active_attempt(&t2).await?;
+    let (id, branch, worktree) = active_attempt(&t2).await?;
     click(&wait_q("[data-view=task-panel] [data-action=discard]").await?);
     let dialog = until("discard dialog", UI, || open_dialog("DiscardDialog")).await?;
     let since = last_toast();
@@ -1465,10 +1497,38 @@ async fn detail(task: &str) -> R<TaskDetail> {
         .map_err(|e| e.to_string())
 }
 
-/// `(branch, worktree path)` of the task's active attempt.
-async fn active_attempt(task: &str) -> R<(String, String)> {
+/// `(id, branch, worktree path)` of the task's active attempt.
+async fn active_attempt(task: &str) -> R<(String, String, String)> {
     let attempt = detail(task).await?.attempt.ok_or("no active attempt")?;
-    Ok((attempt.branch, attempt.worktree_path))
+    Ok((attempt.id, attempt.branch, attempt.worktree_path))
+}
+
+/// What the DB says once the task's attempt `id` is closed: no active attempt, `id` among the
+/// closed ones in `state` with its worktree removed, the task in `status`. Returns the attempt.
+async fn closed_in_db(
+    task: &str,
+    id: &str,
+    state: AttemptState,
+    status: TaskStatus,
+) -> R<atm_types::AttemptView> {
+    let d = detail(task).await?;
+    let closed = d.closed_attempts.iter().find(|a| a.id == id);
+    match closed {
+        Some(a)
+            if d.attempt.is_none()
+                && d.task.status == status
+                && a.state == state
+                && a.worktree_state == WorktreeState::Removed
+                && a.closed_at.is_some() =>
+        {
+            Ok(a.clone())
+        }
+        _ => Err(format!(
+            "task {:?} with active attempt {:?}, closed {closed:?}",
+            d.task.status,
+            d.attempt.as_ref().map(|a| &a.id)
+        )),
+    }
 }
 
 /// The board of the project of `repo`.

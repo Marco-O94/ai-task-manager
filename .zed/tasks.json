@@ -1,0 +1,46 @@
+// Task Zed di AI Task Manager (cmd-shift-p -> "task: spawn"). Zed va aperto sulla radice del repo.
+//
+// Prerequisiti, una volta sola (vedi README): toolchain 1.97.1 con target wasm32, `cargo install trunk`
+// e `cargo install tauri-cli` alle versioni del README.
+//
+// `app (debug)` = `cargo tauri dev`: build di debug della shell + `trunk serve` della UI su :1420, con
+// ricarica a ogni salvataggio. Usa il `claude` reale (e il tuo abbonamento quando lanci un agente).
+//
+// `app (debug, fake-claude)` fa lo stesso ma con fake-claude al posto del CLI: nessuna chiamata API,
+// nessuna quota consumata. Il prompt sceglie lo scenario con `[fake:NOME]` (simple, approval, slow,
+// hang, crash, usage_limit, auth_fail, ... in crates/atm-core/src/bin/fake-claude.rs).
+// Attenzione: l'impostazione "Percorso di claude" dell'app vince su ATM_CLAUDE_PATH, e DB/worktree
+// sono gli stessi dell'app con il claude reale.
+//
+// `UI nel browser (mock)` = solo frontend con backend finto, su :1421 (così non collide con :1420
+// di `cargo tauri dev`). `http://localhost:1421/?task=task-inreview` apre subito un pannello task.
+//
+// Non lanciare l'app mentre gira `scripts/e2e.sh`: il test apre e chiude l'app da solo.
+[
+  {
+    "label": "app (debug)",
+    "command": "cargo",
+    "args": ["tauri", "dev"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "app (debug, fake-claude)",
+    "command": "sh",
+    // fake-claude va compilato prima: `cargo tauri dev` builda solo la shell.
+    "args": ["-c", "cargo build -p atm-core --bin fake-claude && cargo tauri dev"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": { "ATM_CLAUDE_PATH": "$ZED_WORKTREE_ROOT/target/debug/fake-claude" },
+    "reveal": "always",
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "UI nel browser (mock)",
+    "command": "trunk",
+    "args": ["serve", "--features", "mock", "--port", "1421"],
+    "cwd": "$ZED_WORKTREE_ROOT/ui",
+    "reveal": "always",
+    "allow_concurrent_runs": false
+  }
+]
