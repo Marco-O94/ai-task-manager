@@ -1,0 +1,15 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: approval_decisions()
+---
+[
+  {
+    "kind": "Allow",
+    "remember": true
+  },
+  {
+    "kind": "Deny",
+    "message": "usa un altro approccio",
+    "interrupt": false
+  }
+]

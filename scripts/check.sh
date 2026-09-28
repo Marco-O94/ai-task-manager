@@ -5,13 +5,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 cargo fmt --all --check
-cargo clippy --workspace --exclude atm-ui --all-targets -- -D warnings
-cargo clippy -p atm-ui --target wasm32-unknown-unknown -- -D warnings
-# TODO(M1): enable once the `mock` feature exists:
-# cargo clippy -p atm-ui --target wasm32-unknown-unknown --features mock -- -D warnings
-cargo check -p atm-types --target wasm32-unknown-unknown
-cargo test --workspace --exclude atm-ui
-cargo test -p atm-ui # M0 confirmed that atm-ui also builds for the host
+# --locked: Cargo.toml and Cargo.lock are frozen after M1 (spec §11.1); a manifest edit that
+# would rewrite the lock fails here instead of passing silently.
+cargo clippy --locked --workspace --exclude atm-ui --all-targets -- -D warnings
+cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown --features mock -- -D warnings
+cargo check --locked -p atm-types --target wasm32-unknown-unknown
+cargo test --locked --workspace --exclude atm-ui
+cargo test --locked -p atm-ui # M0 confirmed that atm-ui also builds for the host
 
 fail=0
 hits() { # hits <rule> <matches>
@@ -35,9 +36,12 @@ m=$(scan -rnF -e '<script' -e 'inner_html' -e 'set_inner_html' \
     -e 'dangerousDisableAssetCspModification' ui/src)
 hits "ui/src" "$m"
 
-m=$(scan -rnF -e '"--bare"' -e '"--dangerously-skip-permissions"' \
-    -e 'find-generic-password' -e 'SecKeychain' -e 'TcpListener' -e 'UdpSocket' -e '0.0.0.0' \
-    crates src-tauri/src)
+# The forbidden CLI flags only in code that can pass them: tests may assert their absence.
+m=$(scan -rnF -e '"--bare"' -e '"--dangerously-skip-permissions"' crates/*/src src-tauri/src)
+hits "crates/*/src, src-tauri/src" "$m"
+
+m=$(scan -rnF -e 'find-generic-password' -e 'SecKeychain' -e 'TcpListener' -e 'UdpSocket' \
+    -e '0.0.0.0' crates src-tauri/src)
 hits "crates, src-tauri/src" "$m"
 
 # credentials.json may appear only inside the `DENY_RULES` constant (up to its closing `];`).

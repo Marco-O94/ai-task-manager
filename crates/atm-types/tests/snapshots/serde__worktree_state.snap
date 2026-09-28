@@ -1,0 +1,9 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "WorktreeState::ALL"
+---
+[
+  "present",
+  "removed",
+  "missing"
+]

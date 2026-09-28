@@ -5,7 +5,12 @@ rust-version.workspace = true
 version.workspace = true
 publish = false
 
+[features]
+# In-browser backend for `trunk serve --features mock` (spec D13): `ipc::mock` replaces `ipc::tauri`.
+mock = []
+
 [dependencies]
+atm-types.workspace = true
 console_error_panic_hook.workspace = true
 icons.workspace = true
 js-sys.workspace = true

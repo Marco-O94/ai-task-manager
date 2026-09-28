@@ -2,17 +2,44 @@ mod app;
 #[rustfmt::skip] // vendored Rust/UI code, kept byte-identical to upstream
 mod hooks;
 mod ipc;
+#[cfg(not(feature = "mock"))]
 mod selftest;
 #[rustfmt::skip] // vendored Rust/UI code, kept byte-identical to upstream
 mod ui;
+
+// Declared inline so that no `mod.rs` sits outside the file ownership of spec §11.2.
+mod state {
+    pub mod board;
+    pub mod transcript;
+}
+mod views {
+    pub mod approval;
+    pub mod board;
+    pub mod composer;
+    pub mod diff;
+    pub mod merge_dialog;
+    pub mod onboarding;
+    pub mod settings;
+    pub mod sidebar;
+    pub mod start_dialog;
+    pub mod task_dialog;
+    pub mod task_panel;
+    pub mod transcript;
+}
+mod widgets {
+    pub mod dnd;
+    pub mod toast;
+}
 
 use leptos::prelude::*;
 
 fn main() {
     console_error_panic_hook::set_once();
+    #[cfg(not(feature = "mock"))]
     selftest::count_csp_violations();
     apply_color_scheme();
     leptos::mount::mount_to_body(app::App);
+    #[cfg(not(feature = "mock"))]
     leptos::task::spawn_local(selftest::run_if_enabled());
 }
 

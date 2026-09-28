@@ -1,16 +1,26 @@
 //! IPC and CSP selftest (spec §11.2 M0). Runs only when the debug backend reports
 //! `ATM_SELFTEST=1`; in release the probe commands do not exist and this is a no-op.
+//! Not compiled with `--features mock` (there is no backend to probe). Owner after M1:
+//! M3-TAURI (subscribe, unsubscribe and reload with `debug_forwarder_count`).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use atm_types::debug::{
+    DebugChannelProbe, DebugPing, DebugSelftestEnabled, DebugSelftestReport, PingReq, ProbeMsg,
+    ReportReq,
+};
+use atm_types::{AppError, Empty, ErrorCode};
 use leptos::prelude::*;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use wasm_bindgen::prelude::*;
 use web_sys::SecurityPolicyViolationEvent;
 
-use crate::ipc::{self, AppError};
+use crate::ipc;
+use crate::ui::dialog::{
+    Dialog, DialogBody, DialogClose, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+    DialogTrigger,
+};
 
 const PROBE_COUNT: usize = 50;
 const PROBE_BIG: [u32; 3] = [7, 23, 41];
@@ -18,12 +28,6 @@ const PROBE_BIG_LEN: usize = 20 * 1024;
 
 thread_local! {
     static CSP_VIOLATIONS: Cell<u32> = const { Cell::new(0) };
-}
-
-#[derive(Deserialize)]
-struct ProbeMsg {
-    i: u32,
-    data: String,
 }
 
 /// Counts `securitypolicyviolation` events. Call before mounting so the UI's own
@@ -49,7 +53,7 @@ pub fn count_csp_violations() {
 }
 
 pub async fn run_if_enabled() {
-    if !ipc::call::<_, bool>("debug_selftest_enabled", &())
+    if !ipc::call::<DebugSelftestEnabled>(&Empty {})
         .await
         .unwrap_or(false)
     {
@@ -76,29 +80,28 @@ pub async fn run_if_enabled() {
         "csp_enforced": csp_enforced,
         "csp_violations": CSP_VIOLATIONS.with(Cell::get),
     });
-    if let Err(e) = ipc::call::<_, ()>("debug_selftest_report", &json!({ "report": report })).await
-    {
+    if let Err(e) = ipc::call::<DebugSelftestReport>(&ReportReq { report }).await {
         leptos::logging::error!("selftest report failed: {e:?}");
     }
 }
 
 async fn ping_ok() -> bool {
-    ipc::call::<_, String>("debug_ping", &json!({ "fail": false }))
+    ipc::call::<DebugPing>(&PingReq { fail: false })
         .await
         .is_ok_and(|s| s == "pong")
 }
 
 async fn ping_err_typed() -> bool {
     matches!(
-        ipc::call::<_, String>("debug_ping", &json!({ "fail": true })).await,
-        Err(AppError { code, message }) if code == "Invalid" && !message.is_empty()
+        ipc::call::<DebugPing>(&PingReq { fail: true }).await,
+        Err(AppError { code: ErrorCode::Invalid, message }) if !message.is_empty()
     )
 }
 
 async fn channel_in_order() -> bool {
     let received: Rc<RefCell<Vec<Option<ProbeMsg>>>> = Rc::default();
     let sink = received.clone();
-    let result = ipc::call_with_channel::<_, u32, ProbeMsg>("debug_channel_probe", &(), move |m| {
+    let result = ipc::call_with_channel::<DebugChannelProbe, ProbeMsg>(&Empty {}, move |m| {
         sink.borrow_mut().push(m.ok());
     })
     .await;
@@ -121,11 +124,41 @@ async fn channel_in_order() -> bool {
             .all(|(idx, m)| m.as_ref().is_some_and(|m| probe_intact(idx, m)))
 }
 
-/// Drives the ported dialog on the demo page: trigger opens it and locks scroll,
-/// Esc and a backdrop click close it.
+/// Mounts a ported dialog in its own container: the app shows none at startup.
+fn mount_dialog_fixture() -> Option<web_sys::Element> {
+    let host = document().create_element("div").ok()?;
+    host.set_attribute("data-selftest", "dialog").ok()?;
+    document().body()?.append_child(&host).ok()?;
+    leptos::mount::mount_to(host.clone().unchecked_into(), || {
+        let open = RwSignal::new(false);
+        view! {
+            <Dialog open>
+                <DialogTrigger>"Selftest"</DialogTrigger>
+                <DialogContent>
+                    <DialogBody>
+                        <DialogHeader>
+                            <DialogTitle>"Selftest"</DialogTitle>
+                        </DialogHeader>
+                        <DialogFooter>
+                            <DialogClose>"Chiudi"</DialogClose>
+                        </DialogFooter>
+                    </DialogBody>
+                </DialogContent>
+            </Dialog>
+        }
+    })
+    .forget();
+    Some(host)
+}
+
+/// Drives the ported dialog fixture: trigger opens it and locks scroll, Esc and a backdrop
+/// click close it.
 async fn dialog_ok() -> bool {
     let doc = document();
-    let find = |sel: &str| doc.query_selector(sel).ok().flatten();
+    let Some(host) = mount_dialog_fixture() else {
+        return false;
+    };
+    let find = |sel: &str| host.query_selector(sel).ok().flatten();
     let (Some(trigger), Some(content), Some(backdrop)) = (
         find("[data-dialog-trigger]"),
         find("[data-name=DialogContent]"),

@@ -23,8 +23,13 @@ Niente Node: alla prima build Trunk scarica da solo Tailwind standalone `4.3.3`,
 
 ```bash
 cargo tauri dev          # avvia `trunk serve` in ui/ (porta 1420) e apre l'app
-scripts/check.sh         # fmt, clippy host + wasm32, test, grep di sicurezza: va tenuto verde
+scripts/check.sh         # fmt, clippy host + wasm32 (anche --features mock), test, grep di sicurezza: va tenuto verde
+(cd ui && trunk serve --features mock)   # solo UI nel browser (porta 1420), backend finto in ui/src/ipc/mock
 ```
+
+Nel mock, `http://localhost:1420/?task=<id>` apre subito il pannello di quel task. Con la baseline di M1 in
+`ui/src/ipc/mock/board.rs` (loggato, un progetto, un task per colonna) gli id sono `task-todo`, `task-inprogress`,
+`task-inreview` e `task-done`.
 
 ## Build
 
@@ -45,7 +50,9 @@ guida il dialog portato e conta le violazioni CSP; l'app stampa il report JSON s
 altrimenti con 1 (anche se la UI non risponde entro 90 s). Funziona anche con `ATM_SELFTEST=1 cargo tauri dev`,
 ma lì `csp_enforced` vale `null`: Tauri applica la CSP solo agli asset incorporati, non alla pagina di `trunk serve`.
 In selftest il plugin single-instance non viene registrato, così la prova gira anche con un'altra istanza aperta;
-il controllo su stdout esclude le uscite con 0 senza report (per esempio la finestra chiusa a mano).
+per lo stesso motivo il Core usa una cartella dati privata (`$TMPDIR/atm-selftest-<pid>`, cancellata all'uscita)
+e non tocca mai il DB né gli agenti dell'app aperta. Il controllo su stdout esclude le uscite con 0 senza report
+(per esempio la finestra chiusa a mano).
 
 ## Fallback di wasm-opt
 

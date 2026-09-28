@@ -1,0 +1,7 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: NOTICE_ACTIONS
+---
+[
+  "NewSession"
+]

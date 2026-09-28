@@ -5,4 +5,10 @@ rust-version.workspace = true
 version.workspace = true
 publish = false
 
+# Only serde: this crate compiles for wasm32 (UI) and the host.
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+insta.workspace = true

@@ -1,0 +1,28 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: tool_statuses()
+---
+[
+  {
+    "state": "Running"
+  },
+  {
+    "state": "AwaitingApproval",
+    "approval_id": "00000000-0000-4000-8000-000000000009",
+    "can_remember": true,
+    "reason": "Bash non è tra i tool consentiti"
+  },
+  {
+    "state": "Denied",
+    "message": "no"
+  },
+  {
+    "state": "Succeeded"
+  },
+  {
+    "state": "Failed"
+  },
+  {
+    "state": "Cancelled"
+  }
+]

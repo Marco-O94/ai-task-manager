@@ -1,0 +1,21 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: merge_outcomes()
+---
+[
+  {
+    "kind": "Merged",
+    "commit": "c0ffee",
+    "strategy": "FfCheckedOut",
+    "cleanup_warning": "worktree non rimosso"
+  },
+  {
+    "kind": "NothingToMerge"
+  },
+  {
+    "kind": "Conflicts",
+    "files": [
+      "src/a b.rs"
+    ]
+  }
+]

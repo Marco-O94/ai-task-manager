@@ -1,0 +1,11 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "Effort::ALL"
+---
+[
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max"
+]

@@ -1,0 +1,11 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: LINE_KINDS
+---
+[
+  "Hunk",
+  "Context",
+  "Add",
+  "Del",
+  "Meta"
+]

@@ -1,0 +1,11 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "TaskStatus::ALL"
+---
+[
+  "todo",
+  "inprogress",
+  "inreview",
+  "done",
+  "cancelled"
+]

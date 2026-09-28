@@ -1,0 +1,15 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "StopReason::ALL"
+---
+[
+  "user_stop",
+  "app_shutdown",
+  "app_restart",
+  "spawn_error",
+  "init_timeout",
+  "exit_timeout",
+  "crash",
+  "auth_failure",
+  "usage_limit"
+]

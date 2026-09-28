@@ -1,0 +1,10 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "ProcessStatus::ALL"
+---
+[
+  "running",
+  "completed",
+  "failed",
+  "killed"
+]

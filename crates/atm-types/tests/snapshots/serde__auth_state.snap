@@ -1,0 +1,21 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: auth_states()
+---
+[
+  {
+    "state": "LoggedIn",
+    "auth_method": "claude.ai",
+    "api_provider": "firstParty",
+    "email": "user@example.com",
+    "org_name": null,
+    "subscription_type": "max"
+  },
+  {
+    "state": "LoggedOut"
+  },
+  {
+    "state": "Unknown",
+    "reason": "timeout"
+  }
+]

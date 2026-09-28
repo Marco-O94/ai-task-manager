@@ -1,0 +1,9 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "AttemptState::ALL"
+---
+[
+  "active",
+  "merged",
+  "discarded"
+]

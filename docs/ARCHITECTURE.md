@@ -230,7 +230,7 @@ wasm_bindgen = "0.2.129"
   "app": {
     "withGlobalTauri": true,
     "windows": [{ "label": "main", "title": "AI Task Manager", "width": 1440, "height": 900,
-                  "minWidth": 1024, "minHeight": 640, "dragDropEnabled": false }],
+                  "minWidth": 1024, "minHeight": 640, "visible": false, "dragDropEnabled": false }],
     "security": { "csp": {
       "default-src": "'self'",
       "script-src": "'self' 'wasm-unsafe-eval'",
@@ -245,6 +245,7 @@ wasm_bindgen = "0.2.129"
 ```
 - Il `cwd` si risolve relativo a `src-tauri`, perché tauri-cli fa `set_current_dir` lì (verificato dal giudice 1).
 - `dragDropEnabled:false` serve a far funzionare il drag-and-drop HTML5.
+- `visible:false`: il guscio mostra la finestra solo dopo `Core::startup` (recovery), quindi niente finestra bianca bloccata; se `Core::new` fallisce compare solo un dialog nativo d'errore e l'app esce con 1.
 
 **`src-tauri/capabilities/default.json`**
 ```json
@@ -534,11 +535,12 @@ pub type Millis = i64;
 // model.rs
 pub struct Project { pub id: Id, pub name: String, pub repo_path: String, pub default_target_branch: String,
     pub default_permission_mode: PermissionMode, pub default_model: Option<String>,
-    pub config_policy: ConfigPolicy, pub trusted: bool /* fingerprint approvato e ancora valido */,
+    pub config_policy: ConfigPolicy, pub trusted: bool /* Trusted e fingerprint approvato ancora valido */,
     pub allow_bypass: bool, pub created_at: Millis, pub updated_at: Millis }
 pub struct Task { pub id: Id, pub project_id: Id, pub title: String, pub description: String,
     pub status: TaskStatus, pub position: f64, pub created_at: Millis, pub updated_at: Millis }
-pub struct TaskCard { pub task: Task, pub attempt_id: Option<Id>, pub branch: Option<String>, pub running: bool,
+pub struct TaskCard { pub task: Task, pub attempt_id: Option<Id>,
+    pub attempt_state: Option<AttemptState> /* Some(Active) = ha un attempt attivo */, pub branch: Option<String>, pub running: bool,
     pub pending_approvals: u32, pub last_status: Option<ProcessStatus>, pub last_stop_reason: Option<StopReason>,
     pub worktree_state: Option<WorktreeState> }
 pub struct AttemptView { pub id: Id, pub task_id: Id, pub state: AttemptState, pub branch: String,
@@ -563,7 +565,8 @@ pub enum AuthState { LoggedIn { auth_method: Option<String>, api_provider: Optio
     org_name: Option<String>, subscription_type: Option<String> }, LoggedOut, Unknown { reason: String } }
 pub struct EnvStatus { pub claude: ClaudeInfo, pub auth: AuthState, pub git_version: Option<String>,
     pub api_key_in_env: bool, pub cloud_provider_env: bool, pub paused: Option<String> /* usage limit */,
-    pub problems: Vec<String>, pub checked_at: Millis }
+    pub running: u32, pub max_running: u32 /* topbar "in esecuzione x/y" */,
+    pub problems: Vec<String>, pub checked_at: Millis /* la UI tiene il più recente */ }
 pub enum LoginMethod { ClaudeAi, Console, Sso }        // → (nessun flag) | --console | --sso
 pub enum OpenTarget { Finder, Terminal, Editor }
 
@@ -577,20 +580,22 @@ pub enum EntryBody {
                     mcp_servers: u32, warnings: Vec<String> },
     AssistantText { text: String },
     Thinking      { text: String },
-    ToolCall      { tool_use_id: String, name: String, summary: String, input: String /* JSON ≤4 KiB */,
+    ToolCall      { tool_use_id: String, name: String, summary: String,
+                    input: String /* JSON ≤4 KiB; ≤256 KiB se ha chiesto approvazione */,
                     status: ToolStatus, output: Option<ToolOutput> },
     ApiRetry      { attempt: u32, max_retries: u32, delay_ms: u64, error: String },
     TurnEnd       { subtype: String, is_error: bool, duration_ms: Option<u64>, num_turns: Option<u32>,
                     cost_usd_estimate: Option<f64>, permission_denials: u32, text: Option<String>,
                     limit: Option<LimitKind> },
-    Notice        { level: Level, text: String },
+    Notice        { level: Level, text: String, action: Option<NoticeAction> },
     Stderr        { text: String },
 }
 #[serde(tag = "state")]
-pub enum ToolStatus { Running, AwaitingApproval { approval_id: Id, can_remember: bool },
+pub enum ToolStatus { Running, AwaitingApproval { approval_id: Id, can_remember: bool, reason: Option<String> },
     Denied { message: String }, Succeeded, Failed, Cancelled }
 pub struct ToolOutput { pub text: String /* ≤8 KiB, testa+coda */, pub truncated_bytes: u64, pub is_error: bool }
 pub enum Level { Info, Warn, Error }
+pub enum NoticeAction { NewSession }                  // bottone "Nuova sessione" (§7.9)
 pub enum LimitKind { UsageLimit, RateLimit, AuthFailure, Billing }
 #[serde(tag = "t")]
 pub enum TranscriptMsg {
@@ -617,6 +622,10 @@ pub enum MergeStrategy { UpdateRef, FfCheckedOut }
 #[serde(tag = "kind")]
 pub enum MergeOutcome { Merged { commit: String, strategy: MergeStrategy, cleanup_warning: Option<String> },
     NothingToMerge, Conflicts { files: Vec<String> } }
+pub fn merge_message(title: &str, description: &str, attempt_id: &str) -> String   // default del §8.7
+
+// api.rs (oltre a marker, Req e Changed)
+pub const CONTINUE_PROMPT: &str = "The previous run was interrupted (app restart). Continue the task.";
 
 // error.rs
 pub struct AppError { pub code: ErrorCode, pub message: String }
@@ -637,7 +646,7 @@ pub enum ErrorCode { NotFound, Invalid, Conflict, Busy, ConcurrencyLimit, UsageL
 | `pick_repo_folder` | `{}` → `Option<String>` | Chiama `blocking_pick_folder` in `spawn_blocking` [F] |
 | `add_project` | `{path}` → `{project, warnings: Vec<String>}` | §8.3 |
 | `update_project` | `{id, name, default_target_branch, default_permission_mode, default_model}` → `Project` | |
-| `set_project_security` | `{id, config_policy, allow_bypass}` → `Project` | M6. Conferma nativa quando si **eleva** il livello |
+| `set_project_security` | `{id, config_policy, allow_bypass}` → `Project` | M6. Conferma nativa quando si **eleva** il livello **effettivo**: Trusted se il progetto non è `trusted` ora (anche Trusted con fingerprint scaduto), oppure bypass. Il guscio legge il progetto con `Core::project(id)` |
 | `remove_project` | `{id}` → `()` | Rifiutato se ci sono turni attivi. Snapshot e rimozione dei worktree; branch tenuti |
 | `list_branches` | `{project_id}` → `BranchList` | |
 | `get_board` | `{project_id}` → `Vec<TaskCard>` | Unisce DB e registro live |
@@ -645,11 +654,11 @@ pub enum ErrorCode { NotFound, Invalid, Conflict, Busy, ConcurrencyLimit, UsageL
 | `move_task` | `{id, status, before_id: Option<Id>}` → `()` | `Busy` se il task è in esecuzione e la destinazione è done o cancelled |
 | `delete_task` | `{id}` → `()` | `Busy` se in esecuzione. Fa discard dell'attempt attivo |
 | `get_task_detail` | `{id}` → `TaskDetail` | |
-| `start_attempt` | `{task_id, target_branch, permission_mode, model?, effort?}` → `AttemptView` | Ritorna dopo che worktree e righe esistono; lo spawn è asincrono |
-| `send_follow_up` | `{attempt_id, prompt, permission_mode?, fresh_session: bool}` → `ProcessInfo` | `Busy` se c'è un turno in corso |
+| `start_attempt` | `{task_id, target_branch, permission_mode, model?, effort?}` → `AttemptView` | Ritorna dopo che worktree e righe esistono; lo spawn è asincrono. `bypassPermissions` senza `allow_bypass` → `Invalid` |
+| `send_follow_up` | `{attempt_id, prompt, permission_mode?, fresh_session: bool}` → `ProcessInfo` | `Busy` se c'è un turno in corso. `permission_mode` vale **solo per quel turno** (`processes.permission_mode`); quella dell'attempt non cambia |
 | `stop_attempt` | `{attempt_id}` → `()` | Ritorna subito; l'escalation continua in background |
 | `respond_approval` | `{attempt_id, approval_id, decision: ApprovalDecision}` → `()` | |
-| `subscribe_transcript` | `{attempt_id}` + `onEvent: Channel<TranscriptMsg>` → `Id` (subscription) | Registra e ritorna subito [F] |
+| `subscribe_transcript` | `{attempt_id}` + `onEvent: Channel<TranscriptMsg>` → `Id` (subscription) | Registra e ritorna subito [F]. Attempt sconosciuto: nessun errore, `Snapshot` vuoto (`has_more:false`) |
 | `unsubscribe_transcript` | `{subscription_id}` → `()` | |
 | `get_entries` | `{attempt_id, before_idx, limit ≤ 200}` → `EntryPage` | |
 | `get_diff` | `{attempt_id}` → `DiffResult` | §8.6 |
@@ -659,7 +668,7 @@ pub enum ErrorCode { NotFound, Invalid, Conflict, Busy, ConcurrencyLimit, UsageL
 | `delete_branch` | `{attempt_id}` → `()` | Solo per attempt `merged` e branch `atm/…` |
 | `open_attempt` | `{attempt_id, target: OpenTarget}` → `()` | `open`, `open -a Terminal`, `open -a <editor_app>`. Il path viene dal DB |
 | `open_url` | `{url}` → `()` | Solo `http(s)` |
-| *(solo debug)* `debug_ping`, `debug_channel_probe`, `debug_selftest_report` | §11 M0 | `#[cfg(debug_assertions)]` |
+| *(solo debug)* `debug_ping`, `debug_channel_probe`, `debug_selftest_enabled`, `debug_forwarder_count`, `debug_selftest_report` | §11 M0 | `#[cfg(debug_assertions)]` |
 
 ### 6.4 Eventi globali (`app.emit`)
 
@@ -822,14 +831,14 @@ Per stderr il cap è 64 KiB per riga. Cap dei file di log: `stdout.jsonl` 64 MiB
 
 ### 7.6 Normalizzazione (`normalize.rs`, pura, golden test con insta)
 
-`Normalizer::new(process_id, next_idx)`. Metodi:
+`Normalizer::new(process_id, next_idx, worktree)` (il worktree canonico rende relativi i path dei summary e si confronta con il `cwd` di `system/init`). Metodi:
 - `on_user_message(&str, ts)`
 - `on_line(&Value, ts) -> Vec<EntryOp>`
 - `on_stderr(&str, ts)`
-- `on_approval_requested(approval_id, &Value /*request*/, can_remember)`
+- `on_approval_requested(approval_id, &Value /*request*/, can_remember, ts)`
 - `on_approval_resolved(approval_id, &ApprovalDecision)`
 - `on_approval_cancelled(approval_id)`
-- `on_notice(level, text)`
+- `on_notice(level, text, action: Option<NoticeAction>, ts)`
 - `finish(ts)`
 
 Dove `EntryOp = Upsert(Entry) | Typing(Option<String>)`.
@@ -867,7 +876,7 @@ Dove `EntryOp = Upsert(Entry) | Typing(Option<String>)`.
 | `mcp__s__t` | `MCP s/t` |
 | Altro | `<name>` |
 
-**Limiti:** campi di testo 256 KiB; `input` 4 KiB; `output` 8 KiB.
+**Limiti:** campi di testo 256 KiB; `input` 4 KiB (256 KiB per un tool che ha chiesto approvazione: la card lo mostra intero); `output` 8 KiB.
 
 ### 7.7 Ciclo di vita del turno (`runner.rs`) e classificazione
 
@@ -901,7 +910,7 @@ run_turn(attempt, prompt, mode):
 
 ### 7.8 Approvazioni
 
-- **All'arrivo di `can_use_tool`** (campi `tool_name`, `input` e `tool_use_id` obbligatori; `permission_suggestions` resta `Value` grezzo [F]):
+- **All'arrivo di `can_use_tool`** (campi `tool_name`, `input` e `tool_use_id` obbligatori; `permission_suggestions` resta `Value` grezzo [F]; `decision_reason` facoltativo diventa `AwaitingApproval.reason`, forma [DA VERIFICARE → M5]):
   - si registra in memoria `Pending{approval_id: uuid, request_id, tool_use_id, input, rules}`;
   - si aggiorna l'entry;
   - si emette `changed` (badge "Richiede approvazione" sulla card).
@@ -934,8 +943,8 @@ run_turn(attempt, prompt, mode):
   - `session_started=1` solo quando arriva `system/init`;
   - se un turno muore **prima** di `init`, il turno successivo genera un **nuovo UUID**, aggiorna `attempts.session_id` e usa `--session-id` (lezione di Vibe Kanban #2993; correzione E7).
 - **Resume.** Stesso cwd canonico (il worktree non si sposta né si rinomina mai). I file `.jsonl` del CLI non si copiano, leggono o spostano mai. Mai due processi sulla stessa sessione (indice unico).
-- **Resume fallito** (`No conversation found`): Notice con l'azione "Nuova sessione", che invia `send_follow_up{fresh_session:true}`.
-- **Interrotto al riavvio.** Card e pannello mostrano **"Continua"**, che invia il follow-up "The previous run was interrupted (app restart). Continue the task." con `--resume`.
+- **Resume fallito** (`No conversation found`, costante `normalize::RESUME_FAILED_PATTERN`): Notice con `action: Some(NoticeAction::NewSession)`; la UI mostra "Nuova sessione", che invia `send_follow_up{fresh_session:true}`.
+- **Interrotto al riavvio.** Card e pannello mostrano **"Continua"** (card: `attempt_state == Active` e `last_stop_reason == app_restart`), che invia il follow-up `atm_types::CONTINUE_PROMPT` ("The previous run was interrupted (app restart). Continue the task.") con `--resume`.
 - **Stop sequence** (obiettivo ≤ 13 s; lo stato finale dipende dal nostro flag, non dal subtype di `result`, che è [DA VERIFICARE]):
   1. Se `init` è arrivato e stdin è aperto: `{"type":"control_request","request_id":"atm_n_…","request":{"subtype":"interrupt"}}`, poi fino a 5 s di attesa per `result` o uscita.
   2. Chiusura di stdin (l'EOF cancella il prompt pendente [F]), poi fino a 3 s.
@@ -1100,7 +1109,7 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 7 DB (1 transazione): attempt merged + merge_commit + closed_at; task → done; emit changed
 8 best effort: se remove_worktree_after_merge → rimozione (§8.4); un errore → cleanup_warning. Il branch resta
 ```
-- **Messaggio di default** (modificabile): titolo, riga vuota, descrizione (≤ 2000 caratteri), riga vuota, `ATM-Attempt: <id>`.
+- **Messaggio di default** (modificabile, costruito dalla UI con `atm_types::merge_message`): titolo, riga vuota, descrizione (≤ 2000 caratteri, omessa se vuota), riga vuota, `ATM-Attempt: <id>`.
 - **Target divergente senza conflitti:** si mergia direttamente, senza rebase.
 - **Conflitti:** "Risolvi con l'agente" invia questo follow-up:
   > "This branch conflicts with `<target>` in: <files>. Run `git merge <target>`, resolve every conflict preserving both intents, run the project's tests if available, and commit the merge. Do not push."
@@ -1119,6 +1128,7 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
   - Al massimo 2000 file; i symlink contano con la stringa del loro target; ogni path deve stare dentro repo o worktree.
 - **Approvazione:** calcolata sul checkout principale.
 - **Prima di ogni turno:** calcolata sul worktree.
+- `git::config_fingerprint` è `async`: legge e calcola l'hash in `spawn_blocking`, fuori dai worker tokio.
 
 ---
 
@@ -1148,13 +1158,13 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 | Schermata | Componenti Rust/UI | Scritto a mano |
 |---|---|---|
 | Onboarding (§7.10) | card, callout, alert, button, spinner, select_native, input, label, kbd, dialog* (attesa del login) | polling, logica del gate |
-| Sidebar e topbar | button (ghost), separator, scroll_area, badge, status, tooltip | lista progetti, "Aggiungi repository", chip account, banner di pausa con "Riprendi", contatore "in esecuzione x/y" |
+| Sidebar e topbar | button (ghost), separator, scroll_area, badge, status, tooltip | lista progetti, "Aggiungi repository", chip account, banner di pausa con "Riprendi", contatore "in esecuzione x/y" (`EnvStatus.running`/`max_running`) |
 | Board (5 colonne; Annullati compressa) | card, badge (stato, "in esecuzione" con spinner, "Richiede approvazione", "Fallito", "Interrotto – Continua"), scroll_area, empty, skeleton, button | **DnD** (§9.3), creazione rapida in fondo alla colonna |
 | Dialog task (crea/modifica) e Impostazioni | dialog*, input, textarea, label, button, select_native | form |
 | Pannello task: header | badge, button (Avvia, Stop, Scarta, Apri in Finder/Terminale/Editor), tooltip, separator | – |
 | Dialog Avvia | dialog*, select_native (branch target, modello: Predefinito/opus/sonnet/fable, effort, modalità: Supervisionato/Auto-edit/Autonomo, quest'ultimo abilitato solo con `allow_bypass`), callout (avviso bypass), button | – |
 | Tab **Agente** | message, bubble, chat (classi di layout), marker (notice e righe tool), collapsible (output tool, thinking), badge (esito TurnEnd, costo "≈ stima API", durata), alert (errori, limiti, auth, resume fallito), button (approvazioni, Continua, Nuova sessione), textarea e button (composer, disabilitato durante il turno), kbd (⌘↩), empty | **lista del transcript** (§9.4), **card di approvazione** (tool, input completo, motivo; "Consenti", "Consenti sempre (attempt)" solo se `can_remember`, "Nega", "Nega e ferma", campo messaggio), annidamento dei subagent tramite `parent_tool_use_id`, riga di anteprima digitazione |
-| Tab **Modifiche** | collapsible (un file per blocco), badge (A/M/D/R, +/−), button (Aggiorna, Merge, Risolvi con l'agente, Elimina branch), alert (conflitti, target avanti di N commit, checkout del target sporco, HEAD non corretto), skeleton, empty | **viewer diff** (righe con numeri e colori per `LineKind`, "mostra tutto" oltre 2000 righe, segnaposto per binari, file troppo grandi e omessi); dialog* di merge con messaggio modificabile; dialog* di conferma per lo scarto |
+| Tab **Modifiche** (`DiffView{attempt_id, task}`) | collapsible (un file per blocco), badge (A/M/D/R, +/−), button (Aggiorna, Merge, Risolvi con l'agente, Elimina branch), alert (conflitti, target avanti di N commit, checkout del target sporco, HEAD non corretto), skeleton, empty | **viewer diff** (righe con numeri e colori per `LineKind`, "mostra tutto" oltre 2000 righe, segnaposto per binari, file troppo grandi e omessi); dialog* di merge con messaggio modificabile; dialog* di conferma per lo scarto |
 | Toast | classi di alert | `Toaster` (Vec in un signal, al massimo 4, rimossi dopo 5 s) |
 
 `*` = componente portato.
@@ -1213,7 +1223,7 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 
 | Minaccia | Controlli |
 |---|---|
-| Configurazione del repo eseguita sotto `-p` (hook, env, `apiKeyHelper`, MCP) | Isolated di default (`--setting-sources=user --strict-mcp-config`). Trusted solo con **conferma nativa** e fingerprint ricontrollato a ogni turno: se non corrisponde, il turno gira Isolated con una Notice. Warning quando si aggiunge il progetto |
+| Configurazione del repo eseguita sotto `-p` (hook, env, `apiKeyHelper`, MCP) | Isolated di default (`--setting-sources=user --strict-mcp-config`). Trusted solo con **conferma nativa** e fingerprint ricontrollato a ogni turno: se non corrisponde, il turno gira Isolated con una Notice. Riapprovare un fingerprint scaduto chiede di nuovo la conferma. Warning quando si aggiunge il progetto |
 | Codice del repo eseguito dal git dell'app | Runner del §8.1 |
 | Prompt injection che porta a comandi distruttivi | Auto-edit di default (Bash chiede sempre); deny rules via `--settings`; bypass solo con opt-in, conferma nativa e `--allow-dangerously-skip-permissions`; la UI dice chiaramente che il worktree **non è una sandbox** |
 | XSS nella webview che abusa dell'IPC | CSP senza `unsafe-inline` negli script; solo text node; nessun `inner_html`; nav guard (plugin con `on_navigation`: consente solo `tauri://localhost`, `http://tauri.localhost` e in dev `http://localhost:1420`); `open_url` solo `http(s)`; **conferme native** (non cliccabili da un XSS) per bypass, Trusted e passthrough della chiave API |
@@ -1227,9 +1237,10 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 ### 10.3 Grep di sicurezza (in `scripts/check.sh`; qualunque match fa fallire)
 
 - **`ui/src`:** `<script`, `inner_html`, `set_inner_html`, `dangerousDisableAssetCspModification`.
-- **`crates/`, `src-tauri/src`:**
+- **`crates/*/src`, `src-tauri/src`** (i test possono asserire che mancano):
   - `"--bare"`;
-  - `"--dangerously-skip-permissions"`;
+  - `"--dangerously-skip-permissions"`.
+- **`crates/`, `src-tauri/src`:**
   - `find-generic-password`, `SecKeychain`;
   - `TcpListener`, `UdpSocket`, `0.0.0.0`;
   - `credentials.json` fuori dalla costante `DENY_RULES`;
@@ -1248,8 +1259,9 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 - Le milestone sono **sequenziali**. Dentro M2 e M3 i pacchetti vanno in **parallelo**, ognuno in un **git worktree dedicato** (isolation worktree dell'Agent tool, oppure `git worktree add ../atm-wp-<id> -b wp/<id>`).
 - L'orchestratore fa merge in `main` nell'ordine indicato e lancia `scripts/check.sh` dopo ogni merge.
 - **Ownership esclusiva dei file:** i conflitti sono impossibili per costruzione.
-  - `Cargo.toml` e `Cargo.lock` sono **congelati dopo M1**: tutte le dipendenze sono dichiarate lì.
+  - `Cargo.toml` e `Cargo.lock` sono **congelati dopo M1**: tutte le dipendenze sono dichiarate lì (check.sh usa `--locked`).
   - Se ne serve una nuova, il pacchetto la segnala e la aggiunge l'orchestratore.
+  - Un file nuovo si aggiunge come sottomodulo di un file posseduto (es. `mod parse;` in `git.rs` → `src/git/parse.rs`), perché le liste dei moduli (`lib.rs`, `main.rs`) sono congelate.
 - **Contratti congelati in M1:** `atm-types`, le firme pubbliche dei moduli di `atm-core`, i comandi registrati, `ui/src/{main.rs, app.rs, ipc/mod.rs, ipc/tauri.rs, ipc/mock/mod.rs, widgets/toast.rs, ui/*, hooks/*}`. Si possono solo **aggiungere** cose, e solo tramite il pacchetto che possiede il file.
 
 **Divieti:**
@@ -1265,11 +1277,12 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 **Verifica standard** (`scripts/check.sh`):
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --exclude atm-ui --all-targets -- -D warnings
-cargo clippy -p atm-ui --target wasm32-unknown-unknown -- -D warnings
-cargo clippy -p atm-ui --target wasm32-unknown-unknown --features mock -- -D warnings
-cargo check -p atm-types --target wasm32-unknown-unknown
-cargo test --workspace --exclude atm-ui
+cargo clippy --locked --workspace --exclude atm-ui --all-targets -- -D warnings
+cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown --features mock -- -D warnings
+cargo check --locked -p atm-types --target wasm32-unknown-unknown
+cargo test --locked --workspace --exclude atm-ui
+cargo test --locked -p atm-ui
 # + i grep del §10.3
 ```
 Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p atm-ui` per i reducer puri.
@@ -1334,18 +1347,18 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 
 | Pacchetto | Possiede | Scope | Accettazione (`cargo test -p atm-core --test <x>` + check.sh) |
 |---|---|---|---|
-| **M2-DB** | `atm-core/src/db.rs`, `migrations/**`, `tests/db.rs` | open, migrate, query (progetti, task, board join, attempt, process, entries upsert/tail/before, settings), posizioni, `mark_orphans` | migrazione su `:memory:`; cascade delle FK; CHECK rifiutati; indici parziali (secondo attempt attivo e secondo process `running` rifiutati); 500 spostamenti casuali mantengono l'ordine stretto con rinumerazione; upsert idempotente con `rev`; paginazione |
-| **M2-GIT** | `atm-core/src/git.rs`, `tests/git.rs`, `tests/common/**` | §8 tranne il fingerprint (M6): runner, validazione del repo, branch, add/remove/riconciliazione worktree, auto-commit, diff snapshot con parser dei hunk, branch status, squash merge, slug | Repo temporanei con una **gitconfig globale ostile** (hooksPath e fsmonitor che scrivono un marker): il marker non compare mai. 10 worktree concorrenti; path con spazi e unicode; `worktree prune` dell'utente non tocca i worktree bloccati; diff con modifica, rinomina, cancellazione, file non tracciato, binario, `too_large`, `omitted`; l'indice dell'agente resta invariato (mtime e hash); merge con target non in checkout (`update-ref`, fallimento CAS gestito), in checkout e pulito (`ff-only`), con sovrapposizione sporca (`TargetCheckoutDirty`, nessun byte cambiato), target divergente senza conflitti (merge ok), conflitto (nessun ref toccato), `NothingToMerge`; tutto con `LANG=it_IT.UTF-8` |
-| **M2-CLAUDE** | `atm-core/src/{claude,wire,normalize}.rs`, `src/bin/fake-claude.rs`, `tests/{claude,normalize}.rs`, `tests/fixtures/**` | §7.1–7.6, §7.8 (funzioni pure), §7.10 (probe, script di login), `killpg`; fake-claude del §12.1 | snapshot insta dell'argv (primo turno, resume, isolated/trusted, bypass abilitato, model+effort): contiene `--permission-mode=` e mai `--bare`; golden del normalizer per ogni riga della tabella del §7.6; parse di `auth status` (dentro e fuori); gate di versione; `approval_response` (riscrittura della destination, regole a tool intero escluse); riga da 20 MiB saltata con lo stream che prosegue; spawn contro fake-claude: l'env registrato non contiene `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `GIT_DIR` e `PWD` = cwd; il PATH della login shell viene estratto dai marker |
+| **M2-DB** | `atm-core/src/db.rs`, `migrations/**`, `tests/db.rs`, `tests/snapshots/db__*` | open, migrate, query (progetti, task, board join, attempt, process, entries upsert/tail/before, settings), posizioni, `mark_orphans` | migrazione su `:memory:`; cascade delle FK; CHECK rifiutati; indici parziali (secondo attempt attivo e secondo process `running` rifiutati); 500 spostamenti casuali (xorshift con seme fisso scritto nel test: nessuna dipendenza RNG) mantengono l'ordine stretto con rinumerazione; upsert idempotente con `rev`; paginazione |
+| **M2-GIT** | `atm-core/src/git.rs`, `tests/git.rs`, `tests/common/**`, `tests/snapshots/git__*` | §8 tranne il fingerprint (M6), con l'env di test via `Git::with_env` (mai `std::env::set_var`): runner, validazione del repo, branch, add/remove/riconciliazione worktree, auto-commit, diff snapshot con parser dei hunk, branch status, squash merge, slug | Repo temporanei con una **gitconfig globale ostile** (hooksPath e fsmonitor che scrivono un marker): il marker non compare mai. 10 worktree concorrenti; path con spazi e unicode; `worktree prune` dell'utente non tocca i worktree bloccati; diff con modifica, rinomina, cancellazione, file non tracciato, binario, `too_large`, `omitted`; l'indice dell'agente resta invariato (mtime e hash); merge con target non in checkout (`update-ref`, fallimento CAS gestito), in checkout e pulito (`ff-only`), con sovrapposizione sporca (`TargetCheckoutDirty`, nessun byte cambiato), target divergente senza conflitti (merge ok), conflitto (nessun ref toccato), `NothingToMerge`; tutto con `LANG=it_IT.UTF-8` |
+| **M2-CLAUDE** | `atm-core/src/{claude,wire,normalize}.rs`, `src/bin/fake-claude.rs`, `tests/{claude,normalize}.rs`, `tests/fixtures/**`, `tests/snapshots/{claude,normalize}__*` | §7.1–7.6, §7.8 (funzioni pure), §7.10 (probe, script di login), `killpg`; fake-claude del §12.1 | snapshot insta dell'argv (primo turno, resume, isolated/trusted, bypass abilitato, model+effort): contiene `--permission-mode=` e mai `--bare`; golden del normalizer per ogni riga della tabella del §7.6; parse di `auth status` (dentro e fuori); gate di versione; `approval_response` (riscrittura della destination, regole a tool intero escluse); riga da 20 MiB saltata con lo stream che prosegue; spawn contro fake-claude: l'env registrato non contiene `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `GIT_DIR` e `PWD` = cwd; il PATH della login shell viene estratto dai marker |
 | **M2-UI-BOARD** | `ui/src/views/{onboarding,sidebar,board,task_dialog,settings}.rs`, `widgets/dnd.rs`, `state/board.rs`, `ipc/mock/board.rs` | Gate, sidebar, board con DnD, dialog task, impostazioni | clippy wasm con mock; `trunk serve --features mock`: creazione di un task, drag tra colonne e dentro una colonna (l'ordine persiste nel mock), tutti gli stati dell'onboarding; con browser automatizzato se disponibile (screenshot), altrimenti una checklist per l'orchestratore |
-| **M2-UI-TASK** | `ui/src/views/{task_panel,start_dialog,transcript,approval,composer,diff,merge_dialog}.rs`, `state/transcript.rs`, `ipc/mock/attempt.rs`, `ipc/mock/fixtures/**` | §9.2 (Agente, Modifiche), §9.4 | Il mock riproduce le fixture `TranscriptMsg` (simple, approval, flood da 10k); consenti, consenti sempre, nega e nega-e-ferma aggiornano le entry; con `flood`, `document.querySelectorAll('[data-entry]').length ≤ 300`; "Carica precedenti" mantiene l'ancora; il diff mostra aggiunte, rimozioni, rinomine, binari, `too_large` e omessi; il dialog di merge mostra Conflicts e TargetCheckoutDirty |
+| **M2-UI-TASK** | `ui/src/views/{task_panel,start_dialog,transcript,approval,composer,diff,merge_dialog}.rs`, `state/transcript.rs`, `ipc/mock/attempt.rs`, `ipc/mock/fixtures/**` | §9.2 (Agente, Modifiche), §9.4. Nel suo worktree `ipc/mock/board.rs` è la baseline di M1 (loggato, un progetto, un task per colonna, sola lettura): con `trunk serve --features mock` l'URL `/?task=task-inreview` apre il pannello senza la board | Il mock riproduce le fixture `TranscriptMsg` (simple, approval, flood da 10k); consenti, consenti sempre, nega e nega-e-ferma aggiornano le entry; con `flood`, `document.querySelectorAll('[data-entry]').length ≤ 300`; "Carica precedenti" mantiene l'ancora; il diff mostra aggiunte, rimozioni, rinomine, binari, `too_large` e omessi; il dialog di merge mostra Conflicts e TargetCheckoutDirty |
 
 #### M3: Orchestrazione e guscio Tauri (2 agenti in parallelo; merge CORE → TAURI)
 
 | Pacchetto | Possiede | Scope | Accettazione |
 |---|---|---|---|
-| **M3-CORE** | `atm-core/src/{lib,runner,live}.rs`, `tests/flow.rs` | Servizi (§6.3), §7.7–7.9, §6.5, recovery, shutdown, cap, pausa, cache env, apertura via `open` | `tests/flow.rs` con fake-claude, repo temporaneo e un sink che registra gli eventi. Sequenza ordinata: `start_attempt` → worktree presente → Snapshot → entry → approvazione pendente → `respond_approval(Allow{remember:true})` → `allow_rules` salvate e presenti nel `--settings` del turno successivo → result → auto-commit (`head_after`) → task in inreview → `get_diff` mostra `hello.txt` → il follow-up usa `--resume=` con lo stesso id → merge → task done e worktree rimosso. Casi `noinit` (nuovo `--session-id` al turno dopo), `hang` con interrupt rispettato (killed in ≤ 5 s), `hang_ignore` (SIGKILL in ≤ 13 s, `kill -0 pgid` fallisce, il nipote `sleep` è morto), `crash` (failed/crash con stderr catturato), `control` (risposta di errore registrata da fake-claude), `usage_limit` (pausa, poi `UsageLimited`), `auth_fail` (env invalidato), cap 2 (il terzo avvio dà `ConcurrencyLimit`), `auth status` con exit 1 (`NotLoggedIn` senza spawn), drop del runtime a metà turno e nuovo Core (`failed/app_restart`, gruppo verificato ucciso, task in inreview), ordine dello snapshot con upsert concorrenti, Lagged (Snapshot inviato di nuovo) |
-| **M3-TAURI** | `src-tauri/**` | Corpi sottili dei comandi; sink `app.emit` e `Channel`; `on_page_load(Started)` → `drop_subscriptions`; nav guard; single-instance; `pick_repo_folder` in `spawn_blocking`; helper `confirm_native(title, msg) -> bool` (dialog plugin, `blocking_show` fuori dal main thread); `ExitRequested` (§7.9); creazione delle dir dati con permessi; selftest esteso con subscribe, unsubscribe e reload | clippy; `cargo tauri build --debug --no-bundle`; selftest con exit 0; manuale: `cargo tauri dev` arriva all'onboarding con dati veri |
+| **M3-CORE** | `atm-core/src/{lib,runner,live}.rs`, `tests/flow.rs`, `tests/snapshots/flow__*` | Servizi (§6.3), §7.7–7.9, §6.5, recovery, shutdown, cap, pausa, cache env, apertura via `open` | `tests/flow.rs` con fake-claude (variabili `FAKE_CLAUDE_*` per Core via `CoreConfig.extra_env`, mai `std::env::set_var`), repo temporaneo e un sink che registra gli eventi. Sequenza ordinata: `start_attempt` → worktree presente → Snapshot → entry → approvazione pendente → `respond_approval(Allow{remember:true})` → `allow_rules` salvate e presenti nel `--settings` del turno successivo → result → auto-commit (`head_after`) → task in inreview → `get_diff` mostra `hello.txt` → il follow-up usa `--resume=` con lo stesso id → merge → task done e worktree rimosso. Casi `noinit` (nuovo `--session-id` al turno dopo), `hang` con interrupt rispettato (killed in ≤ 5 s), `hang_ignore` (SIGKILL in ≤ 13 s, `kill -0 pgid` fallisce, il nipote `sleep` è morto), `crash` (failed/crash con stderr catturato), `control` (risposta di errore registrata da fake-claude), `usage_limit` (pausa, poi `UsageLimited`), `auth_fail` (env invalidato), cap 2 (il terzo avvio dà `ConcurrencyLimit`), `auth status` con exit 1 (`NotLoggedIn` senza spawn), drop del runtime a metà turno e nuovo Core (`failed/app_restart`, gruppo verificato ucciso, task in inreview), ordine dello snapshot con upsert concorrenti, Lagged (Snapshot inviato di nuovo) |
+| **M3-TAURI** | `src-tauri/**`, `ui/src/selftest.rs` | Corpi sottili dei comandi; sink `app.emit` e `Channel`; `on_page_load(Started)` → `drop_subscriptions`; nav guard; single-instance; `pick_repo_folder` in `spawn_blocking`; helper `confirm_native(title, msg) -> bool` (dialog plugin, `blocking_show` fuori dal main thread); `ExitRequested` (§7.9); creazione delle dir dati con permessi; selftest esteso con subscribe, unsubscribe e reload (`debug_forwarder_count`; un attempt sconosciuto dà uno Snapshot vuoto, quindi non serve una fixture) | Nel proprio worktree (Core ancora stub): clippy, `cargo tauri build --debug --no-bundle`, selftest di M0 con exit 0. Dopo il rebase sul merge di M3-CORE (ordine CORE → TAURI): selftest esteso con exit 0; manuale: `cargo tauri dev` arriva all'onboarding con dati veri |
 
 #### M4: Integrazione (1 agente)
 

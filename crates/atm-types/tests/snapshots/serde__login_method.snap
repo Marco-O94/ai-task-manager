@@ -1,0 +1,9 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: LOGIN_METHODS
+---
+[
+  "ClaudeAi",
+  "Console",
+  "Sso"
+]

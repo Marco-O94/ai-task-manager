@@ -1,14 +1,11 @@
 //! Bindings to the global Tauri API (`withGlobalTauri`), spec §6.6.
-//!
-//! Payloads cross the boundary as JSON text (`serde_json` <-> `JSON.parse`/`JSON.stringify`),
-//! so the wire format is exactly serde's on both sides (D11).
 
-use js_sys::{JSON, Object, Reflect};
-use serde::Serialize;
+use atm_types::{AppError, AttemptIdReq, Command, Id, SubscribeTranscript, TranscriptMsg};
+use js_sys::{Object, Reflect};
 use serde::de::DeserializeOwned;
 use wasm_bindgen::prelude::*;
 
-use super::AppError;
+use super::{from_js, to_js};
 
 #[wasm_bindgen]
 extern "C" {
@@ -31,24 +28,6 @@ extern "C" {
     pub fn set_onmessage(this: &Channel, f: &Closure<dyn FnMut(JsValue)>);
 }
 
-fn to_js<T: Serialize + ?Sized>(v: &T) -> Result<JsValue, AppError> {
-    let text = serde_json::to_string(v).map_err(|e| AppError::internal(e.to_string()))?;
-    JSON::parse(&text).map_err(|e| AppError::internal(format!("JSON.parse: {e:?}")))
-}
-
-fn from_js<T: DeserializeOwned>(v: &JsValue) -> Result<T, AppError> {
-    // `JSON.stringify(undefined)` is not a string: commands returning `()` resolve to it.
-    let text = if v.is_undefined() {
-        "null".to_owned()
-    } else {
-        JSON::stringify(v)
-            .ok()
-            .and_then(|s| s.as_string())
-            .ok_or_else(|| AppError::internal("JSON.stringify failed"))?
-    };
-    serde_json::from_str(&text).map_err(|e| AppError::internal(format!("decode: {e}")))
-}
-
 /// A rejected invoke carries the serialized `AppError`, or a plain string for errors
 /// raised by Tauri itself (unknown command, bad arguments).
 fn decode_error(err: &JsValue) -> AppError {
@@ -63,14 +42,10 @@ fn args_object(req: &JsValue) -> Result<Object, AppError> {
     Ok(args)
 }
 
-/// Invokes `cmd` with `{req}` and decodes the reply or the typed error.
-pub async fn call<Req, Res>(cmd: &str, req: &Req) -> Result<Res, AppError>
-where
-    Req: Serialize + ?Sized,
-    Res: DeserializeOwned,
-{
+/// Invokes `C::NAME` with `{req}` and decodes the reply or the typed error.
+pub async fn call<C: Command>(req: &C::Req) -> Result<C::Res, AppError> {
     let args = args_object(&to_js(req)?)?;
-    match tauri_invoke(cmd, args.into()).await {
+    match tauri_invoke(C::NAME, args.into()).await {
         Ok(v) => from_js(&v),
         Err(e) => Err(decode_error(&e)),
     }
@@ -79,16 +54,10 @@ where
 /// Invokes a streaming command with `{req, onEvent}`. The channel's `onmessage` is set
 /// before the invoke, so no message can be missed. Keep the returned `Channel` and
 /// `Closure` alive for as long as messages should be received.
-pub async fn call_with_channel<Req, Res, Msg>(
-    cmd: &str,
-    req: &Req,
+pub async fn call_with_channel<C: Command, Msg: DeserializeOwned + 'static>(
+    req: &C::Req,
     mut on_msg: impl FnMut(Result<Msg, AppError>) + 'static,
-) -> Result<(Res, Channel, Closure<dyn FnMut(JsValue)>), AppError>
-where
-    Req: Serialize + ?Sized,
-    Res: DeserializeOwned,
-    Msg: DeserializeOwned + 'static,
-{
+) -> Result<(C::Res, Channel, Closure<dyn FnMut(JsValue)>), AppError> {
     let channel = Channel::new();
     let closure = Closure::<dyn FnMut(JsValue)>::new(move |v: JsValue| on_msg(from_js(&v)));
     channel.set_onmessage(&closure);
@@ -96,7 +65,7 @@ where
     let args = args_object(&to_js(req)?)?;
     Reflect::set(&args, &"onEvent".into(), &channel)
         .map_err(|e| AppError::internal(format!("{e:?}")))?;
-    match tauri_invoke(cmd, args.into()).await {
+    match tauri_invoke(C::NAME, args.into()).await {
         Ok(v) => Ok((from_js(&v)?, channel, closure)),
         Err(e) => Err(decode_error(&e)),
     }
@@ -104,7 +73,6 @@ where
 
 /// Listens to a global event; `f` receives the event's `payload`. Keep the returned
 /// `Closure` alive and call the returned unlisten function to stop.
-#[allow(dead_code)] // first used in M1 (`changed`, `env_changed`)
 pub async fn listen<T: DeserializeOwned + 'static>(
     event: &str,
     mut f: impl FnMut(T) + 'static,
@@ -120,4 +88,21 @@ pub async fn listen<T: DeserializeOwned + 'static>(
         .await
         .map_err(|e| decode_error(&e))?;
     Ok((closure, unlisten.unchecked_into()))
+}
+
+/// `subscribe_transcript` with its `Channel<TranscriptMsg>` (spec §6.5): returns the
+/// subscription id, the channel and its handler, to be kept alive until unsubscribing.
+#[allow(dead_code)] // first used by the transcript view (M2-UI-TASK)
+pub async fn subscribe_transcript(
+    attempt_id: &Id,
+    mut f: impl FnMut(TranscriptMsg) + 'static,
+) -> Result<(Id, Channel, Closure<dyn FnMut(JsValue)>), AppError> {
+    let req = AttemptIdReq {
+        attempt_id: attempt_id.clone(),
+    };
+    call_with_channel::<SubscribeTranscript, TranscriptMsg>(&req, move |msg| match msg {
+        Ok(msg) => f(msg),
+        Err(e) => leptos::logging::error!("transcript message: {}", e.message),
+    })
+    .await
 }

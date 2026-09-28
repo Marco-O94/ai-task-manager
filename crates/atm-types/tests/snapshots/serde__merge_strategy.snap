@@ -1,0 +1,8 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: MERGE_STRATEGIES
+---
+[
+  "UpdateRef",
+  "FfCheckedOut"
+]

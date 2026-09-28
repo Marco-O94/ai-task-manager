@@ -1,0 +1,23 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: ERROR_CODES
+---
+[
+  "NotFound",
+  "Invalid",
+  "Conflict",
+  "Busy",
+  "ConcurrencyLimit",
+  "UsageLimited",
+  "ClaudeNotFound",
+  "NotLoggedIn",
+  "WorktreeMissing",
+  "BranchMismatch",
+  "TargetCheckoutDirty",
+  "GitIdentityMissing",
+  "Git",
+  "Io",
+  "Db",
+  "NotImplemented",
+  "Internal"
+]

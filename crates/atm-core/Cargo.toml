@@ -5,4 +5,25 @@ rust-version.workspace = true
 version.workspace = true
 publish = false
 
+[lib]
+path = "src/lib.rs"
+
+# Test double of the Claude CLI (spec §12.1). Built with the workspace, never bundled.
+[[bin]]
+name = "fake-claude"
+path = "src/bin/fake-claude.rs"
+
 [dependencies]
+atm-types.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+tempfile.workspace = true

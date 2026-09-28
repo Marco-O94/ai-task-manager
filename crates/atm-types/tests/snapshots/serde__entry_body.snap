@@ -1,0 +1,75 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: entry_bodies()
+---
+[
+  {
+    "type": "UserMessage",
+    "text": "ciao"
+  },
+  {
+    "type": "SessionInit",
+    "model": "claude-opus",
+    "permission_mode": "acceptEdits",
+    "api_key_source": "none",
+    "mcp_servers": 0,
+    "warnings": []
+  },
+  {
+    "type": "AssistantText",
+    "text": "ok"
+  },
+  {
+    "type": "Thinking",
+    "text": "hmm"
+  },
+  {
+    "type": "ToolCall",
+    "tool_use_id": "toolu_1",
+    "name": "Write",
+    "summary": "Write hello.txt",
+    "input": "{\"file_path\":\"hello.txt\"}",
+    "status": {
+      "state": "Succeeded"
+    },
+    "output": {
+      "text": "done",
+      "truncated_bytes": 0,
+      "is_error": false
+    }
+  },
+  {
+    "type": "ApiRetry",
+    "attempt": 1,
+    "max_retries": 10,
+    "delay_ms": 500,
+    "error": "overloaded"
+  },
+  {
+    "type": "TurnEnd",
+    "subtype": "success",
+    "is_error": false,
+    "duration_ms": 1000,
+    "num_turns": 2,
+    "cost_usd_estimate": 0.5,
+    "permission_denials": 0,
+    "text": "fatto",
+    "limit": "RateLimit"
+  },
+  {
+    "type": "Notice",
+    "level": "Warn",
+    "text": "Contesto compattato",
+    "action": null
+  },
+  {
+    "type": "Notice",
+    "level": "Error",
+    "text": "Sessione non trovata",
+    "action": "NewSession"
+  },
+  {
+    "type": "Stderr",
+    "text": "warning"
+  }
+]

@@ -1,0 +1,12 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: FILE_STATUSES
+---
+[
+  "Added",
+  "Modified",
+  "Deleted",
+  "Renamed",
+  "Copied",
+  "TypeChanged"
+]
