@@ -36,7 +36,7 @@ const STAGE_KEY: &str = "atm-selftest-first-load";
 const UNKNOWN_ATTEMPT: &str = "00000000-0000-4000-8000-000000000000";
 
 /// A check that needs the M3 core: `None` (null in the report) while the core is the M1
-/// stub and answers `NotImplemented`. The backend requires it only with `ATM_SELFTEST_FULL=1`.
+/// stub and answers `NotImplemented`. The backend requires it once the core is not the stub.
 type CoreCheck = Option<bool>;
 
 thread_local! {

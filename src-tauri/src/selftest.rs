@@ -1,13 +1,14 @@
 //! Debug-only IPC probes driven by the UI when `ATM_SELFTEST=1` (spec §11.2 M0, M3).
 
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use atm_core::claude::ATM_CLAUDE_PATH_ENV;
 use atm_core::{Core, CoreConfig};
-use atm_types::AppError;
 use atm_types::debug::{PingReq, ProbeMsg, ReportReq};
+use atm_types::{AppError, ErrorCode};
 use tauri::ipc::Channel;
 use tauri::{AppHandle, State};
 
@@ -16,7 +17,7 @@ const PROBE_BIG: [u32; 3] = [7, 23, 41];
 const PROBE_BIG_LEN: usize = 20 * 1024;
 const WATCHDOG: Duration = Duration::from_secs(90);
 /// Report keys of the transcript checks (spec §11.2 M3-TAURI). The UI reports them as null
-/// while the core is the M1 stub, so they are required only with `ATM_SELFTEST_FULL=1`.
+/// while the core is the M1 stub, so they are required as soon as it is not ([`core_is_stub`]).
 const FULL_KEYS: [&str; 3] = [
     "transcript_subscribe_ok",
     "forwarder_unsub_ok",
@@ -33,26 +34,46 @@ fn env_flag(name: &str) -> bool {
     std::env::var(name).as_deref() == Ok("1")
 }
 
+/// Ends a selftest run that cannot report: exit code 1, private dir removed.
+fn fail(why: &str) -> ! {
+    eprintln!("selftest: {why}");
+    remove_private_dir();
+    std::process::exit(1)
+}
+
 /// Data and cache dirs of a selftest run (`$TMPDIR/atm-selftest-<pid>`), used instead of the
 /// app's: the probe may run next to an open instance, whose DB and agents it must not touch.
 pub fn private_dir() -> PathBuf {
     std::env::temp_dir().join(format!("atm-selftest-{}", std::process::id()))
 }
 
-/// A selftest never opens the user's DB, recovers (kills) the agents of an open app or runs
-/// the user's Claude CLI: it gets [`private_dir`] and the `fake-claude` built next to this
-/// binary (by `cargo test`; if missing, the core just reports Claude as not found).
+/// A selftest never opens the user's DB or recovers (kills) the agents of an open app: it
+/// gets a fresh [`private_dir`] (a dead run with the same pid may have left one behind).
+///
+/// Nor may it run the user's Claude CLI, yet `claude_path` is only discovery's first
+/// candidate (spec §7.1): the run exits 1 unless `fake-claude` was built next to this binary
+/// (by `cargo test`/`cargo build`, not by `cargo tauri build`), and `ATM_CLAUDE_PATH` and
+/// `HOME` point the next candidates, and any `~/.claude` read, away from the user's.
+#[allow(clippy::needless_update)] // M3-CORE may add fields to `CoreConfig`
 pub fn core_config() -> CoreConfig {
     let dir = private_dir();
-    let exe_dir = std::env::current_exe()
+    let _ = std::fs::remove_dir_all(&dir);
+    let fake_claude = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(Path::to_path_buf))
-        .unwrap_or_default();
+        .and_then(|exe| Some(exe.parent()?.join("fake-claude")))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| {
+            fail("no fake-claude next to the binary: run `cargo build -p atm-core --bin fake-claude`")
+        });
     CoreConfig {
         data_dir: dir.join("data"),
         cache_dir: dir.join("cache"),
-        claude_path: Some(exe_dir.join("fake-claude")),
+        claude_path: Some(fake_claude.clone()),
         path_env: Some(SELFTEST_PATH.into()),
+        extra_env: vec![
+            (ATM_CLAUDE_PATH_ENV.into(), fake_claude.into()),
+            ("HOME".into(), dir.into()),
+        ],
         ..CoreConfig::default()
     }
 }
@@ -69,8 +90,7 @@ pub fn start_watchdog() {
     if selftest_enabled() {
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
-            eprintln!("selftest: no report from the UI within {WATCHDOG:?}");
-            std::process::exit(1);
+            fail(&format!("no report from the UI within {WATCHDOG:?}"));
         });
     }
 }
@@ -115,13 +135,23 @@ pub async fn debug_forwarder_count(core: State<'_, Arc<Core>>) -> Result<u32, Ap
 
 /// Prints the UI's report on stdout and exits: 0 if every check passed, 1 otherwise.
 #[tauri::command]
-pub async fn debug_selftest_report(app: AppHandle, req: ReportReq) -> Result<(), AppError> {
-    let passed = report_passed(&req.report, env_flag("ATM_SELFTEST_FULL"));
+pub async fn debug_selftest_report(
+    app: AppHandle,
+    core: State<'_, Arc<Core>>,
+    req: ReportReq,
+) -> Result<(), AppError> {
+    let passed = report_passed(&req.report, !core_is_stub(&core).await);
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{}", req.report);
     let _ = out.flush();
     app.exit(if passed { 0 } else { 1 });
     Ok(())
+}
+
+/// The M1 stub answers every service with `NotImplemented`; a core past it must pass the
+/// transcript checks, so a regression to `NotImplemented` (null) fails the run.
+async fn core_is_stub(core: &Core) -> bool {
+    matches!(core.get_settings().await, Err(e) if e.code == ErrorCode::NotImplemented)
 }
 
 /// Every boolean must be true and `csp_violations` must be 0; with `full`, every
