@@ -1,0 +1,10 @@
+[build]
+target = "index.html"
+[watch]
+watch = [".", "../crates/atm-types"]      # rebuild quando cambia il contratto
+[serve]
+port = 1420
+open = false
+[tools]
+tailwindcss = "4.3.3"                     # Trunk 0.21.14 ha 3.3.5 come default
+wasm_bindgen = "0.2.129"                  # = versione di wasm-bindgen in Cargo.lock

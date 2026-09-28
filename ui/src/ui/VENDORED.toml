@@ -1,0 +1,56 @@
+# Rust/UI (Leptos) sources vendored by hand (spec §9.1): `ui add` is broken upstream.
+# Files are byte-identical to upstream unless listed under [ported]; `sha256` is the
+# hash of the UPSTREAM file at `commit`, so `shasum -a 256` shows any local drift.
+# mod.rs files (here and in ../hooks) are ours: they list only the vendored modules.
+
+[source]
+repo = "https://github.com/rust-ui/leptos-ui"
+commit = "9cb8e9f251a254bea19c5d00318e296bb13dca05"   # main, 2026-09-22
+fetched = "2026-09-28"
+ui_dir = "app_crates/registry/src/ui"                 # -> ui/src/ui/
+hooks_dir = "app_crates/registry/src/hooks"           # -> ui/src/hooks/
+
+[ported]
+"dialog.rs" = "ATM-PORT: inline script element removed; `open: RwSignal<bool>` on <Dialog> drives data-state; Esc (window keydown) and backdrop click close; use_scroll_lock::lock/unlock from Rust; focus first focusable, restored on close; pointer-events via data-state classes instead of inline style"
+"button.rs" = "ATM-PORT: `support_aria_current: true` removed from variants! (it expands to leptos_router::use_location; no router in this app, D12)"
+
+[sha256.ui]
+"alert.rs" = "64a8202dd493a08a395951170229b38f675f29a2e5b2dfdf6ef04f01c834b6ce"
+"badge.rs" = "d2bcd542232ad3469902c12f9133978dc352a2c7fc1159eb61d629cd233da819"
+"bubble.rs" = "cb8117b211d9d7197d8d08e33b9767ab665b676953a79139f67ef9d9a0d5c2c6"
+"button.rs" = "152dc00e00a5ba99794a79aba1d1009160ba35c9506b63814154061fe07886c9"
+"callout.rs" = "341d252610e9e7618ae3b9a5719d2644184f56376d079d7d69ccc77a2578736b"
+"card.rs" = "8ca336981eec68056446d6f083bc24c1ffb081543172e285f467dafc895e470d"
+"chat.rs" = "97e5a25f3ddd3749f30a58a71e685771664a04964fd53a86690c82eabaa48838"
+"collapsible.rs" = "e06563f3182156898226413dd8e4c57da36d4dabaaa61f6f6625f725ffff6209"
+"dialog.rs" = "ff117f2ee51a8895dfd54f473f847a13dd88e4160607134c25c9d25cbe6707d6"
+"empty.rs" = "be73db21f491de0018cc730d65905ed50811d28f809e353737043266217459b7"
+"input.rs" = "62edf7d028c0ece5ffa42890bd7766085e72adf6f474ec612ab0504858f60696"
+"kbd.rs" = "7402cb0d62ea040148494856f7acef5d9e44aefb83b17e796f3c5063dc8ead22"
+"label.rs" = "b52c3e635643714c6ef5e096108a7da9435e5ab3245a3416d5393c719d5c3585"
+"marker.rs" = "19bef90200d1654e4bdc7f722f114ec55013c286192304e715377aa1576d7c10"
+"message.rs" = "45a3a70ed0c2f0f5d668bec48c76fe2cd838a4826d9b1064f5d27dfab7dfc546"
+"scroll_area.rs" = "a0d73c31e1fb6403b4951961339af6fe571b3838602336f02251c1d86f264aaf"
+"select_native.rs" = "f3b343118da07a4d594ad0b2986648f28804255e4182400efde61412932591c6"
+"separator.rs" = "0ee20575696498f98f1248118dcd51e68078ea0d3fd2b10ebc64e0392f67ee22"
+"skeleton.rs" = "56635170b3fab39167f12e59723910cb657dee69004b527e02b77fd273f3da9c"
+"spinner.rs" = "024bf95d08d2051b6a1728d6e3039ad539d56f9ec3ad3216be38e61417cf840b"
+"status.rs" = "cc11ce00426bcd3388f0941e5bd57c7e65c040bb0046f17136bb5a87a53ad4ce"
+"tabs.rs" = "61dcc2a126b6dd6d1f84a9c832bc9c41d33af7e6d2b541a3f85d2b4beed34164"
+"textarea.rs" = "c40d5b5efdc290bfd9144ee250a523afa9c423923e39837bf944c727b16d4032"
+"tooltip.rs" = "e88a4a96aca747eb72042baa1063bfcec402d6dfbc22b0734b8a34dac0ec68c7"
+
+[sha256.hooks]
+"use_random.rs" = "4c29f3b2de4e364b0a8e80a16f7e2f7bd4a1400ab0b48e8b6dda1f814ca6b934"
+"use_scroll_lock.rs" = "615762fa805ad6af78e07940ff14598d0ba70e280b9a42366585b603a556e301"
+
+# Design tokens: ui/style/tailwind.css copies only the :root, .dark, `@theme inline` and
+# `@layer base` blocks of this file (not its @import of site CSS, not its @utility blocks).
+[css]
+file = "style/tailwind.css"
+sha256 = "7e0429b0f9f12d193f7fb6db7af498cd3bfeb0dccf80bf749fdb287539fdd897"
+
+# ui/style/vendor/tw-animate.css (no Node toolchain).
+[tw-animate]
+url = "https://unpkg.com/tw-animate-css@1.4.0/dist/tw-animate.css"
+sha256 = "6035b41301945cd65eb233b4653965e3c235338faae51b0f55676d591daaef23"
