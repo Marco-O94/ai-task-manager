@@ -6,9 +6,12 @@ mod confirm;
 #[cfg(debug_assertions)]
 mod selftest;
 
+use std::fs::{File, OpenOptions, TryLockError};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use atm_core::runner::SHUTDOWN_DEADLINE;
 use atm_core::{AppEvent, Core, CoreConfig, Notify};
@@ -17,9 +20,14 @@ use tauri::plugin::{Builder as PluginBuilder, TauriPlugin};
 use tauri::webview::PageLoadEvent;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, Runtime, Url};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tokio::sync::OnceCell;
 
 /// Past `SHUTDOWN_DEADLINE`, the exit no longer waits for `Core::shutdown`.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// Held in the data dir for the whole process lifetime (see [`lock_data_dir`]).
+const LOCK_FILE: &str = "atm.lock";
+/// A quitting instance ends within `SHUTDOWN_DEADLINE + SHUTDOWN_GRACE`; this covers the rest.
+const LOCK_MARGIN: Duration = Duration::from_secs(2);
 
 pub fn run() {
     // A selftest run must not hand off to an instance that is already open (debug and release
@@ -33,7 +41,10 @@ pub fn run() {
     if single_instance {
         // Must be registered first: a second launch focuses the running window and exits.
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
+            // Runs off the main thread: until the core is up the window must stay hidden.
+            if app.try_state::<Arc<Core>>().is_some()
+                && let Some(window) = app.get_webview_window("main")
+            {
                 let _ = window.unminimize();
                 let _ = window.show();
                 let _ = window.set_focus();
@@ -121,7 +132,10 @@ pub fn run() {
 /// Builds the core and runs its recovery before the UI can load any data (spec §7.9), both
 /// inside the async runtime. A failed `startup` is logged; the app still runs.
 fn start_core(app: &AppHandle) -> Result<Arc<Core>, AppError> {
-    let config = core_config(app).map_err(|e| AppError::io(e.to_string()))?;
+    let config = core_config(app)?;
+    let wait = SHUTDOWN_DEADLINE + SHUTDOWN_GRACE + LOCK_MARGIN;
+    // Released by the kernel when the process exits, whichever way.
+    std::mem::forget(lock_data_dir(&config.data_dir, wait)?);
     let notify = notifier(app.clone());
     tauri::async_runtime::block_on(async move {
         let core = Arc::new(Core::new(config, notify)?);
@@ -132,22 +146,67 @@ fn start_core(app: &AppHandle) -> Result<Arc<Core>, AppError> {
     })
 }
 
-fn core_config(app: &AppHandle) -> tauri::Result<CoreConfig> {
-    // A selftest must never open the user's DB nor recover (kill) the agents of an open app.
+/// The core's paths, with the data and cache dirs created private (spec §4).
+fn core_config(app: &AppHandle) -> Result<CoreConfig, AppError> {
+    let config = dirs_config(app).map_err(|e| AppError::io(e.to_string()))?;
+    for dir in [&config.data_dir, &config.cache_dir] {
+        create_private_dir(dir).map_err(|e| AppError::io(format!("{}: {e}", dir.display())))?;
+    }
+    Ok(config)
+}
+
+fn dirs_config(app: &AppHandle) -> tauri::Result<CoreConfig> {
     #[cfg(debug_assertions)]
     if selftest::selftest_enabled() {
-        let dir = selftest::private_dir();
-        return Ok(CoreConfig {
-            data_dir: dir.join("data"),
-            cache_dir: dir.join("cache"),
-            ..CoreConfig::default()
-        });
+        return Ok(selftest::core_config());
     }
     Ok(CoreConfig {
         data_dir: app.path().app_data_dir()?,
         cache_dir: app.path().app_cache_dir()?,
         ..CoreConfig::default()
     })
+}
+
+/// `dir` and its missing parents are created 0700, an existing `dir` is tightened to 0700:
+/// the DB, logs and login script inside (created 0600/0700 by the core) stay the user's.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
+/// The data dir belongs to one process at a time. Cmd+Q, the Dock's Quit and logout end the
+/// event loop without `ExitRequested`: the single-instance socket is removed before `Exit`
+/// runs the shutdown, so a relaunch in that window waits here (up to `wait`) instead of
+/// recovering the agents the quitting instance is still finalizing. Errors: `Busy`, `Io`.
+fn lock_data_dir(dir: &Path, wait: Duration) -> Result<File, AppError> {
+    let path = dir.join(LOCK_FILE);
+    let io_err = |e: std::io::Error| AppError::io(format!("{}: {e}", path.display()));
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(io_err)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(AppError::busy(format!(
+                    "Un'altra istanza di AI Task Manager sta ancora usando {}.",
+                    dir.display()
+                )));
+            }
+            Err(TryLockError::Error(e)) => return Err(io_err(e)),
+        }
+    }
 }
 
 /// The app cannot run without its core (e.g. an unreadable or newer DB): a launch from the
@@ -179,36 +238,57 @@ fn notifier(app: AppHandle) -> Notify {
     })
 }
 
-static EXITING: AtomicBool = AtomicBool::new(false);
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// The first exit request is held back while `Core::shutdown` stops the agents (spec §7.9);
-/// then the app exits with the requested code (the selftest's 0/1 included). The exit
-/// happens even if the shutdown panics or overruns: a windowless process that keeps the
-/// single-instance socket would swallow every relaunch.
+/// The first exit request is held back while [`shutdown_core`] runs (spec §7.9); then the
+/// app exits with the requested code (the selftest's 0/1 included). Cmd+Q (`NSApp
+/// terminate:`) ends the event loop without `ExitRequested`, so `Exit` runs the shutdown too,
+/// blocking the main thread: the process ends as soon as this callback returns, and only
+/// then releases the data-dir lock a relaunch waits on ([`lock_data_dir`]).
 fn on_run_event(app: &AppHandle, event: RunEvent) {
-    if let RunEvent::ExitRequested { code, api, .. } = event {
-        if EXITING.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        api.prevent_exit();
-        let app = app.clone();
-        tauri::async_runtime::spawn(async move {
-            let core = app.try_state::<Arc<Core>>().map(|s| Arc::clone(&s));
-            if let Some(core) = core {
-                let shutdown = tauri::async_runtime::spawn(async move {
-                    core.shutdown(SHUTDOWN_DEADLINE).await;
-                });
-                match tokio::time::timeout(SHUTDOWN_DEADLINE + SHUTDOWN_GRACE, shutdown).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => eprintln!("core shutdown failed: {e}"),
-                    Err(_) => eprintln!("core shutdown overran {SHUTDOWN_DEADLINE:?}"),
-                }
+    match event {
+        RunEvent::ExitRequested { code, api, .. } => {
+            if EXIT_REQUESTED.swap(true, Ordering::SeqCst) {
+                return;
             }
+            api.prevent_exit();
+            let app = app.clone();
+            tauri::async_runtime::spawn(async move {
+                shutdown_core(&app).await;
+                app.exit(code.unwrap_or(0));
+            });
+        }
+        RunEvent::Exit => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+            tauri::async_runtime::block_on(shutdown_core(app));
             #[cfg(debug_assertions)]
             selftest::remove_private_dir();
-            app.exit(code.unwrap_or(0));
-        });
+        }
+        _ => {}
     }
+}
+
+/// Stops the agents once, whichever exit path gets here first; a second caller waits for the
+/// first. Bounded even if the shutdown panics or overruns: a windowless process that keeps
+/// the single-instance socket would swallow every relaunch.
+async fn shutdown_core(app: &AppHandle) {
+    static DONE: OnceCell<()> = OnceCell::const_new();
+    DONE.get_or_init(|| async {
+        let Some(core) = app.try_state::<Arc<Core>>().map(|s| Arc::clone(&s)) else {
+            return;
+        };
+        let shutdown = tauri::async_runtime::spawn(async move {
+            core.shutdown(SHUTDOWN_DEADLINE).await;
+        });
+        match tokio::time::timeout(SHUTDOWN_DEADLINE + SHUTDOWN_GRACE, shutdown).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => eprintln!("core shutdown failed: {e}"),
+            Err(_) => eprintln!("core shutdown overran {SHUTDOWN_DEADLINE:?}"),
+        }
+    })
+    .await;
 }
 
 /// Blocks every webview navigation that does not target the app's own origin.
@@ -240,5 +320,33 @@ mod tests {
         assert!(!ok("http://localhost:8080/"));
         assert!(!ok("http://tauri.localhost.evil.com/"));
         assert!(!ok("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn data_dir_lock_is_exclusive_until_released() {
+        let dir = std::env::temp_dir().join(format!("atm-data-lock-{}", std::process::id()));
+        create_private_dir(&dir).unwrap();
+        let held = lock_data_dir(&dir, Duration::ZERO).unwrap();
+        let busy = lock_data_dir(&dir, Duration::from_millis(250)).unwrap_err();
+        assert_eq!(busy.code, atm_types::ErrorCode::Busy);
+        drop(held);
+        lock_data_dir(&dir, Duration::ZERO).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn private_dirs_are_0700_even_if_they_existed() {
+        let root = std::env::temp_dir().join(format!("atm-private-dir-{}", std::process::id()));
+        let existing = root.join("existing");
+        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nested = root.join("new/nested");
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        for dir in [&existing, &nested] {
+            create_private_dir(dir).unwrap();
+            assert_eq!(mode(dir), 0o700, "{}", dir.display());
+        }
+        assert_eq!(mode(&root.join("new")), 0o700);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
