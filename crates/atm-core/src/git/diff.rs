@@ -6,8 +6,8 @@ use std::path::Path;
 use atm_types::{AppError, DiffResult, FileDiff};
 
 use super::{
-    DIFF_TIMEOUT, Git, MAX_DIFF_FILES, MAX_FILE_PATCH, MAX_TOTAL_PATCH, RunOpts, TempFile,
-    check_branch, failure, parse,
+    DIFF_TIMEOUT, Git, MAX_DIFF_FILES, MAX_FILE_PATCH, MAX_TOTAL_PATCH, RunOpts, TempFile, failure,
+    parse,
 };
 
 const DIFF_FLAGS: [&str; 4] = ["--no-color", "--no-ext-diff", "--no-textconv", "-M"];
@@ -15,17 +15,18 @@ const DIFF_FLAGS: [&str; 4] = ["--no-color", "--no-ext-diff", "--no-textconv", "
 impl Git {
     /// Diff of `merge-base refs/heads/<target> HEAD` against a snapshot tree written through
     /// a copy of the worktree index (the agent's index is untouched), with the §8.6 budget.
+    /// Errors: `NotFound` for a missing target, `WorktreeMissing`.
     pub async fn snapshot_diff(
         &self,
         worktree: &Path,
         target_branch: &str,
     ) -> Result<DiffResult, AppError> {
-        check_branch(target_branch)?;
+        self.check_worktree(worktree).await?;
+        let target = self.branch_tip(worktree, target_branch).await?;
         let read = RunOpts {
             timeout: Some(DIFF_TIMEOUT),
             ..RunOpts::read()
         };
-        let target = format!("refs/heads/{target_branch}");
         let base = self
             .run_ok(
                 worktree,

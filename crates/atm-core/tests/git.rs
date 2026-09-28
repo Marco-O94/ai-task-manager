@@ -115,6 +115,24 @@ fn hardened(hostile: &Hostile, bin: Option<PathBuf>) -> Git {
     Git::new(bin, path).with_env(hostile.env.clone())
 }
 
+/// The runner's git behind a wrapper that appends each call's argv (fields ended by 0x1f,
+/// one call per line) to the returned log.
+fn logged_git(fx: &Fx) -> (Git, PathBuf) {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let log = fx.dir.join("calls.log");
+    let wrapper = fx.dir.join("logged/git");
+    common::script(
+        &wrapper,
+        &format!(
+            "for a in \"$@\"; do printf '%s\\037' \"$a\"; done >> '{log}'\necho >> '{log}'\n\
+             exec '{real}' \"$@\"",
+            log = log.display(),
+            real = git::find_git(&path).display()
+        ),
+    );
+    (hardened(&fx.hostile, Some(wrapper)), log)
+}
+
 fn write(path: &Path, contents: impl AsRef<[u8]>) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, contents).unwrap();
@@ -262,7 +280,7 @@ async fn runner_forces_hardening_and_environment() {
     common::script(
         &bin,
         &format!(
-            "case \"$*\" in *--get-regexp*) printf 'hook.evil.command\\0hook.b.x.event\\0'; exit 0;; esac\n\
+            "case \"$*\" in *--get-regexp*) printf 'hook.evil.command\\0hook.b.x.event\\0merge.evil.driver\\0merge.ff\\0merge.x.name\\0'; exit 0;; esac\n\
              printf '%s\\n' \"$@\" > '{r}/argv'\n/usr/bin/env > '{r}/env'"
         ),
     );
@@ -336,7 +354,27 @@ async fn runner_forces_hardening_and_environment() {
         assert!(!e.contains_key(k), "{k} leaked");
     }
 
-    // A call that may write: the config-defined hooks are listed first and disabled.
+    // A call that may write, and `merge-tree`: the config-defined hooks and merge drivers are
+    // listed first and disabled.
+    let disabled = |e: &BTreeMap<String, String>| {
+        assert_eq!(e.get("GIT_CONFIG_COUNT").map(String::as_str), Some("3"));
+        let overrides: Vec<(&str, &str)> = (0..3)
+            .map(|i| {
+                (
+                    e[&format!("GIT_CONFIG_KEY_{i}")].as_str(),
+                    e[&format!("GIT_CONFIG_VALUE_{i}")].as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            overrides,
+            [
+                ("hook.b.x.enabled", "false"),
+                ("hook.evil.enabled", "false"),
+                ("merge.evil.driver", "/usr/bin/false"),
+            ]
+        );
+    };
     let index = fx.dir.join("tmp-index");
     g.run(
         &fx.repo,
@@ -351,11 +389,20 @@ async fn runner_forces_hardening_and_environment() {
     let e = env();
     assert_eq!(e.get("GIT_INDEX_FILE"), Some(&index.display().to_string()));
     assert!(!e.contains_key("GIT_OPTIONAL_LOCKS"));
-    assert_eq!(e.get("GIT_CONFIG_COUNT").map(String::as_str), Some("2"));
-    assert_eq!(e["GIT_CONFIG_KEY_0"], "hook.b.x.enabled");
-    assert_eq!(e["GIT_CONFIG_KEY_1"], "hook.evil.enabled");
-    assert_eq!(e["GIT_CONFIG_VALUE_0"], "false");
-    assert_eq!(e["GIT_CONFIG_VALUE_1"], "false");
+    disabled(&e);
+    g.run(
+        &fx.repo,
+        &["merge-tree", "--write-tree", "a", "b"],
+        &RunOpts {
+            read_only: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .unwrap();
+    let e = env();
+    assert_eq!(e.get("GIT_OPTIONAL_LOCKS").map(String::as_str), Some("0"));
+    disabled(&e);
     fx.done();
 }
 
@@ -396,18 +443,20 @@ async fn runner_kills_on_timeout_and_caps_output() {
     assert_eq!(err.code, ErrorCode::Git);
     assert!(err.message.contains("64 MiB"), "{err}");
 
+    // LC_ALL=C despite LANG/LC_ALL=it_IT.UTF-8: messages are parseable English (localized
+    // git prints "non è un repository Git" here).
+    let plain = fx.dir.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
     let failing = fx
         .git
-        .run_ok(
-            &fx.repo,
-            &["rev-parse", "--verify", "nope"],
-            &RunOpts::default(),
-        )
+        .run_ok(&plain, &["rev-parse", "--git-dir"], &RunOpts::default())
         .await
         .unwrap_err();
     assert_eq!(failing.code, ErrorCode::Git);
-    // LC_ALL=C despite LANG/LC_ALL=it_IT.UTF-8: messages are parseable English.
-    assert!(failing.message.contains("fatal"), "{failing}");
+    assert!(
+        failing.message.contains("not a git repository"),
+        "{failing}"
+    );
     fx.done();
 }
 
@@ -603,11 +652,19 @@ async fn hostile_config_never_runs() {
 
     // Control: plain git with this config runs every kind of hostile script.
     let control = common::init_repo(&fx.dir.join("control"));
+    sh(&control, &["switch", "-q", "-c", "side"]);
+    write(&control.join("README.md"), "side\n");
+    sh(&control, &["commit", "-q", "-am", "side"]);
+    sh(&control, &["switch", "-q", "main"]);
+    write(&control.join("README.md"), "main\n");
+    sh(&control, &["commit", "-q", "-am", "main"]);
     write(&control.join("README.md"), "changed\n");
     fx.hostile.plain_git(&control, &["status"]);
     fx.hostile.plain_git(&control, &["diff"]);
     fx.hostile.plain_git(&control, &["diff", "--no-ext-diff"]);
     fx.hostile.plain_git(&control, &["commit", "-qam", "x"]);
+    fx.hostile
+        .plain_git(&control, &["merge-tree", "--write-tree", "main", "side"]);
     let ran = read(&fx.hostile.marker);
     for script in [
         "hooksPath pre-commit",
@@ -616,25 +673,14 @@ async fn hostile_config_never_runs() {
         "ext-diff",
         "textconv",
         "gpg",
+        "merge-driver",
     ] {
         assert!(ran.contains(script), "control did not run {script}:\n{ran}");
     }
     std::fs::remove_file(&fx.hostile.marker).unwrap();
 
     // The whole lifecycle through the runner, every call logged by a wrapper.
-    let path = std::env::var_os("PATH").unwrap_or_default();
-    let log = fx.dir.join("calls.log");
-    let wrapper = fx.dir.join("logged/git");
-    common::script(
-        &wrapper,
-        &format!(
-            "for a in \"$@\"; do printf '%s\\037' \"$a\"; done >> '{log}'\necho >> '{log}'\n\
-             exec '{real}' \"$@\"",
-            log = log.display(),
-            real = git::find_git(&path).display()
-        ),
-    );
-    let g = hardened(&fx.hostile, Some(wrapper));
+    let (g, log) = logged_git(&fx);
     g.version().await.unwrap();
     g.validate_repo(&fx.repo, &fx.root).await.unwrap();
     g.list_branches(&fx.repo).await.unwrap();
@@ -1012,6 +1058,79 @@ async fn add_worktree_refuses_existing_path_or_branch() {
     fx.done();
 }
 
+#[tokio::test]
+async fn a_worktree_without_its_git_file_never_reaches_an_enclosing_repo() {
+    let fx = Fx::new();
+    // The worktree root sits under a $HOME that is itself a repository.
+    let home = &fx.hostile.home;
+    sh(home, &["init", "-q"]);
+    write(&home.join("secret.key"), "secret\n");
+    let a = fx.attempt("Lost gitfile").await;
+    write(&a.wt.join("work.txt"), "work\n");
+    std::fs::remove_file(a.wt.join(".git")).unwrap();
+
+    let g = &fx.git;
+    let codes = [
+        g.autocommit(&a.wt, "atm: turn 1: x").await.map(drop),
+        g.snapshot_diff(&a.wt, "main").await.map(drop),
+        g.branch_status(&fx.repo, &a.wt, &a.branch, "main")
+            .await
+            .map(drop),
+        fx.merge(&a, "Lost").await.map(drop),
+        g.remove_worktree(&fx.repo, &a.wt).await,
+    ]
+    .map(|r| r.unwrap_err().code);
+    assert_eq!(codes, [ErrorCode::WorktreeMissing; 5]);
+    assert!(!home.join(".git/index").exists());
+    assert_eq!(sh(home, &["count-objects"]), "0 objects, 0 kilobytes");
+    assert_eq!(read(&a.wt.join("work.txt")), "work\n");
+    fx.done();
+}
+
+#[tokio::test]
+async fn removal_snapshots_on_the_atm_branch_and_never_drops_detached_work() {
+    let fx = Fx::new();
+    let a = fx.attempt("Snapshot").await;
+    write(&a.wt.join("wip.txt"), "wip\n");
+    fx.git.remove_worktree(&fx.repo, &a.wt).await.unwrap();
+    assert!(!a.wt.exists());
+    assert_eq!(
+        sh(&fx.repo, &["log", "-1", "--format=%s", &a.branch]),
+        git::SNAPSHOT_MESSAGE
+    );
+    assert_eq!(
+        sh(&fx.repo, &["show", &format!("{}:wip.txt", a.branch)]),
+        "wip"
+    );
+
+    // Changes, then commits, that only a detached HEAD holds block the removal.
+    let b = fx.attempt("Detached").await;
+    let tip = fx.rev(&b.branch);
+    sh(&b.wt, &["switch", "-q", "--detach"]);
+    write(&b.wt.join("b.txt"), "b\n");
+    let refused = || async {
+        let err = fx.git.remove_worktree(&fx.repo, &b.wt).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::BranchMismatch, "{err}");
+        assert!(b.wt.join("b.txt").exists());
+        assert_eq!(fx.rev(&b.branch), tip);
+    };
+    refused().await;
+    sh(&b.wt, &["add", "b.txt"]);
+    sh(&b.wt, &["commit", "-q", "-m", "detached work"]);
+    refused().await;
+
+    // Once a branch holds it, there is nothing to lose.
+    sh(&b.wt, &["switch", "-q", "-c", "rescued"]);
+    fx.git.remove_worktree(&fx.repo, &b.wt).await.unwrap();
+    assert!(!b.wt.exists());
+    assert_eq!(
+        sh(&fx.repo, &["log", "-1", "--format=%s", "rescued"]),
+        "detached work"
+    );
+    assert_eq!(fx.rev(&b.branch), tip);
+    fx.done();
+}
+
 // ---------------------------------------------------------------- autocommit and diff
 
 #[tokio::test]
@@ -1161,6 +1280,10 @@ async fn snapshot_diff_kinds_and_untouched_index() {
         diff.deletions,
         diff.files.iter().map(|f| f.deletions).sum::<u32>()
     );
+    assert_eq!(
+        fx.git.snapshot_diff(w, "nope").await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
     fx.done();
 }
 
@@ -1309,7 +1432,9 @@ async fn merge_retries_once_when_the_cas_fails() {
             .squash_merge(&fx.repo, &a.wt, &a.branch, "main", "Race", &a.id)
             .await;
         if moves_twice {
-            assert_eq!(result.unwrap_err().code, ErrorCode::Git);
+            let err = result.unwrap_err();
+            assert_eq!(err.code, ErrorCode::Git);
+            assert!(err.message.contains("è cambiato durante il merge"), "{err}");
             assert_eq!(fx.rev("main"), y, "the racer's commit is kept");
         } else {
             let MergeOutcome::Merged {
@@ -1330,6 +1455,19 @@ async fn merge_retries_once_when_the_cas_fails() {
         }
         fx.done();
     }
+
+    // A failure that is not a lost race (a stale lock) comes with git's reason.
+    let fx = Fx::new();
+    sh(&fx.repo, &["switch", "-q", "-c", "other"]);
+    let a = fx.attempt("Locked").await;
+    write(&a.wt.join("feature.txt"), "feature\n");
+    let main = fx.rev("main");
+    write(&fx.repo.join(".git/refs/heads/main.lock"), "");
+    let err = fx.merge(&a, "Locked").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Git);
+    assert!(err.message.contains("main.lock"), "{err}");
+    assert_eq!(fx.rev("main"), main);
+    fx.done();
 }
 
 #[tokio::test]
@@ -1494,5 +1632,127 @@ async fn merge_nothing_to_merge() {
         MergeOutcome::NothingToMerge
     );
     assert_eq!(fx.rev("main"), main);
+    fx.done();
+}
+
+async fn assert_target_blocked(fx: &Fx, a: &Attempt, at: &Path) {
+    let status = fx
+        .git
+        .branch_status(&fx.repo, &a.wt, &a.branch, "main")
+        .await
+        .unwrap();
+    assert_eq!(status.target_checked_out_at, Some(at.display().to_string()));
+    assert!(status.merge_blocked.is_some(), "{status:?}");
+    let main = fx.rev("main");
+    let err = fx.merge(a, "Blocked").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::TargetCheckoutDirty, "{err}");
+    assert_eq!(fx.rev("main"), main);
+}
+
+#[tokio::test]
+async fn merge_refuses_a_target_being_rebased_bisected_or_stale() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    for n in 1..=2 {
+        write(&r.join(format!("c{n}.txt")), "c\n");
+        sh(r, &["add", "-A"]);
+        sh(r, &["commit", "-q", "-m", &format!("c{n}")]);
+    }
+    let a = fx.attempt("Busy target").await;
+    write(&a.wt.join("feature.txt"), "feature\n");
+
+    // The user's checkout stopped in the middle of a rebase of main: HEAD is detached.
+    sh(
+        r,
+        &[
+            "-c",
+            "sequence.editor=sed -i.bak s/^pick/edit/",
+            "rebase",
+            "-q",
+            "-i",
+            "HEAD~1",
+        ],
+    );
+    assert_eq!(fx.git.head_ref(r).await.unwrap(), None);
+    assert_target_blocked(&fx, &a, r).await;
+    sh(r, &["rebase", "--abort"]);
+
+    // A bisect of main in a linked worktree of the user.
+    sh(r, &["switch", "-q", "-c", "other"]);
+    let user_wt = fx.dir.join("user wt");
+    sh(
+        r,
+        &["worktree", "add", "-q", user_wt.to_str().unwrap(), "main"],
+    );
+    sh(&user_wt, &["bisect", "start", "main", "main~2"]);
+    assert_eq!(fx.git.head_ref(&user_wt).await.unwrap(), None);
+    assert_target_blocked(&fx, &a, &user_wt).await;
+    sh(&user_wt, &["bisect", "reset"]);
+
+    // main checked out in a worktree whose directory is gone.
+    std::fs::remove_dir_all(&user_wt).unwrap();
+    assert_target_blocked(&fx, &a, &user_wt).await;
+
+    // Pruned, main is checked out nowhere.
+    sh(r, &["worktree", "prune"]);
+    let outcome = fx.merge(&a, "Free").await.unwrap();
+    assert!(
+        matches!(
+            outcome,
+            MergeOutcome::Merged {
+                strategy: MergeStrategy::UpdateRef,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    fx.done();
+}
+
+#[tokio::test]
+async fn merge_refused_by_git_itself_changes_no_byte() {
+    let fx = Fx::new();
+    write(&fx.repo.join(".gitignore"), "secret.env\n");
+    sh(&fx.repo, &["add", ".gitignore"]);
+    sh(&fx.repo, &["commit", "-q", "-m", "ignore"]);
+    write(&fx.dir.join("case-probe"), "");
+    let case_insensitive = fx.dir.join("CASE-PROBE").exists();
+    let (g, log) = logged_git(&fx);
+    let ff_merges = || read(&log).matches("merge\u{1f}--ff-only").count();
+
+    // What the agent adds, and what the user has at a path the merge does not name exactly:
+    // the pre-check lets these through and git refuses (in English under LANG=it_IT.UTF-8).
+    let mut cases = vec![
+        ("file where a directory goes", "foo/bar.txt", "foo"),
+        ("ignored file", "secret.env", "secret.env"),
+    ];
+    if case_insensitive {
+        cases.push(("case-folding collision", "Notes.txt", "notes.txt"));
+    }
+    for (i, (case, theirs, mine)) in cases.into_iter().enumerate() {
+        let a = fx.attempt("Refused").await;
+        write(&a.wt.join(theirs), "agent\n");
+        sh(&a.wt, &["add", "-f", theirs]);
+        g.autocommit(&a.wt, "atm: turn 1: x")
+            .await
+            .unwrap()
+            .unwrap();
+        write(&fx.repo.join(mine), "user\n");
+        if i == 1 {
+            // An ORIG_HEAD from an earlier operation is kept as it was.
+            sh(&fx.repo, &["update-ref", "ORIG_HEAD", "main~1"]);
+        }
+        let before = tree_bytes(&fx.repo);
+        let merges = ff_merges();
+
+        let err = g
+            .squash_merge(&fx.repo, &a.wt, &a.branch, "main", "Refused", &a.id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::TargetCheckoutDirty, "{case}: {err}");
+        assert_eq!(ff_merges(), merges + 1, "{case}: git itself did not refuse");
+        assert_eq!(tree_bytes(&fx.repo), before, "{case}: a byte changed");
+        std::fs::remove_file(fx.repo.join(mine)).unwrap();
+    }
     fx.done();
 }

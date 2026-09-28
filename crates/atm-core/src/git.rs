@@ -17,12 +17,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use atm_types::{AppError, BranchList, WorktreeState};
+use atm_types::{AppError, BranchList, ErrorCode, WorktreeState};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
@@ -82,6 +82,10 @@ const HARDENING: &[&str] = &[
     "maintenance.auto=false",
 ];
 
+/// `git --version` (spec §7.11).
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+/// Replaces every config-defined merge driver: a failing driver leaves the file conflicted.
+const MERGE_DRIVER_OFF: &str = "/usr/bin/false";
 /// stderr kept per call (the rest is drained and dropped).
 const MAX_STDERR: usize = 64 << 10;
 /// Suffixes tried by [`Git::unique_branch`].
@@ -211,8 +215,12 @@ impl Git {
 
     /// `git --version` → `"2.54.0"`. Errors: `Git` if missing or older than [`MIN_GIT_VERSION`].
     pub async fn version(&self) -> Result<String, AppError> {
+        let opts = RunOpts {
+            timeout: Some(VERSION_TIMEOUT),
+            ..RunOpts::read()
+        };
         let (out, _) = self
-            .spawn(None, &["--version"], &RunOpts::read(), &[], MAX_OUTPUT)
+            .spawn(None, &["--version"], &opts, &[], MAX_OUTPUT)
             .await?;
         let text = out.text();
         let (version, found) = parse::parse_version(&text)
@@ -235,10 +243,12 @@ impl Git {
     /// -c color.ui=never -c gc.auto=0 -c maintenance.auto=false -C <dir> <args>` with stdin
     /// null, `kill_on_drop`, the scrubbed environment plus `LC_ALL=C LANGUAGE=C
     /// GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_PAGER=cat` (spec §8.1). Unless the call is
-    /// `read_only` without an `index_file` (it cannot write refs or an index), the hooks
-    /// defined in the configuration (`hook.<name>.command`, which `core.hooksPath` does not
-    /// cover) are listed first and disabled. A non-zero exit is returned in `code`. Errors:
-    /// `Git` on spawn failure, timeout (the process is killed) or stdout over [`MAX_OUTPUT`].
+    /// `read_only` without an `index_file` (it cannot write refs or an index) and is not
+    /// `merge-tree`, the commands defined in the configuration that these flags do not cover
+    /// are listed first and disabled: hooks (`hook.<name>.command`) and merge drivers
+    /// (`merge.<name>.driver`). Clean/smudge filters stay on (git-lfs needs them). A non-zero
+    /// exit is returned in `code`. Errors: `Git` on spawn failure, timeout (the process is
+    /// killed) or stdout over [`MAX_OUTPUT`].
     pub async fn run(
         &self,
         dir: &Path,
@@ -512,13 +522,33 @@ impl Git {
 
     /// Removal (spec §8.4): snapshot commit if dirty, `worktree unlock`, `worktree remove
     /// --force`; if the directory is already gone, deletes only its metadata dir (matched by
-    /// `gitdir`). Never a global `worktree prune`; the branch is kept.
+    /// `gitdir`). Never a global `worktree prune`; the branch is kept. The snapshot goes only
+    /// on an `atm/*` branch: on a detached HEAD it would be reachable from no ref once git
+    /// drops the worktree's HEAD reflog, and other branches are not ours to commit to.
+    /// Errors: `WorktreeMissing` if the directory is no longer a git checkout,
+    /// `BranchMismatch` if HEAD is not on an `atm/*` branch and holds work no ref keeps
+    /// (uncommitted changes, or commits only HEAD reaches).
     pub async fn remove_worktree(&self, repo: &Path, worktree: &Path) -> Result<(), AppError> {
         let path = utf8(worktree)?;
         if !worktree.is_dir() {
             return self.remove_worktree_metadata(repo, worktree).await;
         }
-        self.autocommit(worktree, SNAPSHOT_MESSAGE).await?;
+        self.check_worktree(worktree).await?;
+        let on_atm = self
+            .head_ref(worktree)
+            .await?
+            .is_some_and(|r| r.starts_with("refs/heads/atm/"));
+        if on_atm {
+            self.commit_all(worktree, SNAPSHOT_MESSAGE).await?;
+        } else if !self.status(worktree).await?.is_empty() || !self.head_in_a_ref(worktree).await? {
+            return Err(AppError::new(
+                ErrorCode::BranchMismatch,
+                format!(
+                    "Il worktree {path} non è su un branch atm/… e ha lavoro che nessun branch \
+                     conserva: torna sul branch dell'attempt o crea un branch, poi riprova"
+                ),
+            ));
+        }
         let opts = RunOpts::default();
         // Fails harmlessly when not locked; `remove` reports the real problems.
         self.run(repo, &["worktree", "unlock", "--", path], &opts)
@@ -529,14 +559,7 @@ impl Git {
     }
 
     async fn remove_worktree_metadata(&self, repo: &Path, worktree: &Path) -> Result<(), AppError> {
-        let common = self
-            .run_ok(
-                repo,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                &RunOpts::read(),
-            )
-            .await?
-            .path();
+        let common = self.common_dir(repo).await?;
         let wanted = [
             worktree.join(".git"),
             canonical_parent(worktree).join(".git"),
@@ -593,20 +616,24 @@ impl Git {
     /// empty, `add -A` then `commit --no-verify --no-gpg-sign -q -m <message>`, with the
     /// fallback identity when `user.name`/`user.email` are missing and HEAD is an `atm/*`
     /// branch. `None` if the worktree was clean (or nothing could be staged).
+    /// Errors: `WorktreeMissing` if the directory is no longer a git checkout.
     pub async fn autocommit(
         &self,
         worktree: &Path,
         message: &str,
     ) -> Result<Option<AutoCommit>, AppError> {
+        self.check_worktree(worktree).await?;
+        self.commit_all(worktree, message).await
+    }
+
+    /// [`Git::autocommit`] of a worktree already checked by [`Git::check_worktree`].
+    async fn commit_all(
+        &self,
+        worktree: &Path,
+        message: &str,
+    ) -> Result<Option<AutoCommit>, AppError> {
         let read = RunOpts::read();
-        let status = self
-            .run_ok(
-                worktree,
-                &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                &read,
-            )
-            .await?;
-        let files = parse::status_entries(&status.stdout).len() as u32;
+        let files = parse::status_entries(&self.status(worktree).await?).len() as u32;
         if files == 0 {
             return Ok(None);
         }
@@ -710,6 +737,60 @@ impl Git {
             .and_then(|r| r.strip_prefix("refs/heads/").map(str::to_owned)))
     }
 
+    /// `worktree` is the top level of its own checkout. Without its `.git` git would search the
+    /// parent directories and act on an enclosing repository (e.g. a `$HOME` under git).
+    /// Errors: `WorktreeMissing`.
+    async fn check_worktree(&self, worktree: &Path) -> Result<(), AppError> {
+        let out = self
+            .run(
+                worktree,
+                &["rev-parse", "--show-toplevel"],
+                &RunOpts::read(),
+            )
+            .await?;
+        // Compared by inode: the paths may differ in symlinks or Unicode normalization.
+        let same = out.code == 0
+            && match (out.path().metadata(), worktree.metadata()) {
+                (Ok(top), Ok(wt)) => (top.dev(), top.ino()) == (wt.dev(), wt.ino()),
+                _ => false,
+            };
+        if same {
+            return Ok(());
+        }
+        Err(AppError::new(
+            ErrorCode::WorktreeMissing,
+            format!(
+                "Il worktree {} non esiste o non è più un checkout git (manca il suo .git)",
+                worktree.display()
+            ),
+        ))
+    }
+
+    /// `status --porcelain=v1 -z --untracked-files=all`.
+    async fn status(&self, dir: &Path) -> Result<Vec<u8>, AppError> {
+        let args = ["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+        Ok(self.run_ok(dir, &args, &RunOpts::read()).await?.stdout)
+    }
+
+    /// Some ref reaches the HEAD of `worktree`.
+    async fn head_in_a_ref(&self, worktree: &Path) -> Result<bool, AppError> {
+        let args = [
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains",
+            "HEAD",
+        ];
+        let out = self.run_ok(worktree, &args, &RunOpts::read()).await?;
+        Ok(!out.stdout.is_empty())
+    }
+
+    /// Absolute `--git-common-dir` of `repo`.
+    async fn common_dir(&self, repo: &Path) -> Result<PathBuf, AppError> {
+        let args = ["rev-parse", "--path-format=absolute", "--git-common-dir"];
+        Ok(self.run_ok(repo, &args, &RunOpts::read()).await?.path())
+    }
+
     async fn branch_exists(&self, repo: &Path, branch: &str) -> Result<bool, AppError> {
         let full = format!("refs/heads/{branch}");
         let args = ["show-ref", "--verify", "-q", &full];
@@ -748,22 +829,25 @@ impl Git {
         opts: &RunOpts,
         limit: usize,
     ) -> Result<(GitOutput, bool), AppError> {
-        let hooks = if opts.read_only && opts.index_file.is_none() {
-            Vec::new()
-        } else {
-            self.config_hooks(dir).await?
-        };
-        self.spawn(Some(dir), args, opts, &hooks, limit).await
+        // Hooks run only on writes, merge drivers only inside `merge-tree`.
+        let overrides =
+            if opts.read_only && opts.index_file.is_none() && subcommand(args) != "merge-tree" {
+                Vec::new()
+            } else {
+                self.config_overrides(dir).await?
+            };
+        self.spawn(Some(dir), args, opts, &overrides, limit).await
     }
 
-    /// Names of the hooks defined in the configuration seen from `dir` (`hook.<name>.*`).
-    async fn config_hooks(&self, dir: &Path) -> Result<Vec<OsString>, AppError> {
+    /// `hook.<name>.enabled=false` for every hook and [`MERGE_DRIVER_OFF`] for every merge
+    /// driver defined in the configuration seen from `dir`, sorted by key.
+    async fn config_overrides(&self, dir: &Path) -> Result<Vec<(OsString, OsString)>, AppError> {
         let args = [
             "config",
             "--null",
             "--name-only",
             "--get-regexp",
-            r"^hook\.",
+            r"^(hook|merge)\.",
         ];
         let (out, _) = self
             .spawn(Some(dir), &args, &RunOpts::read(), &[], MAX_OUTPUT)
@@ -773,25 +857,36 @@ impl Git {
             1 => return Ok(Vec::new()),
             _ => return Err(failure(&args, &out)),
         }
-        let names: BTreeSet<&[u8]> = out
-            .stdout
-            .split(|b| *b == 0)
-            .filter_map(|key| {
-                let rest = key.strip_prefix(b"hook.")?;
-                let dot = rest.iter().rposition(|b| *b == b'.')?;
-                Some(&rest[..dot])
-            })
-            .collect();
-        Ok(names
-            .into_iter()
-            .map(|name| OsStr::from_bytes(name).to_owned())
-            .collect())
+        let mut overrides = BTreeMap::new();
+        for key in out.stdout.split(|b| *b == 0) {
+            // `<section>.<subsection>.<variable>`; the subsection may contain dots.
+            let Some(dot) = key.iter().rposition(|b| *b == b'.') else {
+                continue;
+            };
+            let (name, var) = (&key[..dot], &key[dot + 1..]);
+            let (var, value) = if name.starts_with(b"hook.") {
+                ("enabled", "false")
+            } else if name.starts_with(b"merge.") && var == b"driver" {
+                ("driver", MERGE_DRIVER_OFF)
+            } else {
+                continue;
+            };
+            let mut key = OsStr::from_bytes(name).to_owned();
+            key.push(".");
+            key.push(var);
+            overrides.insert(key, OsString::from(value));
+        }
+        Ok(overrides.into_iter().collect())
     }
 
     /// The inherited environment plus `extra_env`, scrubbed, then the forced variables and
-    /// `hook.<name>.enabled=false` for each of `hooks` (through `GIT_CONFIG_COUNT`, which,
-    /// unlike `-c`, accepts any subsection name).
-    fn env(&self, opts: &RunOpts, hooks: &[OsString]) -> BTreeMap<OsString, OsString> {
+    /// the config `overrides` (through `GIT_CONFIG_COUNT`, which, unlike `-c`, accepts any
+    /// subsection name).
+    fn env(
+        &self,
+        opts: &RunOpts,
+        overrides: &[(OsString, OsString)],
+    ) -> BTreeMap<OsString, OsString> {
         let mut env: BTreeMap<OsString, OsString> = std::env::vars_os()
             .chain(self.extra_env.iter().cloned())
             .collect();
@@ -810,18 +905,15 @@ impl Git {
         if let Some(index) = &opts.index_file {
             forced.push(("GIT_INDEX_FILE".to_owned(), index.into()));
         }
-        if !hooks.is_empty() {
+        if !overrides.is_empty() {
             forced.push((
                 "GIT_CONFIG_COUNT".to_owned(),
-                hooks.len().to_string().into(),
+                overrides.len().to_string().into(),
             ));
         }
-        for (i, name) in hooks.iter().enumerate() {
-            let mut key = OsString::from("hook.");
-            key.push(name);
-            key.push(".enabled");
-            forced.push((format!("GIT_CONFIG_KEY_{i}"), key));
-            forced.push((format!("GIT_CONFIG_VALUE_{i}"), "false".into()));
+        for (i, (key, value)) in overrides.iter().enumerate() {
+            forced.push((format!("GIT_CONFIG_KEY_{i}"), key.clone()));
+            forced.push((format!("GIT_CONFIG_VALUE_{i}"), value.clone()));
         }
         env.extend(forced.into_iter().map(|(k, v)| (k.into(), v)));
         env
@@ -832,7 +924,7 @@ impl Git {
         dir: Option<&Path>,
         args: &[&str],
         opts: &RunOpts,
-        hooks: &[OsString],
+        overrides: &[(OsString, OsString)],
         limit: usize,
     ) -> Result<(GitOutput, bool), AppError> {
         let mut cmd = Command::new(&self.bin);
@@ -842,7 +934,7 @@ impl Git {
         }
         cmd.args(args)
             .env_clear()
-            .envs(self.env(opts, hooks))
+            .envs(self.env(opts, overrides))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

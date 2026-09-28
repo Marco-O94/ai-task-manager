@@ -75,11 +75,15 @@ pub const HOOK_EVENTS: &[&str] = &[
     "post-index-change",
 ];
 
-/// The environment of a user whose global gitconfig runs code at every chance: every hook
-/// (`core.hooksPath` and a config-defined `hook.evil`), `core.fsmonitor`, `diff.external`, a
-/// textconv driver for every file, commit signing, plus options that change what git prints
-/// (colors, quoting, prefixes, context, untracked files, renames). Each script appends its
-/// name to `marker`, which must never appear when git runs through the app's runner.
+/// The environment of a user whose global gitconfig runs code wherever the app's runner must
+/// stop it: every hook (`core.hooksPath` and a config-defined `hook.evil`), `core.fsmonitor`,
+/// `diff.external`, a textconv and a merge driver for every file, commit signing, plus options
+/// that change what git prints (colors, quoting, prefixes, context, untracked files, renames).
+/// Each script appends its name to `marker`, which must never appear when git runs through
+/// the app's runner.
+///
+/// Not armed: clean/smudge filters (`filter.<name>.*`), which git runs on `status` and `add`
+/// and the runner leaves on because git-lfs needs them.
 ///
 /// `env` is meant for `Git::with_env` / `CoreConfig::extra_env`: it also carries
 /// `LANG=it_IT.UTF-8` (git is localized on this machine) and variables the runner scrubs.
@@ -117,9 +121,13 @@ impl Hostile {
             &format!("echo textconv >> '{m}'\ncat \"$1\""),
         );
         script(&bin.join("gpg"), &format!("echo gpg >> '{m}'\nexit 1"));
+        script(
+            &bin.join("merge-driver"),
+            &format!("echo merge-driver >> '{m}'\nexit 1"),
+        );
         std::fs::create_dir_all(&home).expect("create hostile home");
         let attributes = home.join("attributes");
-        std::fs::write(&attributes, "* diff=evil\n").expect("write attributes");
+        std::fs::write(&attributes, "* diff=evil merge=evil\n").expect("write attributes");
 
         let b = bin.display();
         let events: String = HOOK_EVENTS
@@ -136,6 +144,7 @@ impl Hostile {
                  [diff]\n\texternal = {b}/ext-diff\n\trenames = false\n\tcontext = 10\n\
                  \tnoprefix = true\n\tsuppressBlankEmpty = true\n\
                  [diff \"evil\"]\n\ttextconv = {b}/textconv\n\
+                 [merge \"evil\"]\n\tdriver = {b}/merge-driver %O %A %B\n\
                  [color]\n\tui = always\n\tdiff = always\n\tstatus = always\n\tbranch = always\n\
                  [status]\n\tshowUntrackedFiles = no\n\
                  [commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {b}/gpg\n\
