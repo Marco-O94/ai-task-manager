@@ -1,0 +1,18 @@
+---
+source: crates/atm-core/tests/git.rs
+expression: rendered
+---
+Hunk     -  - |@@ -1,4 +1,4 @@ fn main
+Context  1  1 |one
+Del      2  - |two
+Add      -  2 |TWO
+Context  3  3 |three
+Context  4  4 |
+Hunk     -  - |@@ -10,2 +10,3 @@
+Context 10 10 |ten
+Del     11  - |eleven
+Meta     -  - |\ No newline at end of file
+Add      - 11 |eleven
+Add      - 12 |twelve
+Hunk     -  - |@@ -0,0 +1 @@
+Add      -  1 |new
