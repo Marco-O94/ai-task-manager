@@ -1,0 +1,14 @@
+---
+source: crates/atm-core/tests/flow.rs
+expression: outline(&entries)
+---
+[
+    "UserMessage",
+    "SessionInit",
+    "ToolCall Bash Succeeded",
+    "AssistantText",
+    "ToolCall Write Succeeded",
+    "AssistantText",
+    "TurnEnd success is_error=false",
+    "Notice Info Commit automatico <sha> (1 file)",
+]
