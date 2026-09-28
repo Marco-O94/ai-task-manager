@@ -53,10 +53,25 @@ m=$(scan -rlF 'credentials.json' crates src-tauri/src |
     done)
 hits "credentials.json outside DENY_RULES" "$m"
 
-# CLAUDE_CODE_OAUTH_TOKEN may appear only in a comment in atm-core's claude.rs (passthrough note).
+# CLAUDE_CODE_OAUTH_TOKEN may appear only in a comment in atm-core's claude.rs (passthrough note)
+# and as an entry of the M5 real-CLI guard's forbidden list (it refuses to run when it is set).
 m=$(scan -rnF 'CLAUDE_CODE_OAUTH_TOKEN' crates src-tauri/src |
-    scan -vE '^crates/atm-core/src/claude\.rs:[0-9]+:[[:space:]]*//')
+    scan -vE '^crates/atm-core/src/claude\.rs:[0-9]+:[[:space:]]*//' |
+    scan -vE '^crates/atm-core/tests/real_cli\.rs:[0-9]+:[[:space:]]*"CLAUDE_CODE_OAUTH_TOKEN",$')
 hits "CLAUDE_CODE_OAUTH_TOKEN" "$m"
+
+# The M5 captures of the real CLI are committed and their sanitizer is best effort (a CLI update may
+# add fields): no email, no home or temp path (plain or in the CLI's dashed form), no key, and no
+# account value but `<redacted>`.
+fixtures=crates/atm-core/tests/fixtures/real
+m=$(scan -rnoE -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -e '/Users/[^<]' \
+    -e '-Users-[^<]' -e '/var/folders/' -e '-var-folders-' -e '/private/var/' -e '-private-var-' \
+    -e 'sk-ant-' "$fixtures")
+hits "$fixtures" "$m"
+account_key='"(email|organization|orgId|orgName)"[[:space:]]*:[[:space:]]*'
+m=$(scan -rnoE "$account_key"'("[^"]*"|[^,}[:space:]]+)' "$fixtures" |
+    scan -vE "$account_key"'"<redacted>"$')
+hits "$fixtures: account values" "$m"
 
 m=$(scan -nE '"csp"[[:space:]]*:[[:space:]]*null|"devtools"[[:space:]]*:[[:space:]]*true' \
     src-tauri/tauri.conf.json)

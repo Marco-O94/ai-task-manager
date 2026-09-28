@@ -49,10 +49,10 @@ pub struct Changed {
     pub task_id: Option<Id>,
 }
 
-/// Follow-up sent by "Continua" on a turn interrupted by an app restart (card and task panel,
-/// spec §7.9); it resumes the session with `--resume`.
+/// Follow-up sent by "Continua" on a turn interrupted by the app closing (`app_shutdown` or
+/// `app_restart`; card and task panel, spec §7.9); it resumes the session with `--resume`.
 pub const CONTINUE_PROMPT: &str =
-    "The previous run was interrupted (app restart). Continue the task.";
+    "The previous run was interrupted when the app closed. Continue the task.";
 
 /// Request of the commands that take no arguments: serializes as `{}`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

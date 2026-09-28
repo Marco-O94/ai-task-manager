@@ -1,0 +1,9 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage # Add one line to README.md⏎⏎Append the line `Edited by AI T…
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("default") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 ToolCall Bash [$ touch approved.txt] Succeeded → (Bash completed with no output)
+ 3 ToolCall Bash [$ python3 -c 'import time; time.sleep(42)'] Cancelled
+typing previews: 0

@@ -625,7 +625,7 @@ pub enum MergeOutcome { Merged { commit: String, strategy: MergeStrategy, cleanu
 pub fn merge_message(title: &str, description: &str, attempt_id: &str) -> String   // default del §8.7
 
 // api.rs (oltre a marker, Req e Changed)
-pub const CONTINUE_PROMPT: &str = "The previous run was interrupted (app restart). Continue the task.";
+pub const CONTINUE_PROMPT: &str = "The previous run was interrupted when the app closed. Continue the task.";
 
 // error.rs
 pub struct AppError { pub code: ErrorCode, pub message: String }
@@ -740,6 +740,7 @@ Si usa il primo candidato valido:
 
 Regole:
 - Un candidato è valido se `<path> --version` termina con `(Claude Code)`.
+- `ATM_CLAUDE_PATH`, se impostata, è vincolante: se non è valida la discovery si ferma lì ("Claude Code non trovato") e non passa ai candidati 3–4. In dev punta a `fake-claude`, e un `--version` lento durante la compilazione farebbe altrimenti partire il CLI reale sull'abbonamento senza avviso.
 - Si conserva il **path del symlink**, senza canonicalizzarlo: il CLI si auto-aggiorna.
 - La versione è la prima parola dell'output di `--version` (semver).
   - Sotto `2.1.223`: banner con "Continua comunque" (il resume tra cwd diversi arriva da quella versione [F]).
@@ -775,6 +776,7 @@ Regole:
 ```
 
 - La forma `--flag=value` impedisce l'iniezione di flag. Il prompt passa **solo da stdin**.
+- **M5 [V]:** `--verbose` è obbligatorio (senza, `-p` con `--output-format stream-json` esce con 1: "requires --verbose"). `--permission-mode=default` è accettato anche se l'help di 2.1.283 elenca `manual` al suo posto (alias: la risposta a `initialize` dice `current_permission_mode: "default"` per entrambi).
 - **Mai passati:**
   - `--bare`: disabilita l'OAuth [F];
   - `--dangerously-skip-permissions`;
@@ -797,6 +799,7 @@ Regole:
 
 **Sequenza di un turno:**
 1. Il runner invia `{"type":"control_request","request_id":"atm_1_…","request":{"subtype":"initialize","hooks":null}}` e **attende** il `control_response` per al massimo 60 s, continuando intanto a instradare stdout.
+   - M5 [V]: non è necessario (un messaggio utente senza `initialize` ottiene `system/init`, streaming e `result` success), ma resta: rende esplicito l'avvio. La risposta arriva dopo l'avvio degli hook `SessionStart` dell'utente e prima di `system/init`, che il CLI emette solo al primo messaggio utente; contiene `commands`, `agents`, `models`, `current_permission_mode`, `pid` e `account: {email, organization, subscriptionType, apiProvider}`. Nel raw log `email` e `organization` diventano `<redacted>` (`wire::redact_for_log`, §7.10).
    - Risposta `error`: Notice (warn) e si prosegue.
    - Timeout: stop sequence, poi `failed` / `init_timeout`.
    - Con `hooks:null` gli hook di progetto non vengono sostituiti (Vibe Kanban #3327 [F]).
@@ -806,12 +809,13 @@ Regole:
    - `fresh_session`: task + descrizione + output di `git log --oneline <base>..HEAD` + il testo.
 3. All'arrivo di `result`: il runner registra il risultato, **chiude stdin** (drop del sender) e continua a leggere stdout fino a EOF, perché dopo `result` possono arrivare altri eventi [F]. Poi `wait` con timeout di 30 s; allo scadere, stop sequence con `exit_timeout`.
 4. Dopo qualunque uscita: `killpg(pgid, SIGTERM)` sul gruppo residuo, ignorando `ESRCH`. Termina i processi in background avviati dall'agente, come i dev server; è un limite documentato del modello un-processo-per-turno.
+   - M5 [V]: il tool Bash del CLI 2.1.283 esegue ogni comando in un **process group suo** (pgid ≠ quello di claude), che il `killpg` del gruppo non raggiunge. Il CLI li chiude da sé su interrupt (osservato, anche per i task in background). Quando il leader è morto i suoi figli passano a launchd e nulla li lega più al turno, quindi il Core **registra i discendenti del leader mentre vive** (`ps -A -o pid,ppid,pgid`, `claude::tree_of`): all'arrivo di `result`, prima di chiudere stdin, e ai gradini EOF e SIGTERM della stop sequence. All'uscita del leader manda SIGTERM a quelli ancora vivi e poi, dopo 3 s, SIGKILL (`claude::survivors`: stesso pgid e genitore launchd o un altro discendente registrato, contro il riuso dei pid); `run_in_background` compresi. Dove il CLI riceve SIGKILL (ultimo gradino, runtime abbandonato con `KillGroupOnDrop`, recovery di un orfano vivo) il Core uccide anche i discendenti, raccolti prima (`claude::kill_tree`). Limite: se il leader muore da solo senza `result` (crash) o insieme all'app, i discendenti non registrati restano (§7.9).
 
 **Routing dello stdout:**
 
 | Riga | Azione |
 |---|---|
-| `control_response` | Risolve la richiesta host in sospeso |
+| `control_response` | Risolve la richiesta host in sospeso; nel raw log l'`account` della risposta a `initialize` è oscurato (M5). L'oscuramento (`wire::redact_for_log`) vale per ogni riga registrata, di qualunque tipo, con `account` in `response.response`, in `response` o al primo livello; un `account` che non è un oggetto diventa `<redacted>` per intero |
 | `control_request` / `can_use_tool` | Approvazioni (§7.8) |
 | `control_request` di altri tipi (`hook_callback`, `mcp_message`, `elicitation`, …) | Risposta `{"subtype":"error","request_id":…,"error":"Unsupported control request subtype: X"}` [F] più una Notice (warn) |
 | `control_cancel_request` | Annulla l'approvazione corrispondente, **senza risposta** [F] |
@@ -846,7 +850,7 @@ Dove `EntryOp = Upsert(Entry) | Typing(Option<String>)`.
 | Input | Output |
 |---|---|
 | Messaggio utente inviato | `UserMessage` |
-| `system/init` | `SessionInit`. Warning se `apiKeySource` indica una chiave API (valori [DA VERIFICARE → M5]) o se `cwd` ≠ worktree. Effetto collaterale nel runner: `session_started=1`; se `session_id` ≠ quello atteso si salva quello osservato e si emette una Notice |
+| `system/init` | `SessionInit`. Warning se `apiKeySource` indica una chiave API (M5 [V]: con il login claude.ai dell'abbonamento vale `none`, l'unico valore di `NO_API_KEY_SOURCES`; ogni altro avvisa), se manca (fonte della fatturazione non verificabile) o se `cwd` ≠ worktree. Effetto collaterale nel runner: `session_started=1`; se `session_id` ≠ quello atteso si salva quello osservato e si emette una Notice |
 | `stream_event` `content_block_delta` (`text_delta`/`thinking_delta`) | `Typing(Some(buffer))`, al massimo ogni 100 ms. `content_block_start` azzera il buffer. Gli altri `stream_event` vengono ignorati |
 | `assistant`: ogni blocco di `message.content[]` | `text` → `AssistantText`; `thinking` → `Thinking`; `tool_use` → `ToolCall{Running}`, oppure fusione con quello creato da `can_use_tool`. Più `Typing(None)`. `parent_tool_use_id` dall'envelope |
 | `user` con `tool_result` | Il `ToolCall` con quel `tool_use_id` passa a `Succeeded` o `Failed(is_error)`, con `output` (stringa o array di blocchi uniti; le immagini diventano `[image]`; 8 KiB testa+coda) |
@@ -857,7 +861,7 @@ Dove `EntryOp = Upsert(Entry) | Typing(Option<String>)`.
 | Approvazione richiesta, risolta o annullata | Il `ToolCall` passa a `AwaitingApproval{…}`, poi a `Running` o `Denied{message}`. Se non esiste ancora viene creato dalla richiesta |
 | stderr | `Stderr`: le righe che arrivano a meno di 2 s l'una dall'altra finiscono nella stessa entry (upsert, ≤ 64 KiB). ANSI rimosso |
 | `finish()` | I `ToolCall` ancora in `Running` o `AwaitingApproval` passano a `Cancelled` |
-| Altri `system/*` e tipi sconosciuti | Nessuna entry (restano nel raw log) |
+| Altri `system/*` e tipi sconosciuti | Nessuna entry (restano nel raw log). M5 ha visto `system/status` (`requesting`, prima di ogni richiesta API), `system/hook_started`/`hook_progress`/`hook_response` (hook dell'utente), `system/thinking_tokens`, `system/task_started`/`task_updated`/`task_notification`/`background_tasks_changed` (comandi in background) e `rate_limit_event` (sotto) |
 
 **`ToolCall.summary`** (path relativi al worktree):
 
@@ -910,19 +914,19 @@ run_turn(attempt, prompt, mode):
 
 ### 7.8 Approvazioni
 
-- **All'arrivo di `can_use_tool`** (campi `tool_name`, `input` e `tool_use_id` obbligatori; `permission_suggestions` resta `Value` grezzo [F]; `decision_reason` facoltativo diventa `AwaitingApproval.reason`, forma [DA VERIFICARE → M5]):
+- **All'arrivo di `can_use_tool`** (campi `tool_name`, `input` e `tool_use_id` obbligatori; `permission_suggestions` resta `Value` grezzo [F]; `decision_reason` facoltativo diventa `AwaitingApproval.reason`. M5 [V]: è una stringa, per esempio `"This command requires approval"`, con accanto `decision_reason_type: "other"`, e manca quando la richiesta porta `blocked_path`; altri campi di 2.1.283: `display_name`, `description`, `blocked_path`):
   - si registra in memoria `Pending{approval_id: uuid, request_id, tool_use_id, input, rules}`;
   - si aggiorna l'entry;
   - si emette `changed` (badge "Richiede approvazione" sulla card).
 - **Nessuna tabella e nessun timeout.** L'utente può sempre fermare il turno. Alla fine del processo le approvazioni pendenti diventano `Cancelled`.
-- **`can_remember`** è vero solo se tutte le suggestion sono `addRules` con `behavior:"allow"` e ogni regola ha `ruleContent` non vuoto. Le regole su un tool intero (es. `Bash` nudo) non sono mai memorizzabili.
+- **`can_remember`** è vero se c'è almeno una suggestion `addRules` con `behavior:"allow"` e ognuna di queste ha regole tutte con `ruleContent` specifico: non vuoto e non fatto solo di `*`, `:` e spazi (`*`, `:*` valgono il tool intero). Le regole su un tool intero (es. `Bash` nudo) non sono mai memorizzabili. Gli altri tipi di suggestion si ignorano e non vengono mai inoltrati: M5 ha visto che il CLI 2.1.283 aggiunge a ogni richiesta Bash `addDirectories` (il worktree) e `setMode` (`acceptEdits`, una modalità che l'utente non ha scelto); con la regola precedente ("tutte le suggestion sono `addRules`") "Consenti sempre" non era mai disponibile.
 
 **Risposte** (funzione pura `wire::approval_response(&Pending, &ApprovalDecision) -> Value`; si fa eco del `request_id` del CLI):
 
 | Decisione | `response` |
 |---|---|
 | `Allow{remember:false}` | `{"behavior":"allow","updatedInput":<input originale>}` (**sempre** presente) |
-| `Allow{remember:true}` | Come sopra, più `"updatedPermissions":<suggestion filtrate, con ogni destination riscritta a "session">`. In più si aggiungono le stringhe `Tool(ruleContent)` ad `attempts.allow_rules`, ripassate nei turni successivi via `--settings` (la persistenza delle regole di sessione dopo `--resume` è [DA VERIFICARE]) |
+| `Allow{remember:true}` | Come sopra, più `"updatedPermissions":<solo le suggestion addRules/allow, con ogni destination riscritta a "session">`. In più si aggiungono le stringhe `Tool(ruleContent)` ad `attempts.allow_rules`, ripassate nei turni successivi via `--settings`. M5 [V]: le regole di sessione **non** sopravvivono a `--resume` (senza il re-pass il comando richiede di nuovo l'approvazione), mentre la regola in `--settings` evita la richiesta anche in una sessione nuova: il re-pass è necessario |
 | `Deny{message, interrupt}` | `{"behavior":"deny","message":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: <msg>","interrupt":<bool>}` |
 | `AskUserQuestion` (arriva comunque) | Deny con `"Ask your question in plain text in your reply instead."`, `interrupt:false` |
 
@@ -933,7 +937,7 @@ run_turn(attempt, prompt, mode):
           "Read(~/.claude/.credentials.json)","Edit(~/.claude/**)","Edit(~/.ssh/**)"],
   "allow":[ /* attempts.allow_rules */ ]}}
 ```
-`-p` ignora in silenzio i settings non validi [V/F]: M5 deve dimostrare che il deny su `git push` funziona. È una difesa in profondità: `sh -c 'git push'` la aggira.
+`-p` ignora in silenzio i settings non validi [V/F]: M5 ha dimostrato che il deny su `git push` funziona [V]: nessun `can_use_tool`, `tool_result` con `is_error` e testo "Permission to use Bash with command git push has been denied.", la voce in `result.permission_denials` (`{tool_name, tool_use_id, tool_input}`) e il remote intatto; il `result` resta `success`. È una difesa in profondità: `sh -c 'git push'` la aggira.
 
 ### 7.9 Follow-up, stop, resume
 
@@ -944,8 +948,8 @@ run_turn(attempt, prompt, mode):
   - se un turno muore **prima** di `init`, il turno successivo genera un **nuovo UUID**, aggiorna `attempts.session_id` e usa `--session-id` (lezione di Vibe Kanban #2993; correzione E7).
 - **Resume.** Stesso cwd canonico (il worktree non si sposta né si rinomina mai). I file `.jsonl` del CLI non si copiano, leggono o spostano mai. Mai due processi sulla stessa sessione (indice unico).
 - **Resume fallito** (`No conversation found`, costante `normalize::RESUME_FAILED_PATTERN`): Notice con `action: Some(NoticeAction::NewSession)`; la UI mostra "Nuova sessione", che invia `send_follow_up{fresh_session:true}`.
-- **Interrotto al riavvio.** Card e pannello mostrano **"Continua"** (card: `attempt_state == Active` e `last_stop_reason == app_restart`), che invia il follow-up `atm_types::CONTINUE_PROMPT` ("The previous run was interrupted (app restart). Continue the task.") con `--resume`.
-- **Stop sequence** (obiettivo ≤ 13 s; lo stato finale dipende dal nostro flag, non dal subtype di `result`, che è [DA VERIFICARE]):
+- **Interrotto dalla chiusura dell'app.** Card e pannello mostrano **"Continua"** (card: `attempt_state == Active` e `last_stop_reason` = `app_shutdown` — Cmd+Q ordinato — oppure `app_restart` — crash, recuperato all'avvio), che invia il follow-up `atm_types::CONTINUE_PROMPT` ("The previous run was interrupted when the app closed. Continue the task.") con `--resume`.
+- **Stop sequence** (obiettivo ≤ 13 s; lo stato finale dipende dal nostro flag, non dal subtype di `result`; M5 [V]: il CLI risponde all'interrupt con `{"still_queued":[]}`, aggiunge la riga utente `[Request interrupted by user…]` e chiude con `result` `error_during_execution`, `is_error`, `errors: ["[ede_diagnostic] …"]`, `terminal_reason: "aborted_streaming"`, poi esce con 1: lo stop reale è durato 0,4–0,7 s):
   1. Se `init` è arrivato e stdin è aperto: `{"type":"control_request","request_id":"atm_n_…","request":{"subtype":"interrupt"}}`, poi fino a 5 s di attesa per `result` o uscita.
   2. Chiusura di stdin (l'EOF cancella il prompt pendente [F]), poi fino a 3 s.
   3. `killpg(pgid, SIGTERM)`, poi fino a 3 s.
@@ -953,7 +957,8 @@ run_turn(attempt, prompt, mode):
 - **Shutdown dell'app.** `RunEvent::ExitRequested` → `api.prevent_exit()` una sola volta (flag atomico) → `core.shutdown(deadline 8 s)`: stop in parallelo con tempi compressi 2/2/2 s, finalize con auto-commit → `app.exit(0)`.
 - **Recovery all'avvio** (prima che la UI carichi i dati):
   - per ogni process `running` con `app_instance_id` diverso da quello attuale:
-    - se `kill(pid,0)` riesce **e** `ps -o command= -p <pid>` contiene il path di claude **e** il `session_id` dell'attempt (un UUID, quindi niente falsi positivi da riuso del PID) → `killpg(SIGTERM)`, 3 s, poi `SIGKILL`;
+    - se `kill(pid,0)` riesce **e** `ps -o command= -p <pid>` contiene il path di claude **e** il `session_id` dell'attempt (un UUID, quindi niente falsi positivi da riuso del PID) → `killpg(SIGTERM)`, 3 s, poi `SIGKILL`, discendenti del leader compresi (§7.4 passo 4);
+    - limite: se il leader è già morto (per esempio uscito all'EOF quando l'app è crollata), i comandi Bash che aveva in process group propri sono ormai figli di launchd e la recovery non li riconosce; restano finché non finiscono;
     - in ogni caso: `failed` / `app_restart`, Notice "Esecuzione interrotta dal riavvio dell'app", tool aperti → `Cancelled`, auto-commit;
   - i task in inprogress senza turni attivi passano a inreview;
   - riconciliazione dei worktree (§8.4).
@@ -1225,14 +1230,14 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 |---|---|
 | Configurazione del repo eseguita sotto `-p` (hook, env, `apiKeyHelper`, MCP) | Isolated di default (`--setting-sources=user --strict-mcp-config`). Trusted solo con **conferma nativa** e fingerprint ricontrollato a ogni turno: se non corrisponde, il turno gira Isolated con una Notice. Riapprovare un fingerprint scaduto chiede di nuovo la conferma. Warning quando si aggiunge il progetto |
 | Codice del repo eseguito dal git dell'app | Runner del §8.1 |
-| Prompt injection che porta a comandi distruttivi | Auto-edit di default (Bash chiede sempre); deny rules via `--settings`; bypass solo con opt-in, conferma nativa e `--allow-dangerously-skip-permissions`; la UI dice chiaramente che il worktree **non è una sandbox** |
+| Prompt injection che porta a comandi distruttivi | Auto-edit di default (M5 [V]: in `acceptEdits` il CLI 2.1.283 approva da solo i comandi Bash che leggono o scrivono file nel cwd, per esempio `printf … >> README.md`; gli altri chiedono. In Supervisionato `ls` passa da solo, `touch` e `python3 -c` chiedono; un `sleep N` isolato il CLI lo blocca e suggerisce `run_in_background`); deny rules via `--settings`; bypass solo con opt-in, conferma nativa e `--allow-dangerously-skip-permissions`; la UI dice chiaramente che il worktree **non è una sandbox** |
 | XSS nella webview che abusa dell'IPC | CSP senza `unsafe-inline` negli script; solo text node; nessun `inner_html`; nav guard (plugin con `on_navigation`: consente solo `tauri://localhost`, `http://tauri.localhost` e in dev `http://localhost:1420`); `open_url` solo `http(s)`; **conferme native** (non cliccabili da un XSS) per bypass, Trusted e passthrough della chiave API |
-| Fatturazione API silenziosa | Chiavi rimosse dall'env; banner su `authMethod` e `apiProvider`; warning su `apiKeySource` |
+| Fatturazione API silenziosa | Chiavi rimosse dall'env; banner su `authMethod` e `apiProvider`; warning su `apiKeySource` diverso da `none` o assente; `ATM_CLAUDE_PATH` vincolante (§7.1) |
 | Attacchi di rete | Nessun socket in ascolto in release |
 | Fuga di segreti | Log 0600 in dir 0700; valori dell'env mai registrati; transcript solo locali, cancellati con il progetto |
 | Iniezione di comandi | Sempre argv; `--flag=value`; prompt solo via stdin come JSON; branch validati; target presi dalla lista dei ref; `-z` e `--` ovunque. Nel `.command` c'è solo il path di claude, con escape |
 | Perdita di dati | Commit di snapshot prima di ogni rimozione; mai rimozione automatica di lavoro non mergiato; `update-ref` CAS; `ff-only`; branch tenuti |
-| Processi orfani | Process group, stop sequence, `killpg` del gruppo residuo, shutdown ordinato, recovery con kill verificato |
+| Processi orfani | Process group, stop sequence, `killpg` del gruppo residuo più i discendenti del leader registrati mentre viveva (i comandi Bash del CLI hanno gruppi propri, §7.4 passo 4), shutdown ordinato, recovery con kill verificato. Non coperti: i discendenti di un leader morto da solo senza `result` o insieme all'app (§7.9) |
 
 ### 10.3 Grep di sicurezza (in `scripts/check.sh`; qualunque match fa fallire)
 
@@ -1426,7 +1431,8 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 | `approval` | Come `simple`, ma prima emette `can_use_tool` per Bash e si blocca finché non arriva la risposta |
 | `slow` | Un evento al secondo |
 | `hang` | init e poi attesa |
-| `hang_ignore` | Ignora interrupt e SIGTERM; avvia un nipote `sleep 300` nello stesso gruppo |
+| `hang_ignore` | Ignora interrupt e SIGTERM; avvia un nipote `sleep 300` in un process group suo |
+| `background` | Avvia un `sleep 300` in un process group suo (come un `run_in_background`), poi `result` success; esce all'EOF: il Core deve chiuderlo a fine turno |
 | `crash` | Exit 1 senza `result` |
 | `noinit` | Esce prima di `init` |
 | `big` | `tool_result` da 50 KiB più una riga da 20 MiB |
@@ -1437,7 +1443,7 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 | `resolve_merge` | `git merge <FAKE_CLAUDE_TARGET>`, risolve concatenando le versioni, `git commit --no-edit` |
 
 - Sull'interrupt risponde success ed emette `result` `error_during_execution` (tranne `hang_ignore`).
-- Le forme JSON seguono i report di ricerca; M5 le sostituisce con catture reali.
+- Le forme JSON seguono le catture reali di M5 (`tests/fixtures/real/`): risposta a `initialize` con `account`, `system/status` prima di ogni richiesta, `rate_limit_event` dopo il primo messaggio assistant, `can_use_tool` con `display_name`, `description`, `decision_reason` stringa e le tre suggestion (`addRules`, `addDirectories`, `setMode`), risposta all'interrupt `{"still_queued":[]}` seguita da `[Request interrupted by user]`. Il `sleep` di `hang_ignore` guida un process group suo, come i comandi del tool Bash reale.
 
 ### 12.2 Percorso utente su fake-claude (M4)
 
@@ -1455,6 +1461,8 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 12. `[fake:usage_limit]` → banner di pausa → "Riprendi". `[fake:auth_fail]` → torna il gate.
 
 ### 12.3 Checklist con il CLI reale (M5, eseguita dall'utente)
+
+M5 (2026-09-28) l'ha eseguita l'agente, con l'OK esplicito dell'utente e **solo con l'abbonamento**, attraverso le API del Core: harness opt-in `crates/atm-core/tests/real_cli.rs` (comando e guardia nel README), cloni temporanei del repo giocattolo, `sonnet` con effort `low`. Esiti nel §13.4.
 
 1. Repo giocattolo con un commit. Task "Aggiungi una riga al README". Avvio in Auto-edit.
 2. Annotare: entry `SessionInit` (`apiKeySource`, `permissionMode`, `mcp_servers` = 0 in Isolated), streaming, `TurnEnd` con costo.
@@ -1521,10 +1529,33 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 | Build di Trunk su 1.97.1; flag wasm-opt; Tailwind 4.3.3; compilazione dei binding; costruttore del Channel; compilazione di `atm-ui` per l'host; flag di `cargo tauri init` | M0 |
 | Drag-and-drop HTML5 su WKWebView con `dragDropEnabled:false`; `.command` in Terminal e Gatekeeper | M2-UI-BOARD / M4 |
 | `process_group` più `killpg`; kill verificato con `ps` | M3-CORE |
-| Obbligatorietà di `--verbose`; ordine e necessità di `initialize`; subtype di `result` dopo un interrupt; valori di `apiKeySource`; forma degli eventi di rate limit e usage limit | M5 |
-| Deny in `--settings` efficace; `--strict-mcp-config` senza `--mcp-config` dà 0 server; `--setting-sources=user` esclude hook di progetto e CLAUDE.md | M5 |
-| Le regole con destination `session` sopravvivono a `--resume` (le ripassiamo comunque) | M5 |
-| Nome della directory del progetto nel CLI: realpath o `$PWD` (per noi è la stessa stringa) | M5 |
+| Obbligatorietà di `--verbose`; ordine e necessità di `initialize`; subtype di `result` dopo un interrupt; valori di `apiKeySource`; forma degli eventi di rate limit e usage limit | M5, chiuse (§13.4) |
+| Deny in `--settings` efficace; `--strict-mcp-config` senza `--mcp-config` dà 0 server; `--setting-sources=user` esclude hook di progetto e CLAUDE.md | M5, chiuse (§13.4) |
+| Le regole con destination `session` sopravvivono a `--resume` (le ripassiamo comunque) | M5, chiusa (§13.4) |
+| Nome della directory del progetto nel CLI: realpath o `$PWD` (per noi è la stessa stringa) | M5, chiusa (§13.4) |
+
+### 13.4 Esiti di M5 (CLI 2.1.283, 2026-09-28)
+
+Osservati con l'harness `tests/real_cli.rs` (18 turni reali in tutto, stima del CLI ≈ 2,9 USD a prezzo di listino, addebitati all'abbonamento), traffico ripulito in `crates/atm-core/tests/fixtures/real/` e ripetuto senza CLI da `tests/real_fixtures.rs`.
+
+| Voce | Esito |
+|---|---|
+| `--verbose` | Obbligatorio: senza, exit 1 con "When using --print, --output-format=stream-json requires --verbose" |
+| `initialize` | Non necessario, mantenuto. Risposta dopo l'avvio degli hook `SessionStart` dell'utente, prima di `system/init` (che arriva solo col primo messaggio utente); porta `account` con email e organizzazione → oscurate nel raw log (fix). Con `--resume` di una sessione inesistente il CLI esce prima di rispondere |
+| `result` dopo un interrupt | `error_during_execution`, `is_error`, `errors: ["[ede_diagnostic] …"]`, `terminal_reason: "aborted_streaming"`, exit 1; risposta all'interrupt `{"still_queued":[]}`; stop reale in 0,4–0,7 s. Il testo di `TurnEnd` è quel `[ede_diagnostic]` interno |
+| `apiKeySource` | `none` con il login claude.ai (Max); nessun altro valore osservato (la guardia dell'harness avrebbe fermato il turno). L'app avvisa anche quando manca (fix). La guardia non può impedire la prima richiesta di un turno (`system/init` arriva con essa): per questo l'harness fa prima un preflight gratuito con solo `initialize` e controlla l'`account` della risposta (`apiProvider`, `subscriptionType`) |
+| Eventi di limite | `rate_limit_event` con `rate_limit_info: {status: "allowed", resetsAt, rateLimitType: "five_hour", overageStatus, overageDisabledReason, isUsingOverage, unifiedWindows: {five_hour, seven_day: {utilization, resetsAt}}}`, uno per richiesta; nessuna entry. Nessun limite raggiunto: `LIMIT_PATTERNS` invariati |
+| Deny in `--settings` | Efficace (§7.8): `git push` negato senza `can_use_tool`, voce in `permission_denials`, remote vuoto |
+| `--strict-mcp-config` senza `--mcp-config` | `mcp_servers: []` benché l'utente abbia server MCP e plugin; il server di `.mcp.json` non parte (con `--setting-sources=user,project` e senza strict sì: controllo positivo) |
+| `--setting-sources=user` | Esclude gli hook di progetto (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`: nessun marker; con `user,project` il `SessionStart` scrive) e CLAUDE.md, che non è nel contesto (l'agente risponde `NOT_IN_CONTEXT`). E11: l'istruzione dell'append prompt basta, l'agente legge CLAUDE.md (con `cat`) e conosce la parola chiave. Gli hook dell'**utente** girano comunque |
+| Regole `session` dopo `--resume` | Non sopravvivono; il re-pass via `--settings` è necessario e funziona anche in una sessione nuova (§7.8) |
+| Directory del progetto nel CLI | realpath (cwd `/private/var/…` anche con `PWD=/var/…`), ogni carattere non alfanumerico → `-`; si vede in `system/init.memory_paths.auto` e nel `transcript_path` degli hook |
+| `decision_reason` | Stringa (`"This command requires approval"`) più `decision_reason_type: "other"`; assente quando c'è `blocked_path` |
+| `permission_suggestions` | `addRules` (`localSettings`) + `addDirectories` (`session`, il worktree) + `setMode` (`session`, `acceptEdits`): `can_remember` filtra solo le `addRules`/`allow` (fix, §7.8) |
+| `RESUME_FAILED_PATTERN` | Confermato: stderr "No conversation found with session ID: <uuid>" e lo stesso testo in `errors` di un `result` `error_during_execution`, exit 1 |
+| Permission mode | `--permission-mode=default` accettato (alias di `manual`); `acceptEdits` approva da solo i comandi Bash di lettura/scrittura file nel cwd (§10.2) |
+| Process group dei comandi Bash | Ognuno nel suo gruppo: il CLI li chiude su interrupt; il Core registra i discendenti del leader mentre vive e a fine turno chiude quelli rimasti, anche su un'uscita normale, e li uccide con il leader sui percorsi con SIGKILL (fix, §7.4). `ps -o command=` mostra il path di claude e il `--session-id`/`--resume`: la verifica degli orfani (§7.9) funziona |
+| Follow-up "fuori tema" | Il modello può rifiutare un follow-up che ritiene estraneo al task ("Task done already…"): l'append prompt lo lega al task. Nessuna modifica; da tenere presente per la UX |
 
 ---
 

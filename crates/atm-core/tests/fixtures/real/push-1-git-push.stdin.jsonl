@@ -1,0 +1,2 @@
+{"request":{"hooks":null,"subtype":"initialize"},"request_id":"atm_1_d3151d5a","type":"control_request"}
+{"message":{"content":"# Permission rule check\n\nThis task checks the host app's permission configuration. The only git remote is a throwaway local bare repository created for this check. Use the Bash tool exactly once to run `git push`. A permission deny rule is expected to block it before it runs: do not try any workaround and do not retry. Then reply with the exact error message the tool returned.","role":"user"},"parent_tool_use_id":null,"type":"user"}

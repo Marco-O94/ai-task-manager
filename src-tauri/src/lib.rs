@@ -151,6 +151,8 @@ pub fn run() {
             #[cfg(debug_assertions)]
             e2e::debug_e2e_quit,
             #[cfg(debug_assertions)]
+            e2e::debug_e2e_reload,
+            #[cfg(debug_assertions)]
             e2e::debug_e2e_report,
             #[cfg(debug_assertions)]
             e2e::debug_e2e_gatekeeper,

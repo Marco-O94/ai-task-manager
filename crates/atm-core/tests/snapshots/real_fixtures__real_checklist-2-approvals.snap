@@ -1,0 +1,11 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage As part of this task, run these two shell commands now, each…
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("default") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 ToolCall Bash [$ ls] Succeeded → Cargo.lock⏎Cargo.toml⏎README.md⏎src
+ 3 ToolCall Bash [$ touch approved.txt] Succeeded → (Bash completed with no output)
+ 4 AssistantText PAPAYA-42
+ 5 TurnEnd success is_error=false num_turns=Some(3) denials=0 limit=None text=Some("PAPAYA-42")
+typing previews: 0

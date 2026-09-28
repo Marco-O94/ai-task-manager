@@ -1,0 +1,10 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage As part of this task, run two shell commands, each in its ow…
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("default") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 ToolCall Bash [$ touch approved.txt] Succeeded → (Bash completed with no output)
+ 3 ToolCall Bash [$ python3 -c 'import time; time.sleep(41)'] Failed → The user doesn't want to proceed with this tool use. The too…
+ 4 TurnEnd error_during_execution is_error=true num_turns=Some(4) denials=0 limit=None text=Some("[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use")
+typing previews: 0

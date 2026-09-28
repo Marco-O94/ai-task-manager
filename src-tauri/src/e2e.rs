@@ -1,22 +1,23 @@
 //! Debug-only in-app E2E of spec §12.2 (M4), driven by the UI (`ui/src/e2e.rs`) when
 //! `ATM_E2E=1` (ignored under `ATM_SELFTEST=1`). `scripts/e2e.sh` launches the app twice with the
-//! same `ATM_E2E_DIR`: `ATM_E2E_PHASE=1` runs steps 1–7 and quits during a turn the way Cmd+Q
-//! does ([`debug_e2e_quit`]: `NSApp terminate:` → `RunEvent::Exit`); `ATM_E2E_PHASE=2`
-//! relaunches on the same data, runs the rest and exits through `app.exit`
-//! (`RunEvent::ExitRequested`) during another turn; `gatekeeper` only opens the real login
-//! script in Terminal (spec §7.10, run by hand).
+//! same `ATM_E2E_DIR`: `ATM_E2E_PHASE=1` runs steps 1–7 and quits during a turn with Cmd+Q
+//! ([`debug_e2e_quit`]: a ⌘Q key event posted through the window server → the menu's Quit →
+//! `NSApp terminate:` → `RunEvent::Exit`); `ATM_E2E_PHASE=2` relaunches on the same data, runs
+//! the rest and exits through `app.exit` (`RunEvent::ExitRequested`) during another turn;
+//! `gatekeeper` only opens the real login script in Terminal (spec §7.10, `--gatekeeper`).
 //!
 //! Everything lives under `ATM_E2E_DIR`: data and cache dirs, `HOME` (hence the worktree
 //! root), the temporary repositories, fake-claude's record and login state. Agents always run
-//! as fake-claude (`ATM_CLAUDE_PATH`, else the `fake-claude` next to this binary); `open` is
-//! recorded instead of run, the native folder picker returns queued paths.
+//! as fake-claude (`ATM_CLAUDE_PATH`, else the `fake-claude` next to this binary, checked by
+//! [`verify_fake`] without running it); `open` is recorded instead of run, the native folder
+//! picker returns queued paths.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use atm_core::claude::{self, ATM_CLAUDE_PATH_ENV};
@@ -32,7 +33,7 @@ use tauri::{AppHandle, Manager};
 /// Instead of the login shell's: a run must not depend on the user's `.zshrc`.
 const E2E_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// A phase that has not reported by then exits 1 with its own message: shorter than the 300 s
-/// `scripts/e2e.sh` gives each phase before killing it (a phase takes ~20 s).
+/// `scripts/e2e.sh` gives each phase before killing it (a phase takes under a minute).
 const WATCHDOG: Duration = Duration::from_secs(240);
 /// Seconds of `[fake:slow]`: long enough to stop it halfway.
 const SLOW_EVENTS: &str = "30";
@@ -41,7 +42,27 @@ const DELTA_MS: &str = "300";
 /// Folder of `app_cache_dir` for the Gatekeeper check: a real login script is never touched.
 const GATEKEEPER_DIR: &str = "e2e-gatekeeper";
 const GATEKEEPER_WAIT: Duration = Duration::from_secs(30);
+/// From Cmd+Q to the end of the process: the shutdown takes at most 10 s.
+const QUIT_WAIT: Duration = Duration::from_secs(30);
 
+/// Only fake-claude's binary contains it (its `auth login` line): a real CLI renamed or linked
+/// as `fake-claude` does not.
+const FAKE_MARKER: &[u8] = b"fake-claude: login simulato";
+/// The variables fake-claude records the presence of (`RECORDED_VARS` in fake-claude.rs).
+const RECORDED_VARS: [&str; 5] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "GIT_DIR",
+];
+/// What `debug_e2e_git` may run: the UI's read-only checks.
+const GIT_SUBCOMMANDS: [&str; 5] = ["show", "log", "status", "branch", "worktree"];
+/// Options `debug_e2e_git` accepts after the subcommand (a trailing `=` takes a value).
+const GIT_OPTIONS: [&str; 5] = ["-1", "--name-only", "--porcelain", "--list", "--format="];
+
+/// fake-claude, checked once ([`verify_fake`]).
+static FAKE: OnceLock<PathBuf> = OnceLock::new();
 /// Path returned by the next `pick_repo_folder` (queued by `debug_e2e_queue_pick`).
 static PICK: Mutex<Option<String>> = Mutex::new(None);
 /// `"<command>: <code>"` of every failed IPC command ([`note_failure`]).
@@ -81,13 +102,20 @@ impl Paths {
             .map(PathBuf::from)
             .and_then(|d| d.canonicalize().ok())
             .unwrap_or_else(|| fail("ATM_E2E_DIR is not an existing directory"));
-        let fake = std::env::var_os(ATM_CLAUDE_PATH_ENV)
-            .map(PathBuf::from)
-            .or_else(|| Some(std::env::current_exe().ok()?.parent()?.join("fake-claude")))
-            .filter(|p| p.is_file() && p.file_name().is_some_and(|n| n == "fake-claude"))
-            .unwrap_or_else(|| {
-                fail("no fake-claude: run `cargo build -p atm-core --bin fake-claude`")
-            });
+        let fake = FAKE
+            .get_or_init(|| {
+                let given = std::env::var_os(ATM_CLAUDE_PATH_ENV)
+                    .map(PathBuf::from)
+                    .or_else(|| Some(std::env::current_exe().ok()?.parent()?.join("fake-claude")))
+                    .unwrap_or_else(|| fail("no ATM_CLAUDE_PATH and no fake-claude"));
+                verify_fake(&given).unwrap_or_else(|e| {
+                    fail(&format!(
+                        "{e}: the E2E runs only fake-claude \
+                         (`cargo build -p atm-core --bin fake-claude`)"
+                    ))
+                })
+            })
+            .clone();
         Paths {
             repos: dir.join("repos"),
             home: dir.join("home"),
@@ -110,6 +138,14 @@ impl Paths {
         let path = Path::new(path);
         let canonical = match tokio::fs::canonicalize(path).await {
             Ok(p) => Ok(p),
+            // A dangling symlink would pass the check on its directory, then be written
+            // through to wherever it points.
+            Err(_) if tokio::fs::symlink_metadata(path).await.is_ok() => {
+                return Err(AppError::invalid(format!(
+                    "{} is a dangling symlink",
+                    path.display()
+                )));
+            }
             // A file about to be written: its directory must exist.
             Err(e) => match path.parent() {
                 Some(parent) => tokio::fs::canonicalize(parent)
@@ -128,6 +164,45 @@ impl Paths {
             )))
         }
     }
+}
+
+/// `path` is fake-claude and not the real CLI under its name: resolved through symlinks, it is
+/// a file named `fake-claude` whose binary carries [`FAKE_MARKER`] (read, never run). Returns
+/// the resolved path.
+fn verify_fake(path: &Path) -> Result<PathBuf, String> {
+    let real = path
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if !real.is_file() || real.file_name().is_none_or(|n| n != "fake-claude") {
+        return Err(format!(
+            "{} is not a file named fake-claude",
+            real.display()
+        ));
+    }
+    let bytes = std::fs::read(&real).map_err(|e| format!("{}: {e}", real.display()))?;
+    if !bytes.windows(FAKE_MARKER.len()).any(|w| w == FAKE_MARKER) {
+        return Err(format!("{} is not fake-claude's binary", real.display()));
+    }
+    Ok(real)
+}
+
+/// `args` are one of the UI's read-only checks: an allowed subcommand first (no option before
+/// it: no `-c`, `-C`, `--git-dir`…), `worktree` only as `worktree list`, `branch` only with
+/// `--list`, and after it only [`GIT_OPTIONS`] among the options. Errors: `Invalid`.
+fn check_git_args(args: &[String]) -> Result<(), AppError> {
+    let refuse = || AppError::invalid(format!("git {args:?} is not an E2E check"));
+    let (sub, rest) = args.split_first().ok_or_else(refuse)?;
+    let option_ok = |a: &str| {
+        GIT_OPTIONS.iter().any(|o| match o.strip_suffix('=') {
+            Some(_) => a.starts_with(o),
+            None => a == *o,
+        })
+    };
+    let ok = GIT_SUBCOMMANDS.contains(&sub.as_str())
+        && (sub != "worktree" || rest.first().is_some_and(|a| a == "list"))
+        && (sub != "branch" || rest.iter().any(|a| a == "--list"))
+        && rest.iter().all(|a| !a.starts_with('-') || option_ok(a));
+    if ok { Ok(()) } else { Err(refuse()) }
 }
 
 /// Data dir, cache dir, fake-claude and the child environment of a run. Phase 1 first creates
@@ -280,8 +355,12 @@ fn auth_state(logged_in: bool) -> &'static str {
     if logged_in { "in" } else { "out" }
 }
 
+/// Written to a temporary file renamed over the state file: fake-claude's `auth status`, which
+/// the core may run at any time, reads the old state or the new one, never an empty file.
 fn write_auth(p: &Paths, logged_in: bool) -> Result<(), AppError> {
-    std::fs::write(&p.auth, auth_state(logged_in))
+    let tmp = p.auth.with_extension("tmp");
+    std::fs::write(&tmp, auth_state(logged_in))
+        .and_then(|()| std::fs::rename(&tmp, &p.auth))
         .map_err(|e| AppError::io(format!("{}: {e}", p.auth.display())))
 }
 
@@ -335,6 +414,11 @@ pub async fn debug_e2e_setup() -> Result<Option<E2eSetup>, AppError> {
         empty: path("empty"),
         mcp_repo: path("mcp"),
         fake_claude: p.fake.display().to_string(),
+        app_env: RECORDED_VARS
+            .iter()
+            .filter(|k| std::env::var_os(k).is_some())
+            .map(|k| (*k).to_owned())
+            .collect(),
         phase1,
     }))
 }
@@ -342,9 +426,9 @@ pub async fn debug_e2e_setup() -> Result<Option<E2eSetup>, AppError> {
 #[tauri::command]
 pub async fn debug_e2e_set_auth(req: E2eAuthReq) -> Result<(), AppError> {
     let p = paths()?;
-    tokio::fs::write(&p.auth, auth_state(req.logged_in))
+    tauri::async_runtime::spawn_blocking(move || write_auth(&p, req.logged_in))
         .await
-        .map_err(|e| AppError::io(format!("{}: {e}", p.auth.display())))
+        .map_err(|e| AppError::internal(e.to_string()))?
 }
 
 #[tauri::command]
@@ -400,6 +484,7 @@ pub async fn debug_e2e_record() -> Result<Vec<Value>, AppError> {
 pub async fn debug_e2e_git(req: E2eGitReq) -> Result<E2eGitOut, AppError> {
     let p = paths()?;
     let repo = p.inside(&req.repo).await?;
+    check_git_args(&req.args)?;
     let args = req.args;
     let out = tauri::async_runtime::spawn_blocking(move || {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -435,11 +520,13 @@ pub async fn debug_e2e_agents() -> Result<Vec<i32>, AppError> {
     live_agents(&paths()?).await
 }
 
-/// The run's agents still alive: the pids fake-claude recorded in this run's record (its
-/// `-p` calls and the `sleep` grandchildren of `hang_ignore`) that `ps` still shows running
-/// the same program (a pid can be reused). Other fake-claude processes on the machine (a
-/// concurrent `cargo test`, another app instance) and the short `--version`/`auth status`
-/// probes are never counted.
+/// The run's agents still alive, recorded or not: the pids fake-claude recorded in this run's
+/// record (its `-p` calls and the `sleep` grandchildren of `hang_ignore`) that `ps` still shows
+/// running the same program (a pid can be reused), plus every fake-claude `-p` and `sleep 300`
+/// on the machine whose working directory is inside the run's directory (the agents run in
+/// worktrees under its `HOME`), found with `lsof`. Other fake-claude processes (a concurrent
+/// `cargo test`, another app instance), the app's own git commands and the short `--version` /
+/// `auth status` probes are never counted.
 async fn live_agents(p: &Paths) -> Result<Vec<i32>, AppError> {
     let recorded: HashMap<u64, bool> = json_lines(&p.record)
         .await
@@ -453,30 +540,55 @@ async fn live_agents(p: &Paths) -> Result<Vec<i32>, AppError> {
             }
         })
         .collect();
-    if recorded.is_empty() {
+    let in_dir = pids_in_dir(&p.dir).await?;
+    let candidates: BTreeSet<u64> = recorded.keys().chain(&in_dir).copied().collect();
+    if candidates.is_empty() {
         return Ok(Vec::new());
     }
-    let list: Vec<String> = recorded.keys().map(u64::to_string).collect();
+    let list: Vec<String> = candidates.iter().map(u64::to_string).collect();
     // Exits 1 when some pid is gone: only its output matters.
     let out = tokio::process::Command::new("/bin/ps")
         .args(["-o", "pid=,command=", "-p", &list.join(",")])
         .stdin(Stdio::null())
         .output()
         .await?;
-    let fake = p.fake.display().to_string();
+    let agent = format!("{} -p", p.fake.display());
     Ok(lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
             let (pid, command) = line.trim().split_once(' ')?;
             let pid: u64 = pid.parse().ok()?;
             let command = command.trim();
-            let alive = match recorded.get(&pid)? {
-                false => command.starts_with(&fake),
-                true => command == "sleep 300",
+            let alive = match recorded.get(&pid) {
+                Some(false) => command.starts_with(&p.fake.display().to_string()),
+                Some(true) => command == "sleep 300",
+                None => command.starts_with(&agent) || command == "sleep 300",
             };
             alive.then_some(pid as i32)
         })
         .collect())
+}
+
+/// Pids of the processes of this user whose working directory lies inside `dir`.
+async fn pids_in_dir(dir: &Path) -> Result<Vec<u64>, AppError> {
+    // Exits 1 when some process could not be read: only its output matters.
+    let out = tokio::process::Command::new("/usr/sbin/lsof")
+        .args(["-w", "-d", "cwd", "-F", "pn"])
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    let mut pids = Vec::new();
+    let mut pid = None;
+    for line in lossy(&out.stdout).lines() {
+        if let Some(p) = line.strip_prefix('p') {
+            pid = p.parse().ok();
+        } else if let (Some(name), Some(p)) = (line.strip_prefix('n'), pid)
+            && Path::new(name).starts_with(dir)
+        {
+            pids.push(p);
+        }
+    }
+    Ok(pids)
 }
 
 #[tauri::command]
@@ -485,53 +597,253 @@ pub async fn debug_e2e_failures() -> Result<Vec<String>, AppError> {
     Ok(FAILURES.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
-/// Hands the partial report to phase 2, then quits the way Cmd+Q does. The default menu's Quit
-/// sends `terminate:` to `NSApp`; tao has no `applicationShouldTerminate:`, so AppKit goes
-/// straight to `applicationWillTerminate:` → tao's `LoopDestroyed` → `RunEvent::Exit`, never
+/// Hands the partial report to phase 2 (with how ⌘Q is delivered in its `details.cmd_q`), then
+/// presses Cmd+Q ([`press_cmd_q`]): the Quit item of the app menu (Tauri's default menu) sends
+/// `terminate:` to `NSApp`; tao has no `applicationShouldTerminate:`, so AppKit goes straight
+/// to `applicationWillTerminate:` → tao's `LoopDestroyed` → `RunEvent::Exit`, never
 /// `ExitRequested`: `on_run_event` then runs `Core::shutdown` on the main thread before the
 /// process exits with 0. (`app.exit` would take the other, `ExitRequested`, branch: phase 2
 /// exits that way.)
 #[tauri::command]
 pub async fn debug_e2e_quit(app: AppHandle, req: ReportReq) -> Result<(), AppError> {
     let p = paths()?;
-    tokio::fs::write(&p.phase1, req.report.to_string()).await?;
-    eprintln!("e2e: phase 1 done, quitting like Cmd+Q (NSApp terminate:)");
-    terminate_like_cmd_q(&app);
+    let route = cmd_q_route();
+    let mut report = req.report;
+    if let Some(details) = report.get_mut("details").and_then(Value::as_object_mut) {
+        details.insert("cmd_q".into(), route.describe().into());
+    }
+    tokio::fs::write(&p.phase1, report.to_string()).await?;
+    eprintln!("e2e: phase 1 done, pressing Cmd+Q ({})", route.describe());
+    press_cmd_q(&app, route)?;
+    // A Cmd+Q that does not quit (no ⌘Q item in the menu, the page swallowing the key) fails
+    // the phase now rather than at the watchdog. The shutdown itself ends well before.
+    std::thread::spawn(|| {
+        std::thread::sleep(QUIT_WAIT);
+        fail(&format!("Cmd+Q did not quit the app within {QUIT_WAIT:?}"));
+    });
     Ok(())
 }
 
-/// `[NSApp performSelectorOnMainThread:@selector(terminate:) withObject:nil
-/// waitUntilDone:NO]`: the main run loop sends `terminate:` outside any tao callback, as the
-/// Quit menu item does (a `run_on_main_thread` closure would run inside tao's handler).
+/// How [`press_cmd_q`] delivers ⌘Q.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CmdQ {
+    /// Key-down and key-up `q` with ⌘ as `CGEvent`s posted to this process through the window
+    /// server (`CGEventPostToPid`), as a keyboard's reach the app: the terminal that started
+    /// the run has the event-posting (Accessibility) access.
+    WindowServer,
+    /// Without that access (`CGPreflightPostEventAccess` false): the same key-down as an
+    /// `NSEvent` handed to `-[NSApplication sendEvent:]` inside the app.
+    SendEvent,
+}
+
+impl CmdQ {
+    fn describe(self) -> &'static str {
+        match self {
+            CmdQ::WindowServer => "⌘Q CGEvent posted to the app's pid through the window server",
+            CmdQ::SendEvent => {
+                "⌘Q NSEvent given to -[NSApp sendEvent:] (no event-posting access: \
+                 CGPreflightPostEventAccess false)"
+            }
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn terminate_like_cmd_q(_app: &AppHandle) {
-    use std::ffi::{c_char, c_void};
-    type Id = *mut c_void;
-    type Perform = unsafe extern "C" fn(Id, Id, Id, Id, bool);
-    #[link(name = "AppKit", kind = "framework")]
-    unsafe extern "C" {
-        static NSApp: Id;
-    }
-    #[link(name = "objc")]
-    unsafe extern "C" {
-        fn sel_registerName(name: *const c_char) -> Id;
-        fn objc_msgSend();
-    }
-    // SAFETY: `NSApp` is set once AppKit runs (the window is up); `objc_msgSend` is called
-    // through the exact prototype of `-[NSObject performSelectorOnMainThread:withObject:
-    // waitUntilDone:]` (id, SEL, SEL, id, BOOL), which may be sent from any thread.
-    unsafe {
-        let perform = std::mem::transmute::<unsafe extern "C" fn(), Perform>(objc_msgSend);
-        let selector =
-            sel_registerName(c"performSelectorOnMainThread:withObject:waitUntilDone:".as_ptr());
-        let terminate = sel_registerName(c"terminate:".as_ptr());
-        perform(NSApp, selector, terminate, std::ptr::null_mut(), false);
+fn cmd_q_route() -> CmdQ {
+    // SAFETY: a plain query of this process's TCC access; never prompts.
+    if unsafe { cocoa::CGPreflightPostEventAccess() } {
+        CmdQ::WindowServer
+    } else {
+        CmdQ::SendEvent
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-fn terminate_like_cmd_q(app: &AppHandle) {
+fn cmd_q_route() -> CmdQ {
+    CmdQ::SendEvent
+}
+
+/// Presses ⌘Q the `route` way. Either way AppKit offers the key-down as a key equivalent to
+/// the key window (the WKWebView passes it to the page, which does not handle it) and then to
+/// the main menu, whose Quit item has ⌘Q. Errors: `Internal` (no main window).
+#[cfg(target_os = "macos")]
+fn press_cmd_q(app: &AppHandle, route: CmdQ) -> Result<(), AppError> {
+    if route == CmdQ::WindowServer {
+        // SAFETY: CoreGraphics event calls, valid from any thread.
+        unsafe { cocoa::post_cmd_q_to_self() };
+        return Ok(());
+    }
+    let window = app
+        .get_webview_window("main")
+        .ok_or_else(|| AppError::internal("no main window"))?;
+    app.run_on_main_thread(move || {
+        let ns_window = window.ns_window().unwrap_or(std::ptr::null_mut());
+        // SAFETY: on the main thread, with AppKit running (the window is up).
+        unsafe { cocoa::post_cmd_q(ns_window) }
+    })
+    .map_err(|e| AppError::internal(e.to_string()))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn press_cmd_q(app: &AppHandle, _route: CmdQ) -> Result<(), AppError> {
     app.exit(0);
+    Ok(())
+}
+
+/// The CoreGraphics calls and the few Objective-C messages of [`press_cmd_q`], the latter sent
+/// through `objc_msgSend` cast to each method's exact prototype.
+#[cfg(target_os = "macos")]
+mod cocoa {
+    use std::ffi::{CStr, c_char, c_void};
+
+    type Id = *mut c_void;
+    type Sel = *mut c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct NsPoint {
+        x: f64,
+        y: f64,
+    }
+
+    const NS_EVENT_TYPE_KEY_DOWN: u64 = 10;
+    const NS_EVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
+    /// `kVK_ANSI_Q`.
+    const KEY_CODE_Q: u16 = 12;
+
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {
+        static NSApp: Id;
+    }
+    /// `kCGEventSourceStateHIDSystemState`: the state of the hardware keyboard.
+    const HID_SYSTEM_STATE: i32 = 1;
+    /// `kCGEventFlagMaskCommand`.
+    const CG_FLAG_COMMAND: u64 = 0x0010_0000;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        pub fn CGPreflightPostEventAccess() -> bool;
+        fn CGEventSourceCreate(state: i32) -> Id;
+        fn CGEventCreateKeyboardEvent(source: Id, key: u16, down: bool) -> Id;
+        fn CGEventSetFlags(event: Id, flags: u64);
+        fn CGEventPostToPid(pid: i32, event: Id);
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFRelease(object: Id);
+    }
+    #[link(name = "objc")]
+    unsafe extern "C" {
+        fn objc_getClass(name: *const c_char) -> Id;
+        fn sel_registerName(name: *const c_char) -> Sel;
+        fn objc_msgSend();
+    }
+
+    unsafe fn sel(name: &CStr) -> Sel {
+        unsafe { sel_registerName(name.as_ptr()) }
+    }
+
+    unsafe fn class(name: &CStr) -> Id {
+        unsafe { objc_getClass(name.as_ptr()) }
+    }
+
+    /// Posts ⌘Q (key-down, key-up) to this process through the window server.
+    ///
+    /// # Safety
+    /// Only CoreGraphics calls, each object released once.
+    pub unsafe fn post_cmd_q_to_self() {
+        let pid = std::process::id() as i32;
+        unsafe {
+            let source = CGEventSourceCreate(HID_SYSTEM_STATE);
+            for down in [true, false] {
+                let event = CGEventCreateKeyboardEvent(source, KEY_CODE_Q, down);
+                if event.is_null() {
+                    continue;
+                }
+                CGEventSetFlags(event, CG_FLAG_COMMAND);
+                CGEventPostToPid(pid, event);
+                CFRelease(event);
+            }
+            if !source.is_null() {
+                CFRelease(source);
+            }
+        }
+    }
+
+    /// Queues `[NSApp sendEvent:<⌘Q key-down>]` on the main run loop.
+    ///
+    /// # Safety
+    /// Main thread, AppKit running; `ns_window` is an `NSWindow` or null.
+    pub unsafe fn post_cmd_q(ns_window: *mut c_void) {
+        type GetId = unsafe extern "C" fn(Id, Sel) -> Id;
+        type GetF64 = unsafe extern "C" fn(Id, Sel) -> f64;
+        type GetIsize = unsafe extern "C" fn(Id, Sel) -> isize;
+        type StringWithUtf8 = unsafe extern "C" fn(Id, Sel, *const c_char) -> Id;
+        type KeyEvent = unsafe extern "C" fn(
+            Id,
+            Sel,
+            u64,
+            NsPoint,
+            u64,
+            f64,
+            isize,
+            Id,
+            Id,
+            Id,
+            bool,
+            u16,
+        ) -> Id;
+        type Perform = unsafe extern "C" fn(Id, Sel, Sel, Id, bool);
+        let send = objc_msgSend as unsafe extern "C" fn();
+        // SAFETY: every call goes through the exact prototype of the method it sends.
+        unsafe {
+            let get_id = std::mem::transmute::<unsafe extern "C" fn(), GetId>(send);
+            let get_f64 = std::mem::transmute::<unsafe extern "C" fn(), GetF64>(send);
+            let get_isize = std::mem::transmute::<unsafe extern "C" fn(), GetIsize>(send);
+            let string = std::mem::transmute::<unsafe extern "C" fn(), StringWithUtf8>(send);
+            let key_event = std::mem::transmute::<unsafe extern "C" fn(), KeyEvent>(send);
+            let perform = std::mem::transmute::<unsafe extern "C" fn(), Perform>(send);
+
+            let q = string(
+                class(c"NSString"),
+                sel(c"stringWithUTF8String:"),
+                c"q".as_ptr(),
+            );
+            let process = get_id(class(c"NSProcessInfo"), sel(c"processInfo"));
+            let now = get_f64(process, sel(c"systemUptime"));
+            let window_number = if ns_window.is_null() {
+                0
+            } else {
+                get_isize(ns_window, sel(c"windowNumber"))
+            };
+            let sel_key_event = sel(
+                c"keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:",
+            );
+            let event = key_event(
+                class(c"NSEvent"),
+                sel_key_event,
+                NS_EVENT_TYPE_KEY_DOWN,
+                NsPoint { x: 0.0, y: 0.0 },
+                NS_EVENT_MODIFIER_FLAG_COMMAND,
+                now,
+                window_number,
+                std::ptr::null_mut(),
+                q,
+                q,
+                false,
+                KEY_CODE_Q,
+            );
+            // Not sent from here: this runs inside tao's event handler, which `terminate:`
+            // would re-enter. The run loop delivers it on its next turn (it retains `event`).
+            perform(
+                NSApp,
+                sel(c"performSelectorOnMainThread:withObject:waitUntilDone:"),
+                sel(c"sendEvent:"),
+                event,
+                false,
+            );
+        }
+    }
 }
 
 /// Prints the report on stdout and exits: 0 if it passed ([`report_passed`]), 1 otherwise.
@@ -544,6 +856,17 @@ pub async fn debug_e2e_report(app: AppHandle, req: ReportReq) -> Result<(), AppE
     let _ = out.flush();
     app.exit(if passed { 0 } else { 1 });
     Ok(())
+}
+
+/// The page reload of phase 1: `-[WKWebView reload]`, as the WebView's own "Reload" (the app
+/// binds no Cmd+R). The UI stored its state first; the answer may not reach the old page.
+#[tauri::command]
+pub async fn debug_e2e_reload(app: AppHandle) -> Result<(), AppError> {
+    paths()?;
+    app.get_webview_window("main")
+        .ok_or_else(|| AppError::internal("no main window"))?
+        .reload()
+        .map_err(|e| AppError::internal(e.to_string()))
 }
 
 /// Phase 2: `step_1`..`step_12` all true; the gatekeeper phase: `gatekeeper_ok` true. Every
@@ -675,6 +998,119 @@ mod tests {
     }
 
     #[test]
+    fn git_takes_only_the_ui_checks() {
+        let args = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        for ok in [
+            &["show", "main:hello.txt"][..],
+            &["show", "--name-only", "--format=", "main"],
+            &["log", "-1", "--format=%H%n%s", "main"],
+            &["status", "--porcelain"],
+            &["branch", "--list", "atm/x"],
+            &["worktree", "list", "--porcelain"],
+        ] {
+            assert!(check_git_args(&args(ok)).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            &[][..],
+            &["-c", "alias.x=!sh", "x"],
+            &["-C", "/", "status"],
+            &["--git-dir=/tmp/x", "log"],
+            &["log", "--output=/tmp/x"],
+            &["show", "-c", "core.fsmonitor=x"],
+            &["branch", "evil"],
+            &["worktree", "add", "/tmp/x"],
+            &["commit", "-m", "x"],
+            &["config", "core.hooksPath", "/tmp"],
+        ] {
+            assert!(check_git_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_fake_claudes_binary_passes() {
+        let dir = std::env::temp_dir().join(format!("atm-e2e-fake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("fake-claude");
+        std::fs::write(
+            &fake,
+            [b"\0bin ".as_slice(), FAKE_MARKER, b" rest"].concat(),
+        )
+        .unwrap();
+        assert_eq!(verify_fake(&fake).unwrap(), fake.canonicalize().unwrap());
+        // The real CLI copied or linked under the name.
+        let real = dir.join("claude");
+        std::fs::write(&real, "#!/bin/sh\necho '2.1.283 (Claude Code)'\n").unwrap();
+        let copy = dir.join("copy");
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::copy(&real, copy.join("fake-claude")).unwrap();
+        assert!(verify_fake(&copy.join("fake-claude")).is_err());
+        let link = dir.join("link");
+        std::fs::create_dir_all(&link).unwrap();
+        std::os::unix::fs::symlink(&real, link.join("fake-claude")).unwrap();
+        assert!(verify_fake(&link.join("fake-claude")).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn inside_rejects_escapes_and_dangling_symlinks() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("atm-e2e-inside-{}", std::process::id()));
+        let dir = root.join("run");
+        std::fs::create_dir_all(dir.join("repo")).unwrap();
+        std::fs::write(dir.join("repo/hello.txt"), "hello\n").unwrap();
+        std::os::unix::fs::symlink(root.join("outside.txt"), dir.join("repo/dangling")).unwrap();
+        std::os::unix::fs::symlink(&root, dir.join("repo/up")).unwrap();
+        let p = Paths {
+            dir: dir.clone(),
+            repos: dir.clone(),
+            home: dir.clone(),
+            auth: dir.join("auth"),
+            record: dir.join("record.jsonl"),
+            open_log: dir.join("open.jsonl"),
+            phase1: dir.join("phase1.json"),
+            fake: PathBuf::new(),
+        };
+        let inside =
+            |path: PathBuf| tauri::async_runtime::block_on(p.inside(&path.display().to_string()));
+        assert!(inside(dir.join("repo/hello.txt")).is_ok());
+        assert!(inside(dir.join("repo/new.txt")).is_ok());
+        assert!(inside(dir.join("repo/dangling")).is_err());
+        assert!(inside(dir.join("repo/up/outside.txt")).is_err());
+        assert!(inside(dir.join("../outside.txt")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn processes_working_in_the_run_dir_are_found() {
+        let root = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("atm-e2e-cwd-{}", std::process::id()));
+        let (dir, sibling) = (root.join("run"), root.join("run-other"));
+        for d in [&dir, &sibling] {
+            std::fs::create_dir_all(d.join("wt")).unwrap();
+        }
+        let sleep_in = |d: &Path| {
+            Command::new("sleep")
+                .arg("30")
+                .current_dir(d.join("wt"))
+                .spawn()
+                .unwrap()
+        };
+        let (mut inside, mut other) = (sleep_in(&dir), sleep_in(&sibling));
+        let found = tauri::async_runtime::block_on(pids_in_dir(&dir)).unwrap();
+        for child in [&mut inside, &mut other] {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(found.contains(&u64::from(inside.id())), "{found:?}");
+        assert!(!found.contains(&u64::from(other.id())), "{found:?}");
+    }
+
+    #[test]
     fn e2e_fns_match_marker_names() {
         let _ = (
             debug_e2e_setup,
@@ -688,6 +1124,7 @@ mod tests {
             debug_e2e_agents,
             debug_e2e_failures,
             debug_e2e_quit,
+            debug_e2e_reload,
             debug_e2e_report,
             debug_e2e_gatekeeper,
         );
@@ -703,6 +1140,7 @@ mod tests {
             ("debug_e2e_agents", DebugE2eAgents::NAME),
             ("debug_e2e_failures", DebugE2eFailures::NAME),
             ("debug_e2e_quit", DebugE2eQuit::NAME),
+            ("debug_e2e_reload", DebugE2eReload::NAME),
             ("debug_e2e_report", DebugE2eReport::NAME),
             ("debug_e2e_gatekeeper", DebugE2eGatekeeper::NAME),
         ] {

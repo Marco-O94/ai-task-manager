@@ -1,0 +1,97 @@
+{
+  "add_project_warnings": [],
+  "cli_version": "2.1.283",
+  "f_push": {
+    "approvals": [],
+    "permission_denials": [
+      {
+        "tool_input": {
+          "command": "git push",
+          "description": "Attempt git push, expected to be blocked by permission rule"
+        },
+        "tool_name": "Bash",
+        "tool_use_id": "toolu_01XyCQ1EC1bdJXTeH52B6ann"
+      }
+    ],
+    "remote_refs": "",
+    "said": "Run `git push` once, per task.\nBlocked. Error: `Permission to use Bash with command git push has been denied.`\nBlocked. Error: `Permission to use Bash with command git push has been denied.`",
+    "status": "completed",
+    "tool_calls": [
+      {
+        "name": "Bash",
+        "output": "Permission to use Bash with command git push has been denied.",
+        "status": {
+          "state": "Failed"
+        },
+        "summary": "$ git push"
+      }
+    ],
+    "turn_end": {
+      "cost_usd_estimate": 0.1650168,
+      "duration_ms": 3296,
+      "is_error": false,
+      "limit": null,
+      "num_turns": 2,
+      "permission_denials": 1,
+      "subtype": "success",
+      "text": "Blocked. Error: `Permission to use Bash with command git push has been denied.`",
+      "type": "TurnEnd"
+    }
+  },
+  "failed_checks": [],
+  "turns": {
+    "push-1-git-push": {
+      "cost_usd_estimate": 0.1650168,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "default",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "text": "Run `git push` once, per task.",
+          "type": "AssistantText"
+        },
+        {
+          "input": "{\"command\":\"git push\",\"description\":\"Attempt git push, expected to be blocked by permission rule\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": true,
+            "text": "Permission to use Bash with command git push has been denied.",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Failed"
+          },
+          "summary": "$ git push",
+          "tool_use_id": "toolu_01XyCQ1EC1bdJXTeH52B6ann",
+          "type": "ToolCall"
+        },
+        {
+          "text": "Blocked. Error: `Permission to use Bash with command git push has been denied.`",
+          "type": "AssistantText"
+        },
+        {
+          "cost_usd_estimate": 0.1650168,
+          "duration_ms": 3296,
+          "is_error": false,
+          "limit": null,
+          "num_turns": 2,
+          "permission_denials": 1,
+          "subtype": "success",
+          "text": "Blocked. Error: `Permission to use Bash with command git push has been denied.`",
+          "type": "TurnEnd"
+        }
+      ],
+      "exit_code": 0,
+      "permission_mode": "default",
+      "result_subtype": "success",
+      "resumed": false,
+      "status": "completed",
+      "stop_reason": null
+    }
+  }
+}

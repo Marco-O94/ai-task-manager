@@ -444,6 +444,46 @@ async fn discover_and_probe_fake_claude() {
     assert_eq!(err.code, ErrorCode::ClaudeNotFound);
 }
 
+/// A set `ATM_CLAUDE_PATH` that is not Claude Code ends the discovery: never a silent fallback
+/// to the next candidate, which would be the real CLI on the user's subscription.
+#[tokio::test]
+async fn an_invalid_atm_claude_path_is_never_skipped() {
+    let dir = common::tempdir();
+    let home = dir.path().canonicalize().unwrap();
+    let bin = home.join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let body = format!(
+        "#!/bin/sh\necho '{} (Claude Code)'\n",
+        atm_types::CLAUDE_TESTED_VERSION
+    );
+    let decoy = write_script(&bin, "claude", &body);
+    let path = OsString::from("/usr/bin:/bin");
+    let env = |extra: &[(&str, &str)]| {
+        let mut vars = os_vars(&[("HOME", home.to_str().unwrap())]);
+        vars.extend(os_vars(extra));
+        ChildEnv::new(vars, &path, false)
+    };
+    // Control: without ATM_CLAUDE_PATH the first fixed candidate is found.
+    let found = claude::discover(None, &env(&[])).await.unwrap();
+    assert_eq!(found.path, decoy);
+    let missing = home.join("missing/fake-claude");
+    for pinned in [Path::new("/bin/echo"), missing.as_path()] {
+        let env = env(&[("ATM_CLAUDE_PATH", pinned.to_str().unwrap())]);
+        assert!(
+            claude::discover(None, &env).await.is_none(),
+            "{}",
+            pinned.display()
+        );
+    }
+    // The override still comes first (spec §7.1).
+    let fake = common::fake_claude();
+    let env = env(&[("ATM_CLAUDE_PATH", "/bin/echo")]);
+    assert_eq!(
+        claude::discover(Some(&fake), &env).await.unwrap().path,
+        fake
+    );
+}
+
 #[test]
 fn version_gate() {
     assert_eq!(
@@ -866,12 +906,58 @@ fn can_remember_only_specific_allow_rules() {
             "allow"
         )]),
         json!([add_rules(json!([]), "allow")]),
-        json!([add_rules(npm.clone(), "allow"), {"type":"setMode","mode":"acceptEdits"}]),
-        json!([add_rules(npm.clone(), "allow"),
-               {"type":"addDirectories","directories":["/tmp"],"destination":"session"}]),
+        // Wildcards alone name the whole tool (spec §7.8): never rememberable.
+        json!([add_rules(
+            json!([{"toolName":"Bash","ruleContent":"*"}]),
+            "allow"
+        )]),
+        json!([add_rules(
+            json!([{"toolName":"Bash","ruleContent":":*"}]),
+            "allow"
+        )]),
+        json!([add_rules(
+            json!([{"toolName":"Bash","ruleContent":" \t"}]),
+            "allow"
+        )]),
+        json!([add_rules(
+            json!([{"toolName":"Bash","ruleContent":" * : ** "}]),
+            "allow"
+        )]),
+        json!([
+            add_rules(npm.clone(), "allow"),
+            add_rules(json!([{"toolName":"Bash","ruleContent":"*"}]), "allow")
+        ]),
+        json!([{"type":"setMode","mode":"acceptEdits","destination":"session"}]),
+        json!([
+            add_rules(npm.clone(), "allow"),
+            add_rules(json!([{"toolName":"Bash"}]), "allow")
+        ]),
     ] {
         assert!(!wire::can_remember(&not_rememberable), "{not_rememberable}");
     }
+}
+
+/// The CLI 2.1.283 adds `addDirectories` and `setMode` to every Bash request (M5 capture): they
+/// neither block "Consenti sempre" nor reach `updatedPermissions`.
+#[test]
+fn remember_ignores_and_never_forwards_other_suggestion_types() {
+    let p = pending(
+        "Bash",
+        json!([
+            add_rules(json!([{"toolName":"Bash","ruleContent":"touch approved.txt"}]), "allow"),
+            {"type":"addDirectories","directories":["/tmp/wt"],"destination":"session"},
+            {"type":"setMode","mode":"acceptEdits","destination":"session"},
+            add_rules(json!([{"toolName":"Bash","ruleContent":"rm -rf x"}]), "deny"),
+        ]),
+    );
+    assert!(wire::can_remember(&p.suggestions));
+    let frame = wire::approval_response(&p, &ApprovalDecision::Allow { remember: true });
+    assert_eq!(
+        frame["response"]["response"]["updatedPermissions"],
+        json!([{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"touch approved.txt"}],
+                "behavior":"allow","destination":"session"}])
+    );
+    assert_eq!(wire::remembered_rules(&p), ["Bash(touch approved.txt)"]);
 }
 
 #[test]
@@ -1142,8 +1228,12 @@ async fn spawn_scrubs_the_environment_and_sets_pwd() {
     );
 
     let records = fx.records();
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.len(), 2);
     let call = &records[0];
+    // Then one line per user message, naming the scenario it played.
+    assert_eq!(records[1]["kind"], "turn");
+    assert_eq!(records[1]["scenario"], "simple");
+    assert_eq!(records[1]["pid"], call["pid"]);
     let wt = fx.worktree.to_str().unwrap();
     assert_eq!(call["kind"], "call");
     assert_eq!(call["pwd"], wt);
@@ -1204,7 +1294,11 @@ async fn approval_scenario_round_trip() {
     assert_eq!(wire::remembered_rules(&pendings[0]), ["Bash(echo hello)"]);
     assert_eq!(turn.result()["subtype"], "success");
     assert!(fx.worktree.join("hello.txt").exists());
-    let answered = &fx.records()[1];
+    let records = fx.records();
+    let answered = records
+        .iter()
+        .find(|r| r["kind"] == "control_response")
+        .unwrap();
     assert_eq!(answered["kind"], "control_response");
     assert_eq!(
         answered["response"]["response"]["updatedPermissions"][0]["destination"],
@@ -1227,7 +1321,11 @@ async fn control_scenario_records_the_error_reply() {
     })
     .await;
     assert!(turn.status.success(), "{}", turn.stderr);
-    let answered = &fx.records()[1];
+    let records = fx.records();
+    let answered = records
+        .iter()
+        .find(|r| r["kind"] == "control_response")
+        .unwrap();
     assert_eq!(answered["response"]["subtype"], "error");
     assert_eq!(
         answered["response"]["error"],
@@ -1261,8 +1359,10 @@ async fn crash_and_resume_fail_exit_without_result() {
     assert!(atm_core::normalize::is_resume_failure(&turn.stderr));
 }
 
+/// The grandchild `sleep` leads a group of its own, like the commands of the real Bash tool
+/// (M5): `killpg` of the agent's group misses it, `kill_tree` does not.
 #[tokio::test]
-async fn killpg_reaches_the_whole_group() {
+async fn kill_tree_reaches_the_group_and_a_descendant_in_its_own_group() {
     let fx = Fixture::new();
     let spawned = fx.spawn(&[("FAKE_CLAUDE_SCENARIO", "hang_ignore")]);
     let claude::Spawned {
@@ -1300,7 +1400,8 @@ async fn killpg_reaches_the_whole_group() {
     let grandchild = i32::try_from(grandchild).unwrap();
     assert!(claude::pid_alive(grandchild));
     // SAFETY: getpgid only reads the process table.
-    assert_eq!(unsafe { libc::getpgid(grandchild) }, pgid);
+    assert_eq!(unsafe { libc::getpgid(grandchild) }, grandchild);
+    assert_eq!(claude::descendants(pgid), [grandchild]);
 
     // Interrupt, EOF and SIGTERM are all ignored.
     tx.send(wire::interrupt_request(&wire::request_id(2)))
@@ -1311,7 +1412,7 @@ async fn killpg_reaches_the_whole_group() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(child.try_wait().unwrap().is_none());
 
-    claude::killpg(pgid, libc::SIGKILL).unwrap();
+    claude::kill_tree(pgid);
     let status = child.wait().await.unwrap();
     assert!(status.code().is_none());
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1356,4 +1457,67 @@ fn spawn_error_is_io() {
     write_script(dir.path(), "claude", "#!/bin/sh\n");
     let err = claude::spawn(&["./claude".into()], dir.path(), &env).unwrap_err();
     assert_eq!(err.code, ErrorCode::Io);
+}
+
+/// The answer to `initialize` names the account (M5): `stdout.jsonl` gets it redacted; every
+/// other line is logged unchanged, without a copy.
+#[test]
+fn redact_for_log_hides_the_account_only() {
+    let answer = json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":"atm_1_0","response":{"commands":[],"account":{"email":"a@b.example",
+        "organization":"Org","subscriptionType":"Claude Max","apiProvider":"firstParty"}}}});
+    let line = answer.to_string();
+    let logged: Value = serde_json::from_slice(&wire::redact_for_log(line.as_bytes())).unwrap();
+    assert_eq!(
+        logged["response"]["response"]["account"],
+        json!({"email": wire::REDACTED, "organization": wire::REDACTED,
+               "subscriptionType": "Claude Max", "apiProvider": "firstParty"})
+    );
+    assert_eq!(logged["response"]["response"]["commands"], json!([]));
+    for untouched in [
+        r#"{"type":"assistant","message":{"content":[{"type":"text","text":"\"account\""}]}}"#,
+        r#"{"type":"control_response","response":{"subtype":"success","request_id":"x","response":{"still_queued":[]}}}"#,
+        r#"{"type":"user","message":{"content":[{"type":"tool_result","content":{"account":"x"}}]}}"#,
+        "not json \"account\"",
+    ] {
+        assert!(matches!(
+            wire::redact_for_log(untouched.as_bytes()),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+}
+
+/// The account is redacted wherever a CLI could put it, in any line type: a `control_response`
+/// without `request_id` (classified as a message), a flat `response.account`, a top-level
+/// `account` (e.g. `system/init`); an `account` that is not an object is replaced whole.
+#[test]
+fn redact_for_log_covers_other_account_shapes() {
+    let account = json!({"email":"a@b.example","organization":"Org","subscriptionType":"pro"});
+    let hidden = json!({"email": wire::REDACTED, "organization": wire::REDACTED,
+                        "subscriptionType": "pro"});
+    let redact = |line: Value| -> Value {
+        serde_json::from_slice(&wire::redact_for_log(line.to_string().as_bytes())).unwrap()
+    };
+    let no_id = json!({"type":"control_response","response":{"subtype":"success",
+        "response":{"account":account}}});
+    assert!(matches!(
+        wire::parse(no_id.to_string().as_bytes()),
+        wire::Inbound::Message(_)
+    ));
+    assert_eq!(redact(no_id)["response"]["response"]["account"], hidden);
+    let flat = json!({"type":"control_response","response":{"subtype":"success",
+        "request_id":"atm_1_0","account":account}});
+    assert_eq!(redact(flat)["response"]["account"], hidden);
+    let init = json!({"type":"system","subtype":"init","account":account,"model":"m"});
+    let logged = redact(init);
+    assert_eq!(logged["account"], hidden);
+    assert_eq!(logged["model"], "m");
+    for scalar in [json!("a@b.example"), json!(["a@b.example"]), json!(42)] {
+        let line = json!({"type":"control_response","response":{"subtype":"success",
+            "request_id":"atm_1_0","response":{"account":scalar}}});
+        assert_eq!(
+            redact(line)["response"]["response"]["account"],
+            wire::REDACTED
+        );
+    }
 }

@@ -9,21 +9,35 @@
 //!   `$FAKE_CLAUDE_RECORD`: `{"kind":"call","argv":[…without argv0],"cwd":…,"pwd":…,
 //!   "pid":…,"env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for
 //!   every answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`),
-//!   and `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`.
+//!   `{"kind":"turn","pid":…,"scenario":…}` for every user message it plays, and
+//!   `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`, `{"kind":"background",
+//!   "pid":…}` for the `sleep` of `background`.
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
 //!   `[fake:NAME]` in its text, else `resolve_merge` for the app's "Risolvi con l'agente"
 //!   prompt, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
-//!   An interrupt is answered with success plus a `result` `error_during_execution`
-//!   (except `hang_ignore`).
+//!   An interrupt is answered with success (`{"still_queued":[]}`), the user line `[Request
+//!   interrupted by user]` and a `result` `error_during_execution` (except `hang_ignore`).
+//!
+//! Frame shapes follow the real CLI 2.1.283 as captured in M5 (`tests/fixtures/real/`): the
+//! `initialize` answer names the account (email, organization), `system/status` precedes each
+//! request and a `rate_limit_event` follows the first assistant message of a turn, `can_use_tool`
+//! carries `display_name`, `description`, a string `decision_reason` and three suggestions
+//! (`addRules`, `addDirectories`, `setMode`), and the `sleep` of `hang_ignore` leads a process
+//! group of its own, like the commands of the real Bash tool.
 //!
 //! Scenarios: simple, approval, slow, hang, hang_ignore, crash, noinit, big, flood, control,
 //! usage_limit, auth_fail (also writes `out` to `$FAKE_CLAUDE_AUTH_FILE`), resolve_merge
-//! (`$FAKE_CLAUDE_TARGET`, else the target named by the app's conflict prompt), resume_fail.
+//! (`$FAKE_CLAUDE_TARGET`, else the target named by the app's conflict prompt), resume_fail,
+//! append (like simple, but appends the message's first line, without the tag and the leading
+//! `#`, to `hello.txt`: two tasks appending to the same file conflict), background (leaves a
+//! `sleep 300` running in a process group of its own, like a `run_in_background` command of the
+//! real Bash tool, then succeeds and exits at EOF as usual).
 //! Counts: `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
 //! `FAKE_CLAUDE_DELTA_MS` (default 0): pause between the text deltas of a streamed text, so a
 //! UI can be seen rendering it progressively.
 
 use std::io::{BufRead as _, Write as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio, exit};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
@@ -109,6 +123,8 @@ type Step = Result<(), Stop>;
 struct Session {
     rx: Receiver<Value>,
     session_id: String,
+    /// The `rate_limit_event` of this turn went out (after its first assistant message).
+    rate_limit_sent: bool,
     cwd: PathBuf,
     permission_mode: String,
     record: Option<PathBuf>,
@@ -129,6 +145,7 @@ impl Session {
             session_id: flag("--session-id=")
                 .or_else(|| flag("--resume="))
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            rate_limit_sent: false,
             cwd: std::env::current_dir().unwrap_or_default(),
             permission_mode: flag("--permission-mode=").unwrap_or_else(|| "default".into()),
             record: std::env::var_os("FAKE_CLAUDE_RECORD").map(PathBuf::from),
@@ -174,12 +191,15 @@ impl Session {
                 Some("user") => {
                     self.prompt = user_text(&msg);
                     let scenario = pick_scenario(&self.prompt);
+                    self.record(json!({
+                        "kind": "turn",
+                        "pid": std::process::id(),
+                        "scenario": scenario,
+                    }));
+                    self.rate_limit_sent = false;
                     match self.play(&scenario) {
                         Ok(()) => {}
-                        Err(Stop::Interrupted(request_id)) => {
-                            self.send(control_success(&request_id, json!({})));
-                            self.result("error_during_execution", true, None);
-                        }
+                        Err(Stop::Interrupted(request_id)) => self.interrupted(&request_id),
                         Err(Stop::Eof) => exit(0),
                     }
                 }
@@ -192,8 +212,8 @@ impl Session {
     fn answer(&mut self, msg: &Value) {
         let request_id = msg["request_id"].as_str().unwrap_or_default();
         let reply = match msg["request"]["subtype"].as_str().unwrap_or_default() {
-            "initialize" => control_success(request_id, json!({"commands": []})),
-            "interrupt" => control_success(request_id, json!({})),
+            "initialize" => self.initialize_answer(request_id),
+            "interrupt" => control_success(request_id, json!({"still_queued": []})),
             other => json!({"type": "control_response", "response": {
                 "subtype": "error",
                 "request_id": request_id,
@@ -266,6 +286,7 @@ impl Session {
         }
         match scenario {
             "simple" => self.simple(),
+            "append" => self.append(),
             "approval" => self.approval()?,
             "slow" => {
                 let n = count_env("FAKE_CLAUDE_SLOW_EVENTS", 20);
@@ -279,6 +300,12 @@ impl Session {
                 self.next_response(None)?;
             },
             "hang_ignore" => self.hang_ignore(),
+            "background" => {
+                let pid = sleep_in_own_group();
+                self.record(json!({"kind": "background", "pid": pid}));
+                self.text("Avviato un processo in background.");
+                self.result("success", false, Some("Processo in background avviato."));
+            }
             "crash" => {
                 eprintln!("fake-claude: crash simulato");
                 exit(1);
@@ -320,7 +347,7 @@ impl Session {
             "auth_fail" => {
                 // The CLI's login is gone: its `auth status` says so from now on.
                 if let Some(path) = std::env::var_os(AUTH_FILE_ENV) {
-                    let _ = std::fs::write(path, "out");
+                    let _ = write_atomically(Path::new(&path), "out");
                 }
                 self.result("success", true, Some("Not logged in · Please run /login"));
             }
@@ -350,6 +377,27 @@ impl Session {
         self.result("success", false, Some("Fatto: hello.txt creato."));
     }
 
+    /// Appends the first line of the message (without the `[fake:…]` tag and the leading `#`
+    /// of the app's task prompt) to `hello.txt` with a Write call, then succeeds.
+    fn append(&mut self) {
+        let path = self.cwd.join("hello.txt");
+        let line = append_line(&self.prompt);
+        let content = std::fs::read_to_string(&path).unwrap_or_default() + &line + "\n";
+        let id = self.tool_use("Write", json!({"file_path": path, "content": content}));
+        match std::fs::write(&path, &content) {
+            Ok(()) => {
+                let msg = format!("The file {} has been updated.", path.display());
+                self.tool_result(&id, &msg, false);
+            }
+            Err(e) => self.tool_result(&id, &e.to_string(), true),
+        }
+        self.result(
+            "success",
+            false,
+            Some(&format!("Aggiunto a hello.txt: {line}")),
+        );
+    }
+
     fn approval(&mut self) -> Step {
         let input = json!({"command": "echo hello", "description": "Print hello"});
         let tool_use_id = self.tool_use("Bash", input.clone());
@@ -358,15 +406,20 @@ impl Session {
             json!({"type": "control_request", "request_id": request_id, "request": {
                 "subtype": "can_use_tool",
                 "tool_name": "Bash",
+                "display_name": "Bash",
                 "input": input,
+                "description": "echo hello",
+                "permission_suggestions": [
+                    {"type": "addRules",
+                     "rules": [{"toolName": "Bash", "ruleContent": "echo hello"}],
+                     "behavior": "allow", "destination": "localSettings"},
+                    {"type": "addDirectories", "directories": [self.cwd],
+                     "destination": "session"},
+                    {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+                ],
+                "decision_reason": "This command requires approval",
+                "decision_reason_type": "other",
                 "tool_use_id": tool_use_id,
-                "permission_suggestions": [{
-                    "type": "addRules",
-                    "rules": [{"toolName": "Bash", "ruleContent": "echo hello"}],
-                    "behavior": "allow",
-                    "destination": "localSettings",
-                }],
-                "decision_reason": "Bash richiede un'approvazione in questa modalità",
             }}),
         );
         let response = match self.await_response(&request_id) {
@@ -446,6 +499,27 @@ impl Session {
         body
     }
 
+    /// The real answer to `initialize` (M5): the account with email and organization (which
+    /// the app must never log), the catalog lists, the mode, and two extra wrapper keys.
+    fn initialize_answer(&self, request_id: &str) -> Value {
+        json!({"type": "control_response", "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "pending_permission_requests": [],
+            "pending_user_dialog_requests": [],
+            "response": {
+                "commands": [], "agents": [], "output_style": "default",
+                "available_output_styles": ["default"],
+                "models": [{"value": "default", "displayName": "Default (recommended)"}],
+                "account": {"email": "fake@example.com", "organization": "Fake Org",
+                            "subscriptionType": "Claude Max", "apiProvider": "firstParty"},
+                "pid": std::process::id(),
+                "current_permission_mode": self.permission_mode,
+                "session_state": "idle",
+            },
+        }})
+    }
+
     fn init(&mut self) {
         let frame = self.envelope(
             "system",
@@ -458,9 +532,36 @@ impl Session {
                 "permissionMode": self.permission_mode,
                 "apiKeySource": "none",
                 "claude_code_version": atm_types::CLAUDE_TESTED_VERSION,
+                "slash_commands": [], "skills": [], "plugins": [], "agents": [],
+                "output_style": "default",
+                "capabilities": ["interrupt_receipt_v1"],
+                "fast_mode_state": "off",
             }),
         );
         self.send(frame);
+        self.status();
+    }
+
+    /// `system/status` `requesting`: the real CLI sends one before every API request.
+    fn status(&mut self) {
+        let frame = self.envelope(
+            "system",
+            json!({"subtype": "status", "status": "requesting"}),
+        );
+        self.send(frame);
+    }
+
+    /// The interrupt's answer, the user line the real CLI adds, and its `result`.
+    fn interrupted(&mut self, request_id: &str) {
+        self.send(control_success(request_id, json!({"still_queued": []})));
+        let frame = self.envelope(
+            "user",
+            json!({"message": {"role": "user", "content": [
+                {"type": "text", "text": "[Request interrupted by user]"}]},
+                "parent_tool_use_id": null}),
+        );
+        self.send(frame);
+        self.result("error_during_execution", true, None);
     }
 
     fn stream_text(&mut self, text: &str) {
@@ -495,6 +596,14 @@ impl Session {
             "parent_tool_use_id": null,
         }));
         self.send(frame);
+        if !std::mem::replace(&mut self.rate_limit_sent, true) {
+            let frame = self.envelope("rate_limit_event", json!({"rate_limit_info": {
+                "status": "allowed", "resetsAt": 1_790_000_000, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false,
+                "unifiedWindows": {"five_hour": {"utilization": 0.1, "resetsAt": 1_790_000_000}},
+            }}));
+            self.send(frame);
+        }
     }
 
     fn text(&mut self, text: &str) {
@@ -503,7 +612,10 @@ impl Session {
 
     fn tool_use(&mut self, name: &str, input: Value) -> String {
         let id = self.next_id("toolu_fake");
-        self.assistant(json!([{"type": "tool_use", "id": id, "name": name, "input": input}]));
+        self.assistant(
+            json!([{"type": "tool_use", "id": id, "name": name, "input": input,
+                               "caller": {"type": "direct"}}]),
+        );
         id
     }
 
@@ -531,10 +643,17 @@ impl Session {
                 "total_cost_usd": 0.0123,
                 "usage": {"input_tokens": 10, "output_tokens": 20},
                 "permission_denials": [],
+                "stop_reason": if is_error { "tool_use" } else { "end_turn" },
+                "terminal_reason": if subtype == "success" { "completed" } else { "aborted_streaming" },
             }),
         );
-        if let Some(text) = text {
-            frame["result"] = text.into();
+        match text {
+            Some(text) => frame["result"] = text.into(),
+            // The real CLI (M5) explains an error without text in `errors`.
+            None if is_error => {
+                frame["errors"] = json!(["[ede_diagnostic] result_type=user"]);
+            }
+            None => {}
         }
         self.send(frame);
     }
@@ -545,15 +664,23 @@ fn control_success(request_id: &str, response: Value) -> Value {
            "response": {"subtype": "success", "request_id": request_id, "response": response}})
 }
 
-/// Ignores SIGTERM, then starts `sleep 300` in the same process group and returns its pid:
-/// the ignore is inherited across exec, so only SIGKILL of the whole group ends both.
+/// Ignores SIGTERM, then starts [`sleep_in_own_group`] and returns its pid: the ignore is
+/// inherited across exec, so only the app's SIGKILL of the fake's group plus its descendants
+/// ends both.
 fn ignore_sigterm_with_grandchild() -> u32 {
     // SAFETY: changes this process's disposition of one signal; no handler code runs.
     unsafe {
         libc::signal(libc::SIGTERM, libc::SIG_IGN);
     }
+    sleep_in_own_group()
+}
+
+/// Starts `sleep 300` leading a process group of its own, as the real Bash tool does (M5), with
+/// no pipe of the fake's, and returns its pid; never waited for.
+fn sleep_in_own_group() -> u32 {
     let spawned = Command::new("sleep")
         .arg("300")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -600,6 +727,31 @@ fn user_text(msg: &Value) -> String {
 fn conflict_target(text: &str) -> Option<String> {
     let (target, _) = text.strip_prefix(CONFLICT_PROMPT)?.split_once('`')?;
     (!target.is_empty() && !target.starts_with('-')).then(|| target.to_owned())
+}
+
+/// The line `append` adds: the message's first non-empty line without its `[fake:…]` tag and
+/// the leading `#` of the app's task prompt.
+fn append_line(text: &str) -> String {
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_default();
+    let untagged = match first.split_once("[fake:") {
+        Some((head, rest)) => {
+            let tail = rest.split_once(']').map_or("", |(_, tail)| tail);
+            format!("{head}{tail}")
+        }
+        None => first.to_owned(),
+    };
+    untagged.trim().trim_start_matches('#').trim().to_owned()
+}
+
+/// Writes `content` to a temporary file next to `path`, then renames it over `path`: a reader
+/// (the app's `auth status` probe) sees the old content or the new one, never an empty file.
+fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
 }
 
 fn pick_scenario(text: &str) -> String {
@@ -678,5 +830,28 @@ mod tests {
             conflict_target("This branch conflicts with `--all` in: x"),
             None
         );
+    }
+
+    #[test]
+    fn append_adds_the_first_line_without_tag_and_heading() {
+        assert_eq!(
+            append_line("# Hola su hello [fake:append]\n\nDescrizione"),
+            "Hola su hello"
+        );
+        assert_eq!(append_line("\nSaluta [fake:append] tutti"), "Saluta  tutti");
+        assert_eq!(append_line("Solo testo"), "Solo testo");
+        assert_eq!(pick_scenario("# Conflitto [fake:append]"), "append");
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file() {
+        let dir = std::env::temp_dir().join(format!("fake-claude-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth");
+        std::fs::write(&path, "in").unwrap();
+        write_atomically(&path, "out").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "out");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

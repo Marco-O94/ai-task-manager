@@ -27,7 +27,8 @@ use crate::wire::{self, Inbound, Line, Pending};
 use crate::{Inner, attempt_key, guard, new_id, now_ms};
 
 /// Once the leader has exited, the residual group got SIGTERM: stdout/stderr must reach EOF
-/// within this, else the group gets SIGKILL and at most [`DRAIN_AFTER_KILL`] more.
+/// within this, else the group gets SIGKILL and at most [`DRAIN_AFTER_KILL`] more. The
+/// survivors of the leader's recorded tree get SIGKILL after it too.
 const DRAIN_AFTER_EXIT: Duration = Duration::from_secs(3);
 const DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
 /// Lines from the reader tasks waiting for the turn loop.
@@ -45,15 +46,16 @@ enum Io {
     StderrTooLong(usize),
 }
 
-/// SIGKILL to the turn's group if `drive` never completes: its future dropped (runtime
-/// shutdown) or unwinding. `kill_on_drop` reaches the leader only, and startup recovery
-/// verifies the leader, which is dead by then.
+/// SIGKILL to the turn's group and to the leader's descendants if `drive` never completes: its
+/// future dropped (runtime shutdown) or unwinding. `kill_on_drop` reaches the leader only,
+/// startup recovery verifies the leader, which is dead by then, and the CLI's Bash commands
+/// run in groups of their own (M5).
 struct KillGroupOnDrop(Option<i32>);
 
 impl Drop for KillGroupOnDrop {
     fn drop(&mut self) {
         if let Some(pgid) = self.0 {
-            let _ = claude::killpg(pgid, libc::SIGKILL);
+            claude::kill_tree(pgid);
         }
     }
 }
@@ -153,6 +155,10 @@ struct Driver {
     stop: Option<StopCause>,
     timings: StopTimings,
     ladder: Option<(Step, Instant)>,
+    /// The leader's descendants, recorded while it lived (on `result` and at the stop steps
+    /// that may end it): the CLI's Bash commands lead groups of their own (M5), and once the
+    /// leader is reaped they are children of launchd that nothing else links to the turn.
+    tree: Vec<claude::Proc>,
     /// `Some(exit code)` once the leader is reaped (`Some(None)`: killed by a signal).
     exit: Option<Option<i32>>,
     exit_at: Instant,
@@ -177,6 +183,7 @@ impl Driver {
             stop: None,
             timings: StopTimings::NORMAL,
             ladder: None,
+            tree: Vec::new(),
             exit: None,
             exit_at: now,
             drain_killed: false,
@@ -221,18 +228,77 @@ impl Driver {
         self.result_at.map(|at| at + EXIT_AFTER_RESULT)
     }
 
-    fn enter(&mut self, step: Step) {
+    async fn enter(&mut self, step: Step) {
         match step {
             Step::Interrupt => {}
-            Step::Eof => self.stdin = None,
+            Step::Eof => {
+                self.snapshot_tree().await;
+                self.stdin = None;
+            }
             Step::Term => {
+                self.snapshot_tree().await;
                 let _ = claude::killpg(self.pgid, libc::SIGTERM);
             }
+            // The leader still runs here: its descendants in other groups (the CLI's Bash
+            // commands, M5) are found and killed with it.
             Step::Kill => {
+                let table = claude::process_table_async().await;
+                self.record_tree(&table);
                 let _ = claude::killpg(self.pgid, libc::SIGKILL);
+                claude::kill_all(
+                    &claude::survivors(self.pgid, &self.tree, &table),
+                    libc::SIGKILL,
+                );
             }
         }
         self.ladder = Some((step, Instant::now()));
+    }
+
+    /// Adds the leader's current descendants to [`Self::tree`], while it lives.
+    async fn snapshot_tree(&mut self) {
+        if self.exit.is_none() {
+            self.record_tree(&claude::process_table_async().await);
+        }
+    }
+
+    /// Adds the leader's descendants in `table` to [`Self::tree`] (a later row of a pid wins).
+    fn record_tree(&mut self, table: &[claude::Proc]) {
+        for p in claude::tree_of(table, self.pgid) {
+            match self.tree.iter_mut().find(|t| t.pid == p.pid) {
+                Some(t) => *t = p,
+                None => self.tree.push(p),
+            }
+        }
+    }
+
+    /// Closes stdin, which ends the leader once it has answered: its tree is recorded first.
+    async fn close_stdin(&mut self) {
+        if self.stdin.is_some() {
+            self.snapshot_tree().await;
+            self.stdin = None;
+        }
+    }
+
+    /// After the leader's exit (spec §7.4 step 4): SIGTERM to the residual group and to what
+    /// survives of the recorded tree, SIGKILL to the latter [`DRAIN_AFTER_EXIT`] later. The
+    /// agent's background jobs (a `run_in_background` dev server included) end with the turn.
+    async fn end_background(&mut self) {
+        let _ = claude::killpg(self.pgid, libc::SIGTERM);
+        let tree = std::mem::take(&mut self.tree);
+        if tree.is_empty() {
+            return;
+        }
+        let pgid = self.pgid;
+        let alive = claude::survivors(pgid, &tree, &claude::process_table_async().await);
+        if alive.is_empty() {
+            return;
+        }
+        claude::kill_all(&alive, libc::SIGTERM);
+        tokio::spawn(async move {
+            tokio::time::sleep(DRAIN_AFTER_EXIT).await;
+            let left = claude::survivors(pgid, &tree, &claude::process_table_async().await);
+            claude::kill_all(&left, libc::SIGKILL);
+        });
     }
 }
 
@@ -344,12 +410,11 @@ impl Turn {
                 status = child.wait(), if d.exit.is_none() => {
                     d.exit = Some(status.ok().and_then(|s| s.code()));
                     d.exit_at = Instant::now();
-                    // The agent's background jobs end with the turn (spec §7.4 step 4).
-                    let _ = claude::killpg(pgid, libc::SIGTERM);
+                    d.end_background().await;
                 }
-                Some(cmd) = self.cmd_rx.recv() => self.on_cmd(cmd, &mut d),
+                Some(cmd) = self.cmd_rx.recv() => self.on_cmd(cmd, &mut d).await,
                 () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => {
-                    self.on_deadline(&mut d);
+                    self.on_deadline(&mut d).await;
                 }
             }
         }
@@ -371,10 +436,12 @@ impl Turn {
         match io {
             Io::Stdout(line) => {
                 let inbound = wire::parse(&line);
+                // The answer to `initialize` names the account (email, org): redacted in any
+                // line that carries one, whatever its classification.
                 if !matches!(inbound, Inbound::StreamEvent(_)) {
-                    self.log_stdout(&line).await;
+                    self.log_stdout(&wire::redact_for_log(&line)).await;
                 }
-                self.on_inbound(inbound, d);
+                self.on_inbound(inbound, d).await;
             }
             Io::StdoutTooLong(len) => self.notice(
                 Level::Warn,
@@ -415,7 +482,7 @@ impl Turn {
     }
 
     /// The routing table of spec §7.4.
-    fn on_inbound(&mut self, inbound: Inbound, d: &mut Driver) {
+    async fn on_inbound(&mut self, inbound: Inbound, d: &mut Driver) {
         match inbound {
             Inbound::ControlResponse { request_id, result } => {
                 if d.init_req.as_deref() != Some(request_id.as_str()) {
@@ -472,7 +539,7 @@ impl Turn {
                 let ops = self.normalizer.on_line(&line, now_ms());
                 self.publish(ops);
                 if let Some(result) = result {
-                    self.on_result(result, d);
+                    self.on_result(result, d).await;
                 }
             }
         }
@@ -506,7 +573,7 @@ impl Turn {
     }
 
     /// `result` → close stdin; the process must then exit within [`EXIT_AFTER_RESULT`].
-    fn on_result(&mut self, result: TurnResult, d: &mut Driver) {
+    async fn on_result(&mut self, result: TurnResult, d: &mut Driver) {
         if result.is_error
             && result
                 .text
@@ -518,9 +585,9 @@ impl Turn {
         d.result = Some(result);
         d.result_at = Some(Instant::now());
         if matches!(d.ladder, Some((Step::Interrupt, _))) {
-            d.enter(Step::Eof);
+            d.enter(Step::Eof).await;
         } else {
-            d.stdin = None;
+            d.close_stdin().await;
         }
     }
 
@@ -567,9 +634,9 @@ impl Turn {
         self.changed();
     }
 
-    fn on_cmd(&mut self, cmd: Cmd, d: &mut Driver) {
+    async fn on_cmd(&mut self, cmd: Cmd, d: &mut Driver) {
         let (approval_id, decision, reply) = match cmd {
-            Cmd::Stop(cause, timings) => return self.request_stop(d, cause, timings),
+            Cmd::Stop(cause, timings) => return self.request_stop(d, cause, timings).await,
             Cmd::Respond {
                 approval_id,
                 decision,
@@ -611,33 +678,34 @@ impl Turn {
             interrupt: true, ..
         } = decision
         {
-            self.request_stop(d, StopCause::User, StopTimings::NORMAL);
+            self.request_stop(d, StopCause::User, StopTimings::NORMAL)
+                .await;
         }
     }
 
-    fn request_stop(&mut self, d: &mut Driver, cause: StopCause, timings: StopTimings) {
+    async fn request_stop(&mut self, d: &mut Driver, cause: StopCause, timings: StopTimings) {
         if d.exit.is_some() {
             return;
         }
         d.stop.get_or_insert(cause);
         d.timings = d.timings.min(timings);
         if d.ladder.is_none() {
-            self.start_ladder(d);
+            self.start_ladder(d).await;
         }
     }
 
     /// Step 1 (interrupt) only once the session exists and stdin is open without a result.
-    fn start_ladder(&mut self, d: &mut Driver) {
+    async fn start_ladder(&mut self, d: &mut Driver) {
         if d.init_seen && d.stdin.is_some() && d.result.is_none() {
             let id = self.next_request_id();
             d.send(wire::interrupt_request(&id));
-            d.enter(Step::Interrupt);
+            d.enter(Step::Interrupt).await;
         } else {
-            d.enter(Step::Eof);
+            d.enter(Step::Eof).await;
         }
     }
 
-    fn on_deadline(&mut self, d: &mut Driver) {
+    async fn on_deadline(&mut self, d: &mut Driver) {
         if d.exit.is_some() {
             if d.drain_killed {
                 d.io_abandoned = true;
@@ -649,17 +717,17 @@ impl Turn {
             return;
         }
         match d.ladder.map(|(step, _)| step) {
-            Some(Step::Interrupt) => d.enter(Step::Eof),
-            Some(Step::Eof) => d.enter(Step::Term),
-            Some(Step::Term) => d.enter(Step::Kill),
+            Some(Step::Interrupt) => d.enter(Step::Eof).await,
+            Some(Step::Eof) => d.enter(Step::Term).await,
+            Some(Step::Term) => d.enter(Step::Kill).await,
             Some(Step::Kill) => {}
             None if d.init_req.is_some() => {
                 d.init_timeout = true;
-                self.start_ladder(d);
+                self.start_ladder(d).await;
             }
             None => {
                 d.exit_timeout = true;
-                self.start_ladder(d);
+                self.start_ladder(d).await;
             }
         }
     }

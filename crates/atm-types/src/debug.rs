@@ -62,6 +62,10 @@ pub struct E2eSetup {
     /// A repository with one commit and a `.mcp.json` (warning, not rejection).
     pub mcp_repo: String,
     pub fake_claude: String,
+    /// Which of the variables fake-claude records the presence of (`ANTHROPIC_API_KEY`,
+    /// `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `GIT_DIR`) are set in the
+    /// app's own environment (`scripts/e2e.sh` sets them all: the agents must not get them).
+    pub app_env: Vec<String>,
     /// What phase 1 handed over with `debug_e2e_quit`.
     pub phase1: Option<serde_json::Value>,
 }
@@ -145,7 +149,9 @@ cmd!(DebugE2eWriteFile, "debug_e2e_write_file", E2eWriteReq => ());
 cmd!(DebugE2eExists, "debug_e2e_exists", E2ePathReq => bool);
 cmd!(
     /// Pids of the run's agents still alive: the fake-claude calls and `hang_ignore`
-    /// grandchildren recorded in its `FAKE_CLAUDE_RECORD` (never other processes).
+    /// grandchildren recorded in its `FAKE_CLAUDE_RECORD`, and any fake-claude `-p` or `sleep`
+    /// on the machine whose working directory is inside the run's directory, recorded or not
+    /// (never other processes).
     DebugE2eAgents, "debug_e2e_agents", Empty => Vec<i32>
 );
 cmd!(
@@ -153,8 +159,14 @@ cmd!(
     DebugE2eFailures, "debug_e2e_failures", Empty => Vec<String>
 );
 cmd!(
-    /// Stores the partial report for phase 2 and quits as Cmd+Q does (`NSApp terminate:`).
+    /// Stores the partial report for phase 2 and presses Cmd+Q: a ⌘Q key event posted to the
+    /// app's process through the window server (`CGEventPostToPid`), which AppKit hands to the
+    /// menu's Quit (`NSApp terminate:`).
     DebugE2eQuit, "debug_e2e_quit", ReportReq => ()
+);
+cmd!(
+    /// Reloads the page natively (`-[WKWebView reload]`, as the WebView's "Reload" does).
+    DebugE2eReload, "debug_e2e_reload", Empty => ()
 );
 cmd!(
     /// Prints the report on stdout and exits 0 if every check passed, 1 otherwise.

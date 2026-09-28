@@ -735,6 +735,56 @@ async fn hang_ignore_is_killed_with_its_group_within_13_s() {
     .await;
 }
 
+/// A job the agent leaves running in a process group of its own (a `run_in_background` command
+/// of the real Bash tool, M5) ends with the turn, although the leader exits by itself at EOF and
+/// no signal ever reaches it through the agent's group (spec §7.4 step 4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_job_in_its_own_group_ends_with_the_turn() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Sfondo", "[fake:background]").await;
+    let attempt = f.start(&task).await;
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    let row = &f.db().attempt_processes(&attempt.id).unwrap()[0];
+    assert_eq!(row.exit_code, Some(0));
+    let job = f
+        .record()
+        .iter()
+        .find_map(|r| (r["kind"] == "background").then(|| r["pid"].as_i64()))
+        .flatten()
+        .unwrap() as i32;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while claude::pid_alive(job) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if claude::pid_alive(job) {
+        claude::kill_all(&[job], libc::SIGKILL);
+        panic!("the background job {job} outlived the turn");
+    }
+}
+
+/// The process-table helpers behind it: the tree of a leader, and which of its recorded
+/// descendants are still the same processes (reparented to launchd, same group).
+#[test]
+fn survivors_of_a_recorded_tree() {
+    let table = claude::parse_process_table(
+        "  1     0     1\n 100     1   100\n 101   100   100\n 102   101   102\n 103   102   102\n\
+         200     1   200\n bad row\n",
+    );
+    let tree = claude::tree_of(&table, 100);
+    let pids: Vec<i32> = tree.iter().map(|p| p.pid).collect();
+    assert_eq!(pids, [101, 102, 103]);
+    assert!(claude::tree_of(&table, 1).is_empty());
+    // The leader and 101 exited: 102 moved to launchd, 103 is still under 102, and 101's pid
+    // now names a stranger in another group.
+    let now = claude::parse_process_table(
+        "  1     0     1\n 101     1   300\n 102     1   102\n 103   102   102\n 200     1   200\n",
+    );
+    assert_eq!(claude::survivors(100, &tree, &now), [102, 103]);
+    // While the leader lives, its direct children count too.
+    assert_eq!(claude::survivors(100, &tree, &table), [101, 102, 103]);
+}
+
 /// Exit 1 without `result`: failed / crash, stderr in the transcript.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn crash_is_failed_with_its_stderr() {
@@ -1127,13 +1177,19 @@ fn app_vanished_mid_turn_is_recovered_by_the_next_core() {
         .enable_all()
         .build()
         .unwrap();
-    let (f, task, attempt) = first.block_on(async {
+    let (f, task, attempt, grandchild) = first.block_on(async {
         let f = Flow::new(&[]).await;
         let task = f.task("Interrotto", "[fake:hang_ignore]").await;
         let attempt = f.start(&task).await;
         f.subscribe(&attempt.id).await;
         f.entry("system/init", is_session_init).await;
-        (f, task, attempt)
+        let grandchild = f
+            .record()
+            .iter()
+            .find_map(|r| (r["kind"] == "grandchild").then(|| r["pid"].as_i64()))
+            .flatten()
+            .unwrap() as i32;
+        (f, task, attempt, grandchild)
     });
     let Flow {
         dir, config, core, ..
@@ -1165,8 +1221,10 @@ fn app_vanished_mid_turn_is_recovered_by_the_next_core() {
             .await
             .unwrap();
         assert_eq!(reaped, pgid);
+        // The grandchild leads its own group, like the real Bash tool's commands (M5): the
+        // recovery kills the orphan's descendants too.
         eventually("the orphan group to vanish", Duration::from_secs(5), || {
-            !claude::group_alive(pgid)
+            !claude::group_alive(pgid) && !claude::pid_alive(grandchild)
         })
         .await;
 
@@ -1597,4 +1655,29 @@ fn entry(idx: u32, rev: u32) -> Entry {
             text: format!("{idx}.{rev}"),
         },
     }
+}
+
+/// The CLI's answer to `initialize` names the account (M5 capture): the raw log keeps its
+/// shape, never the email or the organization (spec §7.10).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn raw_log_never_holds_the_account_email() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Log", "[fake:simple]").await;
+    let attempt = f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let p = &f.db().attempt_processes(&attempt.id).unwrap()[0];
+    let dir = runner::log_dir(&f.config.data_dir, &attempt.id, &p.id);
+    let log = std::fs::read_to_string(dir.join("stdout.jsonl")).unwrap();
+    let answer = log
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .find(|v| v["type"] == "control_response")
+        .unwrap();
+    let redacted = atm_core::wire::REDACTED;
+    assert_eq!(
+        answer["response"]["response"]["account"],
+        serde_json::json!({"email": redacted, "organization": redacted,
+                           "subscriptionType": "Claude Max", "apiProvider": "firstParty"})
+    );
+    assert!(!log.contains("fake@example.com") && !log.contains("Fake Org"));
 }

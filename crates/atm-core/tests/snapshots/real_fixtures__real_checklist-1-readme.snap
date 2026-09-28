@@ -1,0 +1,10 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage # Add one line to README.md⏎⏎Append the line `Edited by AI T…
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("acceptEdits") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 ToolCall Bash [$ printf '%s\n' "Edited by AI Task Manager (M5)." >> README.…] Succeeded → (Bash completed with no output)
+ 3 AssistantText Line added. Codeword kept, not written.
+ 4 TurnEnd success is_error=false num_turns=Some(2) denials=0 limit=None text=Some("Line added. Codeword kept, not written.")
+typing previews: 0

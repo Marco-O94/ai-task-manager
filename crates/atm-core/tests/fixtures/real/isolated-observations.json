@@ -1,0 +1,89 @@
+{
+  "add_project_warnings": [
+    "Il progetto contiene .claude/ e .mcp.json: non verranno caricati finché il progetto è Isolato"
+  ],
+  "cli_version": "2.1.283",
+  "failed_checks": [],
+  "g_control_user_project": {
+    "exit": 0,
+    "marker": "SessionStart\nmcp\nmcp\n"
+  },
+  "g_isolated": {
+    "approvals": [],
+    "first_line": "NOT_IN_CONTEXT",
+    "keyword_known": true,
+    "marker": null,
+    "read_claude_md": false,
+    "said": "NOT_IN_CONTEXT\nTANGERINE-7031\nNOT_IN_CONTEXT\nTANGERINE-7031",
+    "session_init": {
+      "api_key_source": "none",
+      "mcp_servers": 0,
+      "model": "claude-sonnet-5",
+      "permission_mode": "acceptEdits",
+      "type": "SessionInit",
+      "warnings": []
+    },
+    "status": "completed",
+    "tool_calls": [
+      {
+        "name": "Bash",
+        "output": "# Project notes\n\nThe project keyword is TANGERINE-7031.",
+        "status": {
+          "state": "Succeeded"
+        },
+        "summary": "$ cat /tmp/atm-real/wt/7982576f-ce7d-47e8-ad74-94e3d4a03fb9/CLAUDE.md 2>/dev/null | head -5"
+      }
+    ]
+  },
+  "turns": {
+    "isolated-1-keyword": {
+      "cost_usd_estimate": 0.16473640000000003,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "acceptEdits",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"cat /tmp/atm-real/wt/7982576f-ce7d-47e8-ad74-94e3d4a03fb9/CLAUDE.md 2>/dev/null | head -5\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "# Project notes\n\nThe project keyword is TANGERINE-7031.",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ cat /tmp/atm-real/wt/7982576f-ce7d-47e8-ad74-94e3d4a03fb9/CLAUDE.md 2>/dev/null | head -5",
+          "tool_use_id": "toolu_01CHmDybUBz3U3YdcJddDAFa",
+          "type": "ToolCall"
+        },
+        {
+          "text": "NOT_IN_CONTEXT\nTANGERINE-7031",
+          "type": "AssistantText"
+        },
+        {
+          "cost_usd_estimate": 0.16473640000000003,
+          "duration_ms": 5246,
+          "is_error": false,
+          "limit": null,
+          "num_turns": 2,
+          "permission_denials": 0,
+          "subtype": "success",
+          "text": "NOT_IN_CONTEXT\nTANGERINE-7031",
+          "type": "TurnEnd"
+        }
+      ],
+      "exit_code": 0,
+      "permission_mode": "acceptEdits",
+      "result_subtype": "success",
+      "resumed": false,
+      "status": "completed",
+      "stop_reason": null
+    }
+  }
+}

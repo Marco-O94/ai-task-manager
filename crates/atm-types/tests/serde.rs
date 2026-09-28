@@ -635,7 +635,7 @@ fn command_names_are_unique_snake_case() {
 fn fixed_texts() {
     assert_eq!(
         CONTINUE_PROMPT,
-        "The previous run was interrupted (app restart). Continue the task."
+        "The previous run was interrupted when the app closed. Continue the task."
     );
     assert_eq!(
         merge_message(" Titolo ", "riga 1\nriga 2\n", "a1"),

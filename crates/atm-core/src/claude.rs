@@ -261,13 +261,23 @@ pub fn candidates(override_path: Option<&Path>, env: &ChildEnv) -> Vec<PathBuf> 
 /// First valid candidate (spec §7.1): `override_path`, `ATM_CLAUDE_PATH` from `env`,
 /// [`fixed_candidates`] from `env`'s `HOME`, then `claude` on `env`'s `PATH` skipping paths
 /// under `$TMPDIR` or containing `/cmux-cli-shims/`. Valid = [`probe_version`] succeeds.
+///
+/// A set `ATM_CLAUDE_PATH` that is not valid ends the search (`None`, "not found"): it points
+/// at `fake-claude` in dev and tests, and falling through to the next candidate would run the
+/// real CLI on the user's subscription without a word (a slow first `--version` is enough).
 pub async fn discover(override_path: Option<&Path>, env: &ChildEnv) -> Option<Discovered> {
+    let pinned = env
+        .get(ATM_CLAUDE_PATH_ENV)
+        .filter(|v| !v.is_empty())
+        .and_then(|p| std::path::absolute(Path::new(p)).ok());
     for path in candidates(override_path, env) {
-        if !path.is_file() {
-            continue;
-        }
-        if let Ok(version) = probe_version(&path, env).await {
+        if path.is_file()
+            && let Ok(version) = probe_version(&path, env).await
+        {
             return Some(Discovered { path, version });
+        }
+        if pinned.as_ref() == Some(&path) {
+            return None;
         }
     }
     None
@@ -628,6 +638,131 @@ pub fn killpg(pgid: i32, signal: i32) -> std::io::Result<()> {
     } else {
         Err(err)
     }
+}
+
+/// One row of `ps -A -o pid=,ppid=,pgid=`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Proc {
+    pub pid: i32,
+    pub ppid: i32,
+    pub pgid: i32,
+}
+
+const PS_ARGS: [&str; 3] = ["-A", "-o", "pid=,ppid=,pgid="];
+/// Bound of the async `ps` of [`process_table_async`].
+const PS_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Parses the output of `ps -A -o pid=,ppid=,pgid=`; malformed rows are skipped.
+pub fn parse_process_table(output: &str) -> Vec<Proc> {
+    output
+        .lines()
+        .filter_map(|l| {
+            let mut it = l.split_whitespace().map(str::parse::<i32>);
+            Some(Proc {
+                pid: it.next()?.ok()?,
+                ppid: it.next()?.ok()?,
+                pgid: it.next()?.ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Every process of the machine (blocking `ps`); empty if `ps` fails.
+pub fn process_table() -> Vec<Proc> {
+    std::process::Command::new("/bin/ps")
+        .args(PS_ARGS)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|out| parse_process_table(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default()
+}
+
+/// [`process_table`] without blocking the runtime, bounded by 2 s; empty on failure.
+pub async fn process_table_async() -> Vec<Proc> {
+    let out = tokio::time::timeout(
+        PS_TIMEOUT,
+        Command::new("/bin/ps")
+            .args(PS_ARGS)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await;
+    match out {
+        Ok(Ok(out)) => parse_process_table(&String::from_utf8_lossy(&out.stdout)),
+        _ => Vec::new(),
+    }
+}
+
+/// The descendants of `pid` (children, grandchildren, …) in `table`, never `pid`, 0 or 1.
+pub fn tree_of(table: &[Proc], pid: i32) -> Vec<Proc> {
+    if pid <= 1 {
+        return Vec::new();
+    }
+    let mut found: Vec<Proc> = Vec::new();
+    let mut frontier = vec![pid];
+    while let Some(parent) = frontier.pop() {
+        for p in table {
+            if p.ppid == parent
+                && p.pid > 1
+                && p.pid != pid
+                && !found.iter().any(|f| f.pid == p.pid)
+            {
+                found.push(*p);
+                frontier.push(p.pid);
+            }
+        }
+    }
+    found
+}
+
+/// The descendants of `pid` in one `ps` snapshot; empty if `ps` fails. Collect them while `pid`
+/// lives: an orphan moves to launchd. M5: the CLI 2.1.283 runs every Bash command in a process
+/// group of its own, which a `killpg` of the agent's group never reaches.
+pub fn descendants(pid: i32) -> Vec<i32> {
+    tree_of(&process_table(), pid)
+        .into_iter()
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// The pids of `snapshot` (a [`tree_of`] `root`, taken while `root` lived) that `now` still
+/// shows as the same process: same group, and a parent that is `root`, launchd (reparented when
+/// `root` exited) or itself in the snapshot. A pid reused since then fails one of the two in
+/// practice.
+pub fn survivors(root: i32, snapshot: &[Proc], now: &[Proc]) -> Vec<i32> {
+    now.iter()
+        .filter(|p| {
+            snapshot.iter().any(|s| {
+                s.pid == p.pid
+                    && s.pgid == p.pgid
+                    && (p.ppid == 1
+                        || p.ppid == root
+                        || snapshot.iter().any(|parent| parent.pid == p.ppid))
+            })
+        })
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// `signal` to each pid of `pids` (never 0, 1 or this process); `ESRCH` ignored.
+pub fn kill_all(pids: &[i32], signal: i32) {
+    let me = std::process::id() as i32;
+    for &pid in pids {
+        if pid > 1 && pid != me {
+            // SAFETY: a plain syscall on integers.
+            unsafe { libc::kill(pid, signal) };
+        }
+    }
+}
+
+/// SIGKILL to the group `pgid` and to every descendant of its leader (collected first).
+pub fn kill_tree(pgid: i32) {
+    let tree = descendants(pgid);
+    let _ = killpg(pgid, libc::SIGKILL);
+    kill_all(&tree, libc::SIGKILL);
 }
 
 /// `kill(pid, 0)` succeeds.

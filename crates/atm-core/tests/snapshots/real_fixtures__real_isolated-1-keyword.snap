@@ -1,0 +1,10 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage # Project keyword⏎⏎Answer in two lines. Line 1, before using…
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("acceptEdits") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 ToolCall Bash [$ cat /tmp/atm-real/wt/7982576f-ce7d-47e8-ad74-94e3d4a03fb9/…] Succeeded → # Project notes⏎⏎The project keyword is TANGERINE-7031.
+ 3 AssistantText NOT_IN_CONTEXT⏎TANGERINE-7031
+ 4 TurnEnd success is_error=false num_turns=Some(2) denials=0 limit=None text=Some("NOT_IN_CONTEXT⏎TANGERINE-7031")
+typing previews: 0

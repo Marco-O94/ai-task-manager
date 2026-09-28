@@ -7,10 +7,11 @@
 //! IPC reads and through the backend's debug helpers (fake-claude's record, git, files).
 //! `scripts/e2e.sh` runs two launches of the app on the same data:
 //!
-//! - phase 1: steps 1–7 and step 8 up to the quit, with two page reloads carried over in
-//!   `sessionStorage` (step 4's order re-read from the DB, the resubscription check after step
-//!   7). The quit runs during `[fake:hang]` and `[fake:hang_ignore]` turns and takes Cmd+Q's
-//!   path (`NSApp terminate:` → `RunEvent::Exit`);
+//! - phase 1: steps 1–7 and step 8 up to the quit, with two native page reloads
+//!   (`-[WKWebView reload]`) carried over in `sessionStorage` (step 4's order re-read from the
+//!   DB, the resubscription check after step 7). The quit runs during `[fake:hang]` and
+//!   `[fake:hang_ignore]` turns: a ⌘Q key event posted through the window server (the menu's
+//!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
 //!   then the report on stdout; the app then exits through `app.exit` (`ExitRequested`)
 //!   during one more `[fake:hang_ignore]` turn, which the script checks afterwards.
@@ -24,9 +25,9 @@ use std::rc::Rc;
 
 use atm_types::debug::{
     DebugE2eAgents, DebugE2eExists, DebugE2eFailures, DebugE2eGatekeeper, DebugE2eGit,
-    DebugE2eLoginScript, DebugE2eQueuePick, DebugE2eQuit, DebugE2eRecord, DebugE2eReport,
-    DebugE2eSetAuth, DebugE2eSetup, DebugE2eWriteFile, DebugForwarderCount, E2eAuthReq, E2eGitOut,
-    E2eGitReq, E2ePathReq, E2eSetup, E2eWriteReq, ReportReq,
+    DebugE2eLoginScript, DebugE2eQueuePick, DebugE2eQuit, DebugE2eRecord, DebugE2eReload,
+    DebugE2eReport, DebugE2eSetAuth, DebugE2eSetup, DebugForwarderCount, E2eAuthReq, E2eGitOut,
+    E2eGitReq, E2ePathReq, E2eSetup, ReportReq,
 };
 use atm_types::{
     AttemptIdReq, AttemptState, CONTINUE_PROMPT, Empty, Entry, EntryBody, FileStatus, GetBoard,
@@ -49,7 +50,10 @@ use crate::selftest::{channel_in_order, csp_violations, sleep};
 const STATE_KEY: &str = "atm-e2e-state";
 const T1_TITLE: &str = "Crea hello [fake:approval]";
 const T2_TITLE: &str = "Secondo task";
-const T3_TITLE: &str = "Conflitto su hello";
+/// T3 and T6 both append their title to hello.txt (`[fake:append]`): once T6 is merged, T3
+/// conflicts with main (step 10).
+const T3_TITLE: &str = "Conflitto su hello [fake:append]";
+const T6_TITLE: &str = "Hola su hello [fake:append]";
 const T4_TITLE: &str = "Limite d'uso [fake:usage_limit]";
 /// Runs through the quit of step 8 next to T1's `[fake:hang]`: ignores interrupt, EOF and
 /// SIGTERM, with a `sleep 300` grandchild, so only the shutdown's `killpg` SIGKILL ends it.
@@ -58,6 +62,18 @@ const T5_TITLE: &str = "Ignora lo stop [fake:hang_ignore]";
 const STREAMED: &str = "Creo hello.txt nel worktree.";
 /// The Notice of a turn stopped by the app's shutdown (`runner::turn::end_notice`).
 const SHUTDOWN_NOTICE: &str = "Esecuzione fermata alla chiusura dell'app";
+/// Variables every agent must be spared (spec §7.2), set in the app's environment by
+/// `scripts/e2e.sh`; fake-claude records their presence.
+const SCRUBBED: [&str; 5] = [
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "GIT_DIR",
+];
+/// A user Stop of a turn that ignores the interrupt, EOF and SIGTERM ends with the SIGKILL of
+/// its group: interrupt 5 s + EOF 3 s + SIGTERM 3 s (spec §7.9), within the 13 s objective.
+const ESCALATION_MS: (f64, f64) = (10_000.0, 13_000.0);
 /// The only command failures the run provokes: the three folders of step 3.
 const EXPECTED_FAILURES: [&str; 3] = ["add_project: Invalid"; 3];
 /// Default wait of a UI reaction.
@@ -84,17 +100,21 @@ struct State {
     t3: String,
     t4: String,
     t5: String,
+    t6: String,
     /// T1's CLI session (`--session-id` of its first turn).
     session: String,
-    /// Positions of T3 and T2 after step 4 (checked again after the relaunch).
+    /// Positions of T3, T6 and T2 after step 4 (checked again after the relaunch).
     t3_position: f64,
+    t6_position: f64,
     t2_position: f64,
     /// Transcript rows of T1 before step 7's reload.
     entries: usize,
     /// Transcript forwarders just before step 7's reload (T1's panel is open).
     forwarders: u32,
-    /// From step 7's click on Stop to the card leaving "In esecuzione".
+    /// From step 7's click on Stop to the end of the `[fake:slow]` turn.
     stop_ms: f64,
+    /// Same for the `[fake:hang_ignore]` turn (the stop escalates to SIGKILL).
+    stop_escalated_ms: f64,
 }
 
 struct Run {
@@ -131,10 +151,17 @@ pub async fn run_if_enabled() {
         Ok(Next::Reload) => {
             run.st.csp += csp_violations();
             store_state(&run.st);
-            if window().location().reload().is_err() {
-                run.fail("reload", "location.reload failed".into());
-                run.report().await;
-            }
+            // The native reload unloads this page: its answer may never come.
+            let why = match ipc::call::<DebugE2eReload>(&Empty {}).await {
+                Err(e) => e.to_string(),
+                Ok(()) => {
+                    sleep(10_000).await;
+                    "the page was not reloaded within 10 s".into()
+                }
+            };
+            let _ = load_state();
+            run.fail("reload", why);
+            run.report().await;
         }
         Ok(Next::Quit) => {
             run.st.csp += csp_violations();
@@ -263,6 +290,8 @@ async fn phase2(run: &mut Run) -> R<Next> {
     run.check("command_failures_phase2", r)?;
     let r = exit_during_turn(run).await;
     run.check("exit_requested_armed", r)?;
+    let r = child_env_scrubbed(run).await;
+    run.check("child_env_scrubbed", r)?;
     Ok(Next::Report)
 }
 
@@ -302,6 +331,35 @@ async fn exit_during_turn(run: &mut Run) -> R<String> {
     }
     Ok(format!(
         "exiting through app.exit with {agents:?} alive in [fake:hang_ignore]"
+    ))
+}
+
+/// Every agent of both phases ran without the credentials, nesting and git variables the app
+/// itself has (spec §7.2): `scripts/e2e.sh` sets them all, fake-claude records their presence.
+async fn child_env_scrubbed(run: &Run) -> R<String> {
+    let missing: Vec<&str> = SCRUBBED
+        .into_iter()
+        .filter(|k| !run.setup.app_env.iter().any(|a| a == k))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "{missing:?} not set in the app's environment (scripts/e2e.sh sets them)"
+        ));
+    }
+    let calls = records("call").await?;
+    for call in &calls {
+        let leaked: Vec<&str> = SCRUBBED
+            .into_iter()
+            .filter(|k| call["env"][k] != false)
+            .collect();
+        if !leaked.is_empty() {
+            return Err(format!("agent {} got {leaked:?}", call["pid"]));
+        }
+    }
+    Ok(format!(
+        "{} agent calls over both phases got none of {SCRUBBED:?}, all set in the app's \
+         environment",
+        calls.len()
     ))
 }
 
@@ -465,25 +523,29 @@ async fn step_3(run: &Run) -> R<String> {
     ))
 }
 
-/// Three tasks (dialog and quick create; T3 is step 10's), reordered inside "Da fare" and T1
-/// moved to another column and back, all by drag-and-drop: todo = [T3, T2, T1], an order that
-/// is not the creation order. Then the reload that re-reads it from the DB.
+/// Four tasks (dialog and quick create; T3 and T6 are step 10's), reordered inside "Da fare"
+/// and T1 moved to another column and back, all by drag-and-drop: todo = [T3, T6, T2, T1],
+/// not the creation order, and [T3, T6, T2] once T1 has left (checked after the restart).
+/// Then the reload that re-reads it from the DB.
 async fn step_4_before_restart(run: &mut Run) -> R<String> {
     let t1 = create_task("Da fare", T1_TITLE, "Scrivi hello.txt nel worktree.").await?;
     let t2 = quick_create("todo", T2_TITLE).await?;
     let t3 = quick_create("todo", T3_TITLE).await?;
+    let t6 = quick_create("todo", T6_TITLE).await?;
     run.st.t1 = t1.clone();
     run.st.t2 = t2.clone();
     run.st.t3 = t3.clone();
-    until_order("todo", &[&t1, &t2, &t3]).await?;
+    run.st.t6 = t6.clone();
+    until_order("todo", &[&t1, &t2, &t3, &t6]).await?;
 
-    // Reorder: T3 to the top, then T2 above T1.
-    let top = rect_top(&card(&t1).ok_or("no T1 card")?) + 2.0;
-    drag(&t3, "todo", top).await?;
-    until_order("todo", &[&t3, &t1, &t2]).await?;
-    let top = rect_top(&card(&t1).ok_or("no T1 card")?) + 2.0;
-    drag(&t2, "todo", top).await?;
-    until_order("todo", &[&t3, &t2, &t1]).await?;
+    // Reorder: T3 to the top, T2 above T1, T6 above T2.
+    let top = |task: &str| Some(rect_top(&card(task)?) + 2.0);
+    drag(&t3, "todo", top(&t1).ok_or("no T1 card")?).await?;
+    until_order("todo", &[&t3, &t1, &t2, &t6]).await?;
+    drag(&t2, "todo", top(&t1).ok_or("no T1 card")?).await?;
+    until_order("todo", &[&t3, &t2, &t1, &t6]).await?;
+    drag(&t6, "todo", top(&t2).ok_or("no T2 card")?).await?;
+    until_order("todo", &[&t3, &t6, &t2, &t1]).await?;
     // Between columns: T1 to "In revisione", then back to the end of "Da fare".
     drag(&t1, "inreview", 10_000.0).await?;
     until("T1 in inreview", UI, || {
@@ -491,9 +553,9 @@ async fn step_4_before_restart(run: &mut Run) -> R<String> {
     })
     .await?;
     drag(&t1, "todo", 10_000.0).await?;
-    until_order("todo", &[&t3, &t2, &t1]).await?;
+    until_order("todo", &[&t3, &t6, &t2, &t1]).await?;
     // The authoritative order, from the backend.
-    let expected = vec![t3.clone(), t2.clone(), t1.clone()];
+    let expected = vec![t3.clone(), t6.clone(), t2.clone(), t1.clone()];
     let repo = run.setup.repo.clone();
     let board = until_async("backend order", UI, || {
         let (repo, expected) = (repo.clone(), expected.clone());
@@ -504,46 +566,58 @@ async fn step_4_before_restart(run: &mut Run) -> R<String> {
     })
     .await?;
     run.st.t3_position = position(&board, &t3);
+    run.st.t6_position = position(&board, &t6);
     run.st.t2_position = position(&board, &t2);
-    Ok("dialog + 2 quick creates; dragged to todo = [T3, T2, T1] (created T1, T2, T3)".into())
+    Ok(
+        "dialog + 3 quick creates; dragged to todo = [T3, T6, T2, T1] (created T1, T2, T3, T6), \
+        every dragover accepted (defaultPrevented) with the dragged id only in the drop's \
+        DataTransfer"
+            .into(),
+    )
 }
 
 /// After the page reload: the board is read again from the DB, in the same order.
 async fn step_4_reload(run: &mut Run) -> R<String> {
     select_main().await?;
-    let (t1, t2, t3) = (run.st.t1.clone(), run.st.t2.clone(), run.st.t3.clone());
-    until_order("todo", &[&t3, &t2, &t1]).await?;
+    let st = &run.st;
+    let (t1, t2, t3, t6) = (&st.t1, &st.t2, &st.t3, &st.t6);
+    until_order("todo", &[t3, t6, t2, t1]).await?;
     let board = board(&run.setup.repo).await?;
-    if ids_in(&board, TaskStatus::Todo) != [t3, t2, t1] {
+    if ids_in(&board, TaskStatus::Todo) != [t3.clone(), t6.clone(), t2.clone(), t1.clone()] {
         return Err("backend order changed across the reload".into());
     }
-    Ok("after a page reload the board re-read from the DB keeps todo = [T3, T2, T1]".into())
+    Ok(
+        "after a native page reload the board re-read from the DB keeps todo = [T3, T6, T2, T1]"
+            .into(),
+    )
 }
 
 /// Step 4's restart for real: a new process on the same DB (T1 has left "Da fare" since and
-/// T5 went through it): the DOM and the backend keep [T3, T2] at their positions.
+/// T5 went through it): the DOM and the backend keep the dragged [T3, T6, T2] (created T2,
+/// T3, T6) at their positions.
 async fn step_4_relaunch(run: &mut Run) -> R<String> {
     until("board after the relaunch", 20_000, || {
         q("[data-view=sidebar]")
     })
     .await?;
     select_main().await?;
-    let (t2, t3) = (run.st.t2.clone(), run.st.t3.clone());
-    until_order("todo", &[&t3, &t2]).await?;
+    let st = &run.st;
+    let (t2, t3, t6) = (&st.t2, &st.t3, &st.t6);
+    until_order("todo", &[t3, t6, t2]).await?;
     let board = board(&run.setup.repo).await?;
-    let positions = (position(&board, &t3), position(&board, &t2));
-    if ids_in(&board, TaskStatus::Todo) != [t3, t2]
-        || positions != (run.st.t3_position, run.st.t2_position)
+    let positions = [t3, t6, t2].map(|t| position(&board, t));
+    let before = [st.t3_position, st.t6_position, st.t2_position];
+    if ids_in(&board, TaskStatus::Todo) != [t3.clone(), t6.clone(), t2.clone()]
+        || positions != before
     {
         return Err(format!(
-            "todo after the relaunch {:?} at {positions:?}, was at {:?}",
+            "todo after the relaunch {:?} at {positions:?}, was at {before:?}",
             ids_in(&board, TaskStatus::Todo),
-            (run.st.t3_position, run.st.t2_position)
         ));
     }
     Ok(format!(
-        "after the app's restart todo = [T3, T2] in the DOM and in the DB, positions {positions:?} \
-         unchanged"
+        "after the app's restart todo = [T3, T6, T2] (dragged; created T2, T3, T6) in the DOM \
+         and in the DB, positions {positions:?} unchanged"
     ))
 }
 
@@ -627,6 +701,14 @@ async fn step_5(run: &mut Run) -> R<String> {
         panel_header().contains("In revisione").then_some(())
     })
     .await?;
+    let d = detail(&t1).await?;
+    let turn = d.processes.last().ok_or("no process")?;
+    if d.task.status != TaskStatus::InReview || turn.status != ProcessStatus::Completed {
+        return Err(format!(
+            "DB: task {:?}, turn {:?}",
+            d.task.status, turn.status
+        ));
+    }
     let calls = calls().await?;
     let argv = calls.first().ok_or("fake-claude never called")?;
     if !argv.iter().any(|a| a == "--permission-mode=acceptEdits") {
@@ -649,7 +731,8 @@ async fn step_5(run: &mut Run) -> R<String> {
         "spinner in the running badge → approval card → Consenti sempre (card and badges \
          cleared, Bash entry Succeeded, fake-claude got allow + updatedPermissions \
          Bash(echo hello) for the session) → typing {previews:?} → {} entries → TurnEnd \
-         Completato → In revisione; session {}",
+         Completato → In revisione (column, panel and DB: task inreview, turn completed); \
+         session {}",
         streamed - before,
         run.st.session
     ))
@@ -722,7 +805,10 @@ async fn step_7(run: &mut Run) -> R<String> {
         (turn_ends() > ends).then_some(())
     })
     .await?;
-    wait_done(&t1, n).await?;
+    let done = wait_done(&t1, n).await?;
+    if done.status != ProcessStatus::Completed {
+        return Err(format!("[fake:simple] follow-up ended {:?}", done.status));
+    }
     wait_idle(&t1, "inreview").await?;
     let calls = calls().await?;
     let argv = calls.last().ok_or("no call")?;
@@ -766,14 +852,74 @@ async fn step_7(run: &mut Run) -> R<String> {
     if elapsed > 5_000.0 || !agents.is_empty() {
         return Err(format!("stop took {elapsed} ms, agents left {agents:?}"));
     }
+    wait_idle(&t1, "inreview").await?;
+    let escalated = stop_escalates(run).await?;
     Ok(format!(
-        "follow-up used {resume} with the remembered rule; [fake:slow] killed/user_stop \
-         {elapsed:.0} ms after Stop (card updated after {seen:.0} ms), no fake-claude left"
+        "follow-up [fake:simple] completed with {resume} and the remembered rule; [fake:slow] \
+         killed/user_stop {elapsed:.0} ms after Stop (card updated after {seen:.0} ms), no \
+         agent left; {escalated}"
     ))
 }
 
-/// Cmd+R: the reload dropped the forwarder of the open transcript; reopening the task
-/// subscribes again and restores the view.
+/// Stop of a turn that ignores the interrupt, EOF and SIGTERM (`[fake:hang_ignore]`, with a
+/// `sleep` grandchild): only the SIGKILL of its process group ends it, after the whole
+/// sequence of spec §7.9 and within its 13 s objective; nothing of the group survives.
+async fn stop_escalates(run: &mut Run) -> R<String> {
+    let t1 = run.st.t1.clone();
+    let grandchildren = recorded_grandchildren().await?.len();
+    let inits = session_inits();
+    let n = follow_up(&t1, "Ignora lo stop [fake:hang_ignore]").await?;
+    until_async("hang_ignore grandchild", TURN, || async {
+        (recorded_grandchildren().await.ok()?.len() > grandchildren).then_some(())
+    })
+    .await?;
+    // Past `init`: the stop starts with the interrupt.
+    until("hang_ignore running", TURN, || {
+        (badge(&t1, "running").is_some() && session_inits() > inits).then_some(())
+    })
+    .await?;
+    let alive = agents().await?;
+    if alive.len() != 2 {
+        return Err(format!("agents before the stop {alive:?}"));
+    }
+    let stop = wait_q("[data-view=task-panel] [data-action=stop]").await?;
+    let t0 = js_sys::Date::now();
+    click(&stop);
+    let last = until_async("hang_ignore stopped", 20_000, || {
+        let t1 = t1.clone();
+        async move {
+            let d = detail(&t1).await.ok()?;
+            let last = d.processes.get(n - 1)?.clone();
+            (last.status != ProcessStatus::Running).then_some(last)
+        }
+    })
+    .await?;
+    let elapsed = last.finished_at.map_or(f64::INFINITY, |f| f as f64 - t0);
+    run.st.stop_escalated_ms = elapsed;
+    let left = agents().await?;
+    if (last.status, last.stop_reason) != (ProcessStatus::Killed, Some(StopReason::UserStop))
+        || !(ESCALATION_MS.0..=ESCALATION_MS.1).contains(&elapsed)
+        || !left.is_empty()
+    {
+        return Err(format!(
+            "[fake:hang_ignore] ended {:?}/{:?} {elapsed:.0} ms after Stop, agents left {left:?}",
+            last.status, last.stop_reason
+        ));
+    }
+    until("card stopped", UI, || {
+        (badge(&t1, "running").is_none() && badge(&t1, "stopped").is_some()).then_some(())
+    })
+    .await?;
+    wait_idle(&t1, "inreview").await?;
+    Ok(format!(
+        "[fake:hang_ignore] (ignores interrupt, EOF, SIGTERM) killed/user_stop {elapsed:.0} ms \
+         after Stop (interrupt 5 s + EOF 3 s + SIGTERM 3 s → SIGKILL of the group), its \
+         fake-claude and sleep {alive:?} gone"
+    ))
+}
+
+/// The page reload (`location.reload()`: the app binds no Cmd+R) dropped the forwarder of the
+/// open transcript; reopening the task subscribes again and restores the view.
 async fn reload_resubscribes(run: &mut Run) -> R<String> {
     let after_reload = forwarder_count().await?;
     select_main().await?;
@@ -802,9 +948,10 @@ async fn step_8_quit(run: &mut Run) -> R<String> {
     let t1 = run.st.t1.clone();
     let t5 = create_task("Da fare", T5_TITLE, "").await?;
     run.st.t5 = t5.clone();
+    let grandchildren = recorded_grandchildren().await?.len();
     start_attempt(&t5, "acceptEdits").await?;
     until_async("hang_ignore grandchild", TURN, || async {
-        (!recorded_grandchildren().await.ok()?.is_empty()).then_some(())
+        (recorded_grandchildren().await.ok()?.len() > grandchildren).then_some(())
     })
     .await?;
     until("T5 running", TURN, || badge(&t5, "running")).await?;
@@ -824,7 +971,7 @@ async fn step_8_quit(run: &mut Run) -> R<String> {
         return Err(format!("agents before the quit {agents:?}"));
     }
     Ok(format!(
-        "quitting like Cmd+Q with {agents:?} alive ([fake:hang], [fake:hang_ignore] + its sleep)"
+        "pressing Cmd+Q with {agents:?} alive ([fake:hang], [fake:hang_ignore] + its sleep)"
     ))
 }
 
@@ -868,25 +1015,48 @@ async fn step_8_relaunch(run: &mut Run) -> R<String> {
         }
         cut.push(d);
     }
-    let before = calls().await?.len();
-    let n = cut[0].processes.len() + 1;
-    let interrupted = badge(&t1, "interrupted").ok_or("no Interrotto on T1")?;
-    click(&find_in(&interrupted, "button").ok_or("no Continua button")?);
-    let argv = new_call(before).await?;
-    let resume = format!("--resume={}", run.st.session);
-    if !argv.contains(&resume) {
-        return Err(format!("Continua argv {argv:?}"));
-    }
-    let last = wait_done(&t1, n).await?;
-    wait_idle(&t1, "inreview").await?;
-    if last.prompt != CONTINUE_PROMPT || last.status != ProcessStatus::Completed {
-        return Err(format!("Continua turn {:?} {:?}", last.prompt, last.status));
+    let t5_worktree = cut[1]
+        .attempt
+        .as_ref()
+        .ok_or("no T5 attempt")?
+        .worktree_path
+        .clone();
+    let t5_session = calls_in(&t5_worktree)
+        .await?
+        .first()
+        .and_then(|argv| flag(argv, "--session-id="))
+        .ok_or("no --session-id for T5")?;
+    let mut resumed = Vec::new();
+    for (task, session, d) in [(&t1, &run.st.session, &cut[0]), (&t5, &t5_session, &cut[1])] {
+        resumed.push(continue_resumes(task, session, d.processes.len() + 1).await?);
     }
     Ok(format!(
         "no agent of the run (fake-claude or grandchild) after the quit; [fake:hang] and \
          [fake:hang_ignore] both killed/app_shutdown with «{SHUTDOWN_NOTICE}»; \
-         \"Interrotto – Continua\" on both → {resume}"
+         \"Interrotto – Continua\" on both, each Continua → {resumed:?}, turn completed"
     ))
+}
+
+/// Clicks the Continua of `task`'s "Interrotto" badge: the follow-up is `CONTINUE_PROMPT`
+/// with `--resume=<session>`, and its turn (the `n`th) completes. Returns the flag.
+async fn continue_resumes(task: &str, session: &str, n: usize) -> R<String> {
+    let before = calls().await?.len();
+    let interrupted = badge(task, "interrupted").ok_or("no Interrotto")?;
+    click(&find_in(&interrupted, "button").ok_or("no Continua button")?);
+    let argv = new_call(before).await?;
+    let resume = format!("--resume={session}");
+    if !argv.contains(&resume) || argv.iter().any(|a| a.starts_with("--session-id=")) {
+        return Err(format!("Continua argv {argv:?}, expected {resume}"));
+    }
+    let last = wait_done(task, n).await?;
+    wait_idle(task, "inreview").await?;
+    if last.prompt != CONTINUE_PROMPT || last.status != ProcessStatus::Completed {
+        return Err(format!("Continua turn {:?} {:?}", last.prompt, last.status));
+    }
+    if badge(task, "interrupted").is_some() {
+        return Err("Interrotto still shown after Continua".into());
+    }
+    Ok(resume)
 }
 
 /// Merge with `main` checked out and clean: Fatto, worktree removed, squash commit on main.
@@ -927,26 +1097,55 @@ async fn step_9(run: &mut Run) -> R<String> {
     if branch.stdout.trim().is_empty() {
         return Err(format!("branch {} deleted", attempt.1));
     }
+    let merged = closed_in_db(&t1, &attempt.0, AttemptState::Merged, TaskStatus::Done).await?;
+    if merged.merge_commit.as_deref() != Some(head) {
+        return Err(format!(
+            "DB merge_commit {:?} vs main {head}",
+            merged.merge_commit
+        ));
+    }
     Ok(format!(
         "squash {head} \"{subject}\" on main (fast-forward of the checkout), worktree removed \
-         (directory and `git worktree list`), branch {} kept; the panel shows the merged \
-         attempt with no failed command",
+         (directory and `git worktree list`), branch {} kept; DB: task done, attempt merged \
+         with that merge_commit, worktree removed; the panel shows the merged attempt with no \
+         failed command",
         attempt.1
     ))
 }
 
-/// A second task (T3, created in step 4) conflicting with main → "Conflitti con main" listing
-/// hello.txt → "Risolvi con l'agente": the app's conflict prompt, for which fake-claude plays
-/// `resolve_merge` on the target named in it → merge commit on the branch → merge ok.
+/// Two tasks branch from main (T1's hello.txt) and append different lines to hello.txt
+/// (`[fake:append]`); T6 is merged first, so T3, the second, conflicts with main →
+/// "Conflitti con main" listing hello.txt → "Risolvi con l'agente": the app's conflict prompt,
+/// for which fake-claude plays `resolve_merge` (recorded) on the target named in it → merge
+/// commit on the branch → merge ok.
 async fn step_10(run: &mut Run) -> R<String> {
     let repo = run.setup.repo.clone();
-    let t3 = run.st.t3.clone();
-    commit_on_main(&repo, "ciao dal target\n", "target: ciao").await?;
-    start_attempt(&t3, "acceptEdits").await?;
-    wait_turn(&t3, "inreview").await?;
-    commit_on_main(&repo, "hola dal target\n", "target: hola").await?;
-    let attempt = detail(&t3).await?.attempt.ok_or("no attempt")?;
+    let (t3, t6) = (run.st.t3.clone(), run.st.t6.clone());
+    let mut branches = Vec::new();
+    for (task, line) in [(&t6, "Hola su hello"), (&t3, "Conflitto su hello")] {
+        start_attempt(task, "acceptEdits").await?;
+        wait_turn(task, "inreview").await?;
+        let branch = detail(task).await?.attempt.ok_or("no attempt")?.branch;
+        let hello = git(&repo, &["show", &format!("{branch}:hello.txt")]).await?;
+        if hello.stdout != format!("hello\n{line}\n") {
+            return Err(format!("{branch}: hello.txt {:?}", hello.stdout));
+        }
+        branches.push(branch);
+    }
+    // T6 first: a clean squash merge into the checked-out main.
+    merge_via_ui(&t6, true).await?;
+    until("T6 Fatto", UI, || (column_of(&t6)? == "done").then_some(())).await?;
+    closed_cleanly("Mergiato in main con il commit").await?;
+    let t6_attempt = detail(&t6).await?.closed_attempts;
+    let t6_attempt = t6_attempt.last().ok_or("no closed T6 attempt")?;
+    closed_in_db(&t6, &t6_attempt.id, AttemptState::Merged, TaskStatus::Done).await?;
+    let hello = git(&repo, &["show", "main:hello.txt"]).await?;
+    if hello.stdout != "hello\nHola su hello\n" {
+        return Err(format!("main:hello.txt after T6 {:?}", hello.stdout));
+    }
 
+    open_panel(&t3).await?;
+    let attempt = detail(&t3).await?.attempt.ok_or("no attempt")?;
     tab("Modifiche").await?;
     let alert = until("conflict alert", UI, || {
         q_all("[data-view=diff] [data-name=Alert]")
@@ -989,15 +1188,30 @@ async fn step_10(run: &mut Run) -> R<String> {
             last.status, last.result_subtype
         ));
     }
-    // The follow-up is the app's prompt (no `[fake:…]` tag): fake-claude recognized it and
-    // merged the target the prompt names.
+    // The follow-up is the app's own prompt (the button adds no `[fake:…]` tag): fake-claude
+    // played `resolve_merge` for it (its record says so) on the target the prompt names.
+    let pid = records("call")
+        .await?
+        .get(before)
+        .and_then(|c| c["pid"].as_u64())
+        .ok_or("no pid for the resolve call")?;
+    let scenarios: Vec<String> = records("turn")
+        .await?
+        .iter()
+        .filter(|t| t["pid"].as_u64() == Some(pid))
+        .filter_map(|t| t["scenario"].as_str().map(str::to_owned))
+        .collect();
     if !last
         .prompt
         .starts_with("This branch conflicts with `main` in: hello.txt.")
         || last.prompt.contains("[fake:")
         || !argv.iter().any(|a| a.starts_with("--resume="))
+        || scenarios != ["resolve_merge"]
     {
-        return Err(format!("resolve turn {:?} {argv:?}", last.prompt));
+        return Err(format!(
+            "resolve turn {:?} {argv:?}, scenarios {scenarios:?}",
+            last.prompt
+        ));
     }
     let merged_main = attempt_entries(&attempt.id)
         .await?
@@ -1025,17 +1239,18 @@ async fn step_10(run: &mut Run) -> R<String> {
     until("T3 Fatto", UI, || (column_of(&t3)? == "done").then_some(())).await?;
     closed_cleanly("Mergiato in main con il commit").await?;
     worktree_gone(&repo, &attempt.worktree_path).await?;
+    closed_in_db(&t3, &attempt.id, AttemptState::Merged, TaskStatus::Done).await?;
     let hello = git(&repo, &["show", "main:hello.txt"]).await?;
-    if hello.stdout != "hello\nhola dal target\n" {
+    if hello.stdout != "hello\nConflitto su hello\nhello\nHola su hello\n" {
         return Err(format!("merged hello.txt {:?}", hello.stdout));
     }
-    Ok(
-        "Conflitti con main listing hello.txt (alert and get_branch_status), Merge blocked → \
-        Risolvi con l'agente sends the app's conflict prompt (no [fake:] tag): fake-claude plays \
-        resolve_merge and runs `git merge main`, the target named in the prompt → merge commit \
-        on the branch → squash merged, hello.txt = both versions"
-            .into(),
-    )
+    Ok(format!(
+        "T6 and T3 ({branches:?}) both appended to hello.txt; T6 squash merged first → T3 \
+         shows Conflitti con main listing hello.txt (alert and get_branch_status), Merge \
+         blocked → Risolvi con l'agente sends the app's conflict prompt: fake-claude recorded \
+         scenario resolve_merge and ran `git merge main`, the target named in the prompt → \
+         merge commit on the branch → squash merged, hello.txt = both versions"
+    ))
 }
 
 /// Discard: worktree removed, branch kept, task back in "Da fare".
@@ -1059,9 +1274,10 @@ async fn step_11(run: &mut Run) -> R<String> {
     if listed.stdout.trim().is_empty() {
         return Err(format!("branch {branch} deleted"));
     }
+    closed_in_db(&t2, &id, AttemptState::Discarded, TaskStatus::Todo).await?;
     Ok(format!(
         "worktree removed (directory and `git worktree list`), branch {branch} kept, task in \
-         Da fare"
+         Da fare; DB: attempt discarded, worktree removed, task todo"
     ))
 }
 
@@ -1083,11 +1299,25 @@ async fn step_12(run: &mut Run) -> R<String> {
             .then_some(())
     })
     .await?;
+    let limited = detail(&t4).await?;
+    let limited = limited.processes.last().ok_or("no process")?;
+    if (limited.status, limited.stop_reason)
+        != (ProcessStatus::Failed, Some(StopReason::UsageLimit))
+        || env_paused().await?.is_none()
+    {
+        return Err(format!(
+            "usage_limit turn {:?}/{:?}, core not paused",
+            limited.status, limited.stop_reason
+        ));
+    }
     click(&button_in(&banner, "Riprendi").ok_or("no Riprendi")?);
     until("banner gone", UI, || {
         q("[data-banner=paused]").is_none().then_some(())
     })
     .await?;
+    if let Some(paused) = env_paused().await? {
+        return Err(format!("still paused after Riprendi: {paused:?}"));
+    }
 
     let big = channel_big(&t4).await;
     run.check("channel_big_ok", big)?;
@@ -1105,6 +1335,13 @@ async fn step_12(run: &mut Run) -> R<String> {
     if failed.stop_reason != Some(StopReason::AuthFailure) {
         return Err(format!("auth_fail turn ended {:?}", failed.stop_reason));
     }
+    let auth = ipc::call::<GetEnv>(&GetEnvReq { force: false })
+        .await
+        .map_err(|e| e.to_string())?
+        .auth;
+    if auth != atm_types::AuthState::LoggedOut {
+        return Err(format!("get_env after auth_fail: {auth:?}"));
+    }
     set_auth(true).await?;
     click(&wait_q("[data-testid=recheck]:not([disabled])").await?);
     until("board after logging in again", UI, || {
@@ -1112,8 +1349,9 @@ async fn step_12(run: &mut Run) -> R<String> {
     })
     .await?;
     Ok(
-        "pause banner → Riprendi clears it; [fake:auth_fail] (auth_failure) brings back the \
-        login gate alone; logged in again → board"
+        "[fake:usage_limit] failed/usage_limit pauses the core (get_env) → pause banner → \
+        Riprendi clears banner and pause; [fake:auth_fail] (auth_failure, get_env loggedOut) \
+        brings back the login gate alone; logged in again → board"
             .into(),
     )
 }
@@ -1313,21 +1551,6 @@ async fn merge_via_ui(task: &str, checked_out: bool) -> R<String> {
     Ok(commit)
 }
 
-/// The user's own commit on `main` in the repository's checkout.
-async fn commit_on_main(repo: &str, hello: &str, message: &str) -> R {
-    ipc::call::<DebugE2eWriteFile>(&E2eWriteReq {
-        path: format!("{repo}/hello.txt"),
-        content: hello.into(),
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    let out = git(repo, &["commit", "-q", "-a", "-m", message]).await?;
-    if out.code != 0 {
-        return Err(format!("commit on main: {}", out.stderr));
-    }
-    Ok(())
-}
-
 async fn open_panel(task: &str) -> R {
     let sel = format!("[data-view=task-panel][data-task-id=\"{task}\"]");
     if q(&sel).is_none() {
@@ -1418,6 +1641,14 @@ async fn set_auth(logged_in: bool) -> R {
         .map_err(|e| e.to_string())
 }
 
+/// `EnvStatus.paused` as the backend reports it (the 60 s cache holds the pause itself).
+async fn env_paused() -> R<Option<String>> {
+    ipc::call::<GetEnv>(&GetEnvReq { force: false })
+        .await
+        .map(|env| env.paused)
+        .map_err(|e| e.to_string())
+}
+
 async fn forwarder_count() -> R<u32> {
     ipc::call::<DebugForwarderCount>(&Empty {})
         .await
@@ -1459,6 +1690,21 @@ async fn calls() -> R<Vec<Vec<String>>> {
     Ok(records("call")
         .await?
         .into_iter()
+        .filter_map(|l| serde_json::from_value(l["argv"].clone()).ok())
+        .collect())
+}
+
+/// argv of the fake-claude `-p` calls that ran in `worktree`, in order.
+async fn calls_in(worktree: &str) -> R<Vec<Vec<String>>> {
+    let name = worktree.rsplit('/').next().unwrap_or(worktree);
+    Ok(records("call")
+        .await?
+        .into_iter()
+        .filter(|l| {
+            l["cwd"]
+                .as_str()
+                .is_some_and(|cwd| cwd == worktree || cwd.ends_with(&format!("/{name}")))
+        })
         .filter_map(|l| serde_json::from_value(l["argv"].clone()).ok())
         .collect())
 }
@@ -1793,8 +2039,9 @@ fn event(class: &str, kind: &str, props: &[(&str, JsValue)]) -> R<web_sys::Event
     Ok(ev.unchecked_into())
 }
 
-fn fire(target: &Element, ev: &web_sys::Event) {
-    let _ = target.dispatch_event(ev);
+/// Dispatches `ev`; `false` if a listener cancelled it (`preventDefault`).
+fn fire(target: &Element, ev: &web_sys::Event) -> bool {
+    target.dispatch_event(ev).unwrap_or(false)
 }
 
 /// Sets an input's or textarea's value and fires `input` (Leptos' `bind:value`).
@@ -1824,18 +2071,26 @@ fn key_with(el: &Element, key: &str, meta: bool) -> R {
     Ok(())
 }
 
-/// HTML5 drag of a card onto a column at `client_y`: `dragstart` on the card, `dragover` and
-/// `drop` on the column's card list, `dragend` on the card, sharing one `DataTransfer`.
+/// HTML5 drag of a card onto a column at `client_y`: `dragstart` on the card, `dragenter` and
+/// `dragover` on the column's card list, `drop` there, `dragend` on the card. What a native
+/// WebKit drag needs is asserted, since synthetic events would go through without it:
+/// `dragstart` is not cancelled and puts the id in the `DataTransfer`; `dragover` is cancelled
+/// (without that WebKit never fires `drop`) while its `DataTransfer` exposes no data (WebKit's
+/// protected mode during a drag); `drop` is cancelled too (no default action on the dropped
+/// text). (`effectAllowed` cannot be checked: WebKit ignores it on a constructed
+/// `DataTransfer`, the synthetic `dragstart` reads back "none".)
 async fn drag(task: &str, status: &str, client_y: f64) -> R {
     let card = card(task).ok_or(format!("no card {task}"))?;
     let list = q(&format!("[data-column={status}] [data-card-list]"))
         .ok_or(format!("no column {status}"))?;
-    let dt = web_sys::DataTransfer::new().map_err(|e| format!("DataTransfer: {e:?}"))?;
+    let new_dt = || web_sys::DataTransfer::new().map_err(|e| format!("DataTransfer: {e:?}"));
+    let dt = new_dt()?;
+    let protected = new_dt()?;
     let rect = list.get_bounding_client_rect();
     let x = rect.left() + rect.width() / 2.0;
     // Past the column's end: just inside its list, below every card.
     let y = client_y.min(rect.bottom() - 1.0);
-    let props = |y: f64| {
+    let props = |dt: &web_sys::DataTransfer, y: f64| {
         [
             ("dataTransfer", JsValue::from(dt.clone())),
             ("clientX", x.into()),
@@ -1843,14 +2098,32 @@ async fn drag(task: &str, status: &str, client_y: f64) -> R {
         ]
     };
     let start = rect_top(&card) + 2.0;
-    fire(&card, &event("DragEvent", "dragstart", &props(start))?);
+    if !fire(&card, &event("DragEvent", "dragstart", &props(&dt, start))?) {
+        return Err("dragstart cancelled: WebKit would not start the drag".into());
+    }
+    let carried = dt.get_data("text/plain").unwrap_or_default();
+    if carried != task {
+        return Err(format!("dragstart set {carried:?}"));
+    }
     // `DragCtx::start` records the dragged card in a zero-delay timeout.
     sleep(30).await;
-    fire(&list, &event("DragEvent", "dragenter", &props(y))?);
-    fire(&list, &event("DragEvent", "dragover", &props(y))?);
+    fire(
+        &list,
+        &event("DragEvent", "dragenter", &props(&protected, y))?,
+    );
+    if fire(
+        &list,
+        &event("DragEvent", "dragover", &props(&protected, y))?,
+    ) {
+        return Err(format!(
+            "dragover on {status} not cancelled: WebKit would not drop"
+        ));
+    }
     sleep(30).await;
-    fire(&list, &event("DragEvent", "drop", &props(y))?);
-    fire(&card, &event("DragEvent", "dragend", &props(y))?);
+    if fire(&list, &event("DragEvent", "drop", &props(&dt, y))?) {
+        return Err(format!("drop on {status} not cancelled"));
+    }
+    fire(&card, &event("DragEvent", "dragend", &props(&dt, y))?);
     Ok(())
 }
 

@@ -6,11 +6,15 @@
 // `app (debug)` = `cargo tauri dev`: build di debug della shell + `trunk serve` della UI su :1420, con
 // ricarica a ogni salvataggio. Usa il `claude` reale (e il tuo abbonamento quando lanci un agente).
 //
-// `app (debug, fake-claude)` fa lo stesso ma con fake-claude al posto del CLI: nessuna chiamata API,
-// nessuna quota consumata. Il prompt sceglie lo scenario con `[fake:NOME]` (simple, approval, slow,
-// hang, crash, usage_limit, auth_fail, ... in crates/atm-core/src/bin/fake-claude.rs).
-// Attenzione: l'impostazione "Percorso di claude" dell'app vince su ATM_CLAUDE_PATH, e DB/worktree
-// sono gli stessi dell'app con il claude reale.
+// `app (debug, fake-claude)` fa lo stesso ma con fake-claude al posto del CLI (ATM_CLAUDE_PATH): il
+// prompt sceglie lo scenario con `[fake:NOME]` (simple, approval, slow, hang, crash, usage_limit,
+// auth_fail, ... in crates/atm-core/src/bin/fake-claude.rs). L'impostazione "Percorso di claude"
+// dell'app vince su ATM_CLAUDE_PATH (spec §7.1): se nel DB dell'app è impostata, il task si rifiuta
+// di partire (svuotala nelle Impostazioni), così nessun agente è il claude reale e non si consuma
+// quota. ATM_CLAUDE_PATH, quando è impostata, è vincolante: se fake-claude non risponde a
+// `--version` entro 5 s (per esempio mentre `cargo tauri dev` compila), l'app mostra "Claude Code
+// non trovato" (poi "Ricontrolla") invece di ripiegare su `~/.local/bin/claude`.
+// DB, progetti e worktree restano quelli dell'app normale (stessa cartella dati).
 //
 // `UI nel browser (mock)` = solo frontend con backend finto, su :1421 (così non collide con :1420
 // di `cargo tauri dev`). `http://localhost:1421/?task=task-inreview` apre subito un pannello task.
@@ -28,8 +32,13 @@
   {
     "label": "app (debug, fake-claude)",
     "command": "sh",
-    // fake-claude va compilato prima: `cargo tauri dev` builda solo la shell.
-    "args": ["-c", "cargo build -p atm-core --bin fake-claude && cargo tauri dev"],
+    // fake-claude va compilato prima: `cargo tauri dev` builda solo la shell. La guardia legge (in
+    // sola lettura) `claude_path_override` dal DB dell'app e non avvia nulla se è impostato o se il
+    // DB non si legge.
+    "args": [
+      "-c",
+      "db=\"$HOME/Library/Application Support/dev.aitaskmanager.desktop/atm.sqlite3\"; if [ -f \"$db\" ] && [ -n \"$(sqlite3 -readonly \"$db\" \"SELECT value FROM settings WHERE key = 'claude_path_override' AND value <> 'null'\" 2>&1)\" ]; then echo 'Non avvio: Percorso di claude impostato nell app (vincerebbe su fake-claude; svuotalo nelle Impostazioni) o DB non leggibile.' >&2; exit 1; fi; cargo build -p atm-core --bin fake-claude && cargo tauri dev"
+    ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": { "ATM_CLAUDE_PATH": "$ZED_WORKTREE_ROOT/target/debug/fake-claude" },
     "reveal": "always",

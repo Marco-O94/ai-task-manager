@@ -698,14 +698,20 @@ async fn is_our_orphan(p: &ProcessRow, pgid: i32) -> bool {
             .is_some_and(|command| command.contains(&claude) && command.contains(&p.session_id))
 }
 
-/// SIGTERM to the group, up to [`ORPHAN_TERM`] for it to go, then SIGKILL.
+/// SIGTERM to the group, up to [`ORPHAN_TERM`] for it to go, then SIGKILL; the leader's
+/// descendants (collected before the SIGTERM: the CLI's Bash commands run in groups of their
+/// own, M5) get SIGKILL too if still alive.
 async fn kill_orphan(pgid: i32) {
+    let mut tree = claude::descendants(pgid);
     let _ = claude::killpg(pgid, libc::SIGTERM);
     let deadline = tokio::time::Instant::now() + ORPHAN_TERM;
     while claude::group_alive(pgid) && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(ORPHAN_POLL).await;
     }
     if claude::group_alive(pgid) {
+        tree.extend(claude::descendants(pgid));
         let _ = claude::killpg(pgid, libc::SIGKILL);
     }
+    let alive: Vec<i32> = tree.into_iter().filter(|&p| claude::pid_alive(p)).collect();
+    claude::kill_all(&alive, libc::SIGKILL);
 }

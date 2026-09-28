@@ -569,7 +569,7 @@ pub fn interrupted_by_app(reason: Option<StopReason>) -> bool {
     )
 }
 
-/// "Continua" on a turn interrupted by an app restart: follow-up with `CONTINUE_PROMPT`,
+/// "Continua" on a turn interrupted by the app closing: follow-up with `CONTINUE_PROMPT`,
 /// which resumes the session (spec §7.9).
 fn continue_attempt(ctx: AppCtx, attempt_id: Id) {
     spawn_local(async move {

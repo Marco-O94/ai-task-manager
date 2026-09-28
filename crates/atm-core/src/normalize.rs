@@ -32,7 +32,7 @@ pub const MAX_SUMMARY: usize = 1 << 10;
 
 /// Case-insensitive substrings of a failed `result` (subtype, text) and their class, checked
 /// in order (spec §7.6: "Not logged in", "/login", "Login expired", "limit",
-/// `billing_error`). M5 refines them against real captures.
+/// `billing_error`). M5 (spec §13.4) reached no limit with the CLI 2.1.283: unchanged.
 pub const LIMIT_PATTERNS: &[(&str, LimitKind)] = &[
     ("not logged in", LimitKind::AuthFailure),
     ("/login", LimitKind::AuthFailure),
@@ -44,11 +44,13 @@ pub const LIMIT_PATTERNS: &[(&str, LimitKind)] = &[
 
 /// Case-insensitive substring of the CLI's stderr (or `result` text) when `--resume` names a
 /// session it cannot find (spec §7.9): the runner then adds a Notice with
-/// [`NoticeAction::NewSession`]. M5 checks it against the real CLI.
+/// [`NoticeAction::NewSession`]. Confirmed by M5 (spec §13.4): stderr "No conversation found
+/// with session ID: <uuid>", and the same text in the `errors` of the `result`.
 pub const RESUME_FAILED_PATTERN: &str = "no conversation found";
 
 /// `apiKeySource` values of `system/init` that mean "no API key" (subscription login); any
-/// other value warns. [DA VERIFICARE → M5].
+/// other value warns, and so does a missing one. M5 (spec §13.4): the claude.ai login of the
+/// CLI 2.1.283 says `none`, and no other value was seen.
 pub const NO_API_KEY_SOURCES: &[&str] = &["none"];
 
 /// Notice texts (Italian, shown as is).
@@ -282,8 +284,9 @@ fn render_input(input: &Value, max: usize) -> String {
     cap(&input.to_string(), max)
 }
 
-/// `decision_reason` (shape [DA VERIFICARE → M5]): a string as is; an object by its
-/// `reason`/`message`/`description`, else compact JSON; one line, at most [`MAX_REASON`].
+/// `decision_reason`: a string as is (M5, spec §13.4: the CLI 2.1.283 sends a string such as
+/// "This command requires approval", next to `decision_reason_type`); an object, tolerated, by
+/// its `reason`/`message`/`description`, else compact JSON; one line, at most [`MAX_REASON`].
 fn render_reason(reason: &Value) -> Option<String> {
     let text = match reason {
         Value::Null => return None,
@@ -581,15 +584,23 @@ impl Normalizer {
         let text = |key| str_of(line, key).map(|s| cap(s, MAX_TEXT));
         let api_key_source = text("apiKeySource");
         let mut warnings = Vec::new();
-        if let Some(source) = &api_key_source
-            && !NO_API_KEY_SOURCES
-                .iter()
-                .any(|none| source.eq_ignore_ascii_case(none))
-        {
-            warnings.push(format!(
-                "Il CLI usa una chiave API ({source}): l'uso viene fatturato via API, non con \
-                 l'abbonamento."
-            ));
+        match &api_key_source {
+            Some(source)
+                if !NO_API_KEY_SOURCES
+                    .iter()
+                    .any(|none| source.eq_ignore_ascii_case(none)) =>
+            {
+                warnings.push(format!(
+                    "Il CLI usa una chiave API ({source}): l'uso viene fatturato via API, non \
+                     con l'abbonamento."
+                ));
+            }
+            Some(_) => {}
+            None => warnings.push(
+                "Il CLI non indica la fonte della chiave (apiKeySource): non è verificabile che \
+                 l'uso sia addebitato all'abbonamento."
+                    .into(),
+            ),
         }
         if let Some(cwd) = str_of(line, "cwd")
             && cwd.trim_end_matches('/') != self.worktree.trim_end_matches('/')
@@ -692,8 +703,8 @@ impl Normalizer {
 
     /// The matching `ToolCall` → `AwaitingApproval`; created from `request` (the
     /// `can_use_tool` object) if the `tool_use` has not arrived yet. `reason` comes from the
-    /// request's optional `decision_reason` (shape to confirm in M5: a string, else a short
-    /// rendering of the object); `input` is kept up to [`MAX_APPROVAL_INPUT`].
+    /// request's optional `decision_reason` (a string, spec §13.4; see `render_reason`);
+    /// `input` is kept up to [`MAX_APPROVAL_INPUT`].
     pub fn on_approval_requested(
         &mut self,
         approval_id: &str,

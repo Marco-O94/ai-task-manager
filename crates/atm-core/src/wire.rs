@@ -185,6 +185,66 @@ pub fn parse(line: &[u8]) -> Inbound {
     }
 }
 
+/// Keys of `account` kept in the raw log (M5: the CLI 2.1.283 answers `initialize` with
+/// `account: {email, organization, subscriptionType, apiProvider}`).
+pub const LOGGED_ACCOUNT_KEYS: &[&str] = &["subscriptionType", "apiProvider"];
+/// Replaces every other value of `account` in the raw log.
+pub const REDACTED: &str = "<redacted>";
+/// Where an `account` may sit in a stdout line: the answer to `initialize`
+/// (`response.response.account`, M5), and the places a later CLI could move it to (a
+/// `control_response` without the inner envelope, a top-level field such as `system/init`).
+const ACCOUNT_PATHS: &[&[&str]] = &[
+    &["response", "response", "account"],
+    &["response", "account"],
+    &["account"],
+];
+
+/// A stdout line as written to `stdout.jsonl`, whatever its type: every `account` at one of the
+/// [`ACCOUNT_PATHS`] loses its keys outside [`LOGGED_ACCOUNT_KEYS`] to [`REDACTED`], and an
+/// `account` that is not an object becomes [`REDACTED`] as a whole, because email and
+/// organization never reach a log (spec §7.10, §10.1). A line without an `account` there is
+/// returned unchanged, without a copy.
+pub fn redact_for_log(line: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    use std::borrow::Cow;
+    const NEEDLE: &[u8] = b"\"account\"";
+    if !line.windows(NEEDLE.len()).any(|w| w == NEEDLE) {
+        return Cow::Borrowed(line);
+    }
+    let Ok(mut v) = serde_json::from_slice::<Value>(line) else {
+        return Cow::Borrowed(line);
+    };
+    let mut changed = false;
+    for path in ACCOUNT_PATHS {
+        let (key, parents) = path.split_last().expect("paths are not empty");
+        let parent = parents
+            .iter()
+            .try_fold(&mut v, |node, k| node.get_mut(*k))
+            .and_then(Value::as_object_mut);
+        let Some(account) = parent.and_then(|p| p.get_mut(*key)) else {
+            continue;
+        };
+        changed = true;
+        match account {
+            Value::Object(fields) => {
+                for (k, value) in fields.iter_mut() {
+                    if !LOGGED_ACCOUNT_KEYS.contains(&k.as_str()) {
+                        *value = REDACTED.into();
+                    }
+                }
+            }
+            other => *other = REDACTED.into(),
+        }
+    }
+    if !changed {
+        return Cow::Borrowed(line);
+    }
+    match serde_json::to_vec(&v) {
+        Ok(redacted) => Cow::Owned(redacted),
+        // Unreachable for a parsed value; never log the original on failure.
+        Err(_) => Cow::Owned(Vec::new()),
+    }
+}
+
 /// `atm_<n>_<8 hex>`: id of a request sent by the host.
 pub fn request_id(n: u64) -> String {
     format!("atm_{n}_{:08x}", uuid::Uuid::new_v4().as_u128() as u32)
@@ -263,30 +323,52 @@ impl Pending {
     }
 }
 
-/// True only if every suggestion is `addRules` with `behavior:"allow"` and every rule has
-/// a non-empty `ruleContent` (whole-tool rules are never rememberable).
-pub fn can_remember(suggestions: &Value) -> bool {
-    let rememberable = |s: &Value| {
-        s["type"] == "addRules"
-            && s["behavior"] == "allow"
-            && s["rules"].as_array().is_some_and(|rules| {
-                !rules.is_empty()
-                    && rules
-                        .iter()
-                        .all(|r| r["ruleContent"].as_str().is_some_and(|c| !c.is_empty()))
-            })
-    };
+/// A suggestion "Consenti sempre" may forward: `addRules` with `behavior:"allow"`.
+fn is_allow_rules(s: &Value) -> bool {
+    s["type"] == "addRules" && s["behavior"] == "allow"
+}
+
+/// The `addRules`/`allow` suggestions, in order.
+fn allow_rules(suggestions: &Value) -> impl Iterator<Item = &Value> {
     suggestions
         .as_array()
-        .is_some_and(|all| !all.is_empty() && all.iter().all(rememberable))
+        .into_iter()
+        .flatten()
+        .filter(|s| is_allow_rules(s))
+}
+
+/// A `ruleContent` that names something: not empty, and not made only of wildcards, colons
+/// and blanks (`*`, `:*`, ` `), which would allow the whole tool.
+fn specific_content(content: &str) -> bool {
+    content
+        .chars()
+        .any(|c| !(c == '*' || c == ':' || c.is_whitespace()))
+}
+
+/// True if there is at least one `addRules` suggestion with `behavior:"allow"` and every one
+/// of them has rules, each with a specific `ruleContent` ([`specific_content`]: whole-tool rules
+/// are never rememberable, spec §7.8). The other suggestion types are ignored and never
+/// forwarded: M5 saw the CLI 2.1.283 add `addDirectories` (the worktree) and `setMode`
+/// (`acceptEdits`, a mode the user did not pick) to every Bash request.
+pub fn can_remember(suggestions: &Value) -> bool {
+    let specific = |s: &Value| {
+        s["rules"].as_array().is_some_and(|rules| {
+            !rules.is_empty()
+                && rules
+                    .iter()
+                    .all(|r| r["ruleContent"].as_str().is_some_and(specific_content))
+        })
+    };
+    let mut allow = allow_rules(suggestions).peekable();
+    allow.peek().is_some() && allow.all(specific)
 }
 
 /// Complete `control_response` frame for a decision (spec §7.8 table), echoing
 /// `pending.request_id`. Allow always carries `updatedInput` (the original input); remember
-/// adds `updatedPermissions` with every destination rewritten to `"session"`; deny uses
-/// [`DENY_PREFIX`] + message and `interrupt`; `AskUserQuestion` is always denied with
-/// [`ASK_USER_QUESTION_DENY`]. `remember` is ignored unless [`can_remember`] holds, so a
-/// whole-tool rule is never sent.
+/// adds `updatedPermissions` with only the `addRules`/`allow` suggestions, every destination
+/// rewritten to `"session"`; deny uses [`DENY_PREFIX`] + message and `interrupt`;
+/// `AskUserQuestion` is always denied with [`ASK_USER_QUESTION_DENY`]. `remember` is ignored
+/// unless [`can_remember`] holds, so a whole-tool rule is never sent.
 pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Value {
     let response = if pending.tool_name == ASK_USER_QUESTION {
         json!({"behavior": "deny", "message": ASK_USER_QUESTION_DENY, "interrupt": false})
@@ -295,11 +377,14 @@ pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Valu
             ApprovalDecision::Allow { remember } => {
                 let mut allow = json!({"behavior": "allow", "updatedInput": pending.input});
                 if *remember && can_remember(&pending.suggestions) {
-                    let mut suggestions = pending.suggestions.clone();
-                    for s in suggestions.as_array_mut().into_iter().flatten() {
-                        s["destination"] = "session".into();
-                    }
-                    allow["updatedPermissions"] = suggestions;
+                    let session: Vec<Value> = allow_rules(&pending.suggestions)
+                        .map(|s| {
+                            let mut s = s.clone();
+                            s["destination"] = "session".into();
+                            s
+                        })
+                        .collect();
+                    allow["updatedPermissions"] = session.into();
                 }
                 allow
             }
@@ -313,14 +398,14 @@ pub fn approval_response(pending: &Pending, decision: &ApprovalDecision) -> Valu
     control_success(&pending.request_id, response)
 }
 
-/// `Tool(ruleContent)` strings added to `attempts.allow_rules` on "Consenti sempre"; empty
-/// unless [`can_remember`] holds, and always for `AskUserQuestion` (always denied).
+/// `Tool(ruleContent)` strings added to `attempts.allow_rules` on "Consenti sempre", from the
+/// `addRules`/`allow` suggestions; empty unless [`can_remember`] holds, and always for
+/// `AskUserQuestion` (always denied).
 pub fn remembered_rules(pending: &Pending) -> Vec<String> {
     if pending.tool_name == ASK_USER_QUESTION || !can_remember(&pending.suggestions) {
         return Vec::new();
     }
-    let rules = pending.suggestions.as_array().into_iter().flatten();
-    rules
+    allow_rules(&pending.suggestions)
         .flat_map(|s| s["rules"].as_array().into_iter().flatten())
         .map(|r| {
             let tool = r["toolName"].as_str().unwrap_or(&pending.tool_name);

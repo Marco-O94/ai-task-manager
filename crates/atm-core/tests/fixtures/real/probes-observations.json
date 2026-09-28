@@ -1,0 +1,111 @@
+{
+  "cli_version": "2.1.283",
+  "hooks_control_user_project": {
+    "exit": 0,
+    "marker": "SessionStart\n"
+  },
+  "hooks_isolated": {
+    "exit": 0,
+    "marker": null
+  },
+  "initialize": {
+    "account_keys": [
+      "apiProvider",
+      "email",
+      "organization",
+      "subscriptionType"
+    ],
+    "answer_index": 13,
+    "answered": "success",
+    "exit": 0,
+    "kinds_in_order": [
+      "system/hook_started",
+      "system/hook_response",
+      "control_response",
+      "system/hook_response"
+    ],
+    "response_keys": [
+      "account",
+      "agents",
+      "analytics_disabled",
+      "available_output_styles",
+      "commands",
+      "current_permission_mode",
+      "fast_mode_disabled_reason",
+      "fast_mode_state",
+      "ide_rc_auto_enable_gate",
+      "models",
+      "output_style",
+      "pid",
+      "remote_control_auto_connect_default",
+      "remote_control_auto_enable",
+      "remote_control_auto_on_by_default",
+      "remote_control_available",
+      "session_state",
+      "user_output_styles_dir"
+    ],
+    "system_init_before_user_message": false
+  },
+  "no_initialize_turn": {
+    "cost_usd": 0.1492016,
+    "exit": 0,
+    "is_error": false,
+    "kinds_in_order": [
+      "system/hook_started",
+      "system/hook_response",
+      "system/init",
+      "system/status",
+      "stream_event",
+      "assistant",
+      "stream_event",
+      "rate_limit_event",
+      "result/success"
+    ],
+    "result": "OK",
+    "result_subtype": "success",
+    "stream_events": 6,
+    "timed_out": false
+  },
+  "permission_mode_bogus": {
+    "current_permission_mode": null,
+    "exit": 1,
+    "stderr": "error: option '--permission-mode <mode>' argument 'bogus' is invalid. Allowed choices are acceptEdits, auto, bypassPermissions, manual, dontAsk, plan."
+  },
+  "permission_mode_default": {
+    "current_permission_mode": "default",
+    "exit": 0,
+    "stderr": ""
+  },
+  "permission_mode_manual": {
+    "current_permission_mode": "default",
+    "exit": 0,
+    "stderr": ""
+  },
+  "project_dir_name": {
+    "dir_name": "-tmp-atm-real-hooks-repo",
+    "hook_cwd": "/tmp/atm-real/hooks-repo",
+    "matches_pwd": false,
+    "matches_realpath": true,
+    "pwd": "/tmp/atm-real/hooks-repo",
+    "realpath": "/tmp/atm-real/hooks-repo"
+  },
+  "resume_not_found": {
+    "classified_limit": "None",
+    "errors": "[\"No conversation found with session ID: a36b2c9f-0cd2-4a46-a9ca-644bb084b6c7\"]",
+    "exit": 1,
+    "initialize_answered": false,
+    "is_error": true,
+    "kinds_in_order": [
+      "result/error_during_execution"
+    ],
+    "pattern_in_result": true,
+    "pattern_in_stderr": true,
+    "result_subtype": "error_during_execution",
+    "stderr": "No conversation found with session ID: a36b2c9f-0cd2-4a46-a9ca-644bb084b6c7"
+  },
+  "without_verbose": {
+    "exit": 1,
+    "stderr": "Error: When using --print, --output-format=stream-json requires --verbose",
+    "stdout_lines": 0
+  }
+}

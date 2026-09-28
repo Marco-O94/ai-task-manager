@@ -1,0 +1,9 @@
+---
+source: crates/atm-core/tests/real_fixtures.rs
+expression: outline(&replay(label))
+---
+ 0 UserMessage Reply with exactly the word OK.
+ 1 SessionInit model=Some("claude-sonnet-5") mode=Some("acceptEdits") apiKeySource=Some("none") mcp_servers=0 warnings=[]
+ 2 AssistantText OK
+ 3 TurnEnd success is_error=false num_turns=Some(1) denials=0 limit=None text=Some("OK")
+typing previews: 1

@@ -116,6 +116,32 @@ fn session_init() {
     );
 }
 
+/// Without `apiKeySource` the billing source is unknown: a warning, as for an API key; `none`
+/// (M5, spec §13.4) is the only silent value, in any case.
+#[test]
+fn session_init_warns_without_an_api_key_source() {
+    let init = |source: Option<&str>| {
+        let mut line = json!({"type":"system","subtype":"init","cwd":WT,"session_id":"s1",
+            "model":"sonnet","permissionMode":"default","mcp_servers":[]});
+        if let Some(source) = source {
+            line["apiKeySource"] = source.into();
+        }
+        let ops = normalizer().on_line(&line, 1000);
+        match &upserts(&ops)[0].body {
+            EntryBody::SessionInit { warnings, .. } => warnings.clone(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(init(Some("none")), Vec::<String>::new());
+    assert_eq!(init(Some("NONE")), Vec::<String>::new());
+    let missing = init(None);
+    assert_eq!(missing.len(), 1);
+    assert!(missing[0].contains("apiKeySource"), "{missing:?}");
+    let key = init(Some("ANTHROPIC_API_KEY"));
+    assert_eq!(key.len(), 1);
+    assert!(key[0].contains("chiave API (ANTHROPIC_API_KEY)"), "{key:?}");
+}
+
 #[test]
 fn stream_event_typing_preview() {
     let mut n = normalizer();

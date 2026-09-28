@@ -462,7 +462,7 @@ fn status_label(status: TaskStatus) -> &'static str {
 #[derive(Clone, Copy)]
 enum Command {
     Stop,
-    /// "Continua" after an app restart (spec §7.9).
+    /// "Continua" after the app closed mid-turn (spec §7.9).
     Continue,
     Open(OpenTarget),
 }

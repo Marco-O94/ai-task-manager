@@ -1,0 +1,621 @@
+{
+  "a_approvals": [],
+  "a_diff_files": [
+    "README.md"
+  ],
+  "a_process": {
+    "cost_usd_estimate": 0.16509659999999998,
+    "exit_code": 0,
+    "num_turns": 2,
+    "result_subtype": "success",
+    "status": "completed",
+    "stop_reason": null
+  },
+  "a_raw_kinds": [
+    "system/hook_started",
+    "system/hook_response",
+    "control_response",
+    "system/hook_response",
+    "system/init",
+    "system/status",
+    "assistant",
+    "rate_limit_event",
+    "user",
+    "system/status",
+    "assistant",
+    "result/success"
+  ],
+  "a_session_init": {
+    "api_key_source": "none",
+    "mcp_servers": 0,
+    "model": "claude-sonnet-5",
+    "permission_mode": "acceptEdits",
+    "type": "SessionInit",
+    "warnings": []
+  },
+  "a_tool_calls": [
+    {
+      "name": "Bash",
+      "output": "(Bash completed with no output)",
+      "status": {
+        "state": "Succeeded"
+      },
+      "summary": "$ printf '%s\\n' \"Edited by AI Task Manager (M5).\" >> README.md"
+    }
+  ],
+  "a_turn_end": {
+    "cost_usd_estimate": 0.16509659999999998,
+    "duration_ms": 3543,
+    "is_error": false,
+    "limit": null,
+    "num_turns": 2,
+    "permission_denials": 0,
+    "subtype": "success",
+    "text": "Line added. Codeword kept, not written.",
+    "type": "TurnEnd"
+  },
+  "a_typing_previews": 1,
+  "add_project_warnings": [],
+  "b_allow_rules": [
+    "Bash(touch approved.txt)"
+  ],
+  "b_approvals": [
+    {
+      "can_remember": true,
+      "reason": null,
+      "summary": "$ touch approved.txt",
+      "tool": "Bash"
+    }
+  ],
+  "b_can_use_tool_requests": [
+    {
+      "blocked_path": "/tmp/atm-real/wt/10b4b5d2-ce17-4629-916c-c7c1cb945415/approved.txt",
+      "description": "Create approved.txt file",
+      "display_name": "Bash",
+      "input": {
+        "command": "touch approved.txt",
+        "description": "Create approved.txt file"
+      },
+      "permission_suggestions": [
+        {
+          "behavior": "allow",
+          "destination": "localSettings",
+          "rules": [
+            {
+              "ruleContent": "touch approved.txt",
+              "toolName": "Bash"
+            }
+          ],
+          "type": "addRules"
+        },
+        {
+          "destination": "session",
+          "directories": [
+            "/tmp/atm-real/wt/10b4b5d2-ce17-4629-916c-c7c1cb945415"
+          ],
+          "type": "addDirectories"
+        },
+        {
+          "destination": "session",
+          "mode": "acceptEdits",
+          "type": "setMode"
+        }
+      ],
+      "subtype": "can_use_tool",
+      "tool_name": "Bash",
+      "tool_use_id": "toolu_01Ne98QKrwdpYWq9H1kLLdda"
+    }
+  ],
+  "b_ls_asked": false,
+  "b_session_rule_after_resume": {
+    "approvals": [
+      {
+        "can_remember": true,
+        "reason": null,
+        "summary": "$ touch approved.txt",
+        "tool": "Bash"
+      },
+      {
+        "can_remember": true,
+        "reason": "This command requires approval",
+        "summary": "$ python3 -c 'import time; time.sleep(41)'",
+        "tool": "Bash"
+      }
+    ],
+    "touch_asked": true
+  },
+  "b_settings_allow_in_new_session": {
+    "approvals": [
+      {
+        "can_remember": true,
+        "reason": "This command requires approval",
+        "summary": "$ python3 -c 'import time; time.sleep(42)'",
+        "tool": "Bash"
+      }
+    ],
+    "argv_session_id": true,
+    "touch_asked": false
+  },
+  "b_tool_calls": [
+    {
+      "name": "Bash",
+      "output": "Cargo.lock\nCargo.toml\nREADME.md\nsrc",
+      "status": {
+        "state": "Succeeded"
+      },
+      "summary": "$ ls"
+    },
+    {
+      "name": "Bash",
+      "output": "(Bash completed with no output)",
+      "status": {
+        "state": "Succeeded"
+      },
+      "summary": "$ touch approved.txt"
+    }
+  ],
+  "c_resume": {
+    "argv_resume": true,
+    "codeword_remembered": true,
+    "notices": [],
+    "said": "PAPAYA-42\nPAPAYA-42",
+    "session_init": {
+      "api_key_source": "none",
+      "mcp_servers": 0,
+      "model": "claude-sonnet-5",
+      "permission_mode": "default",
+      "type": "SessionInit",
+      "warnings": []
+    },
+    "status": "completed"
+  },
+  "cli_version": "2.1.283",
+  "d_stop": {
+    "elapsed_ms": 653,
+    "exit_code": 1,
+    "is_error": true,
+    "notices": [
+      {
+        "action": null,
+        "level": "Info",
+        "text": "Esecuzione fermata dall'utente"
+      }
+    ],
+    "ps_shows_claude_path_and_session": true,
+    "raw_kinds": [
+      "system/hook_started",
+      "system/hook_response",
+      "control_response",
+      "system/init",
+      "system/status",
+      "system/hook_progress",
+      "assistant",
+      "rate_limit_event",
+      "control_request",
+      "user",
+      "system/hook_response",
+      "system/status",
+      "assistant",
+      "control_request",
+      "control_response",
+      "user",
+      "result/error_during_execution"
+    ],
+    "result_subtype": "error_during_execution",
+    "status": "killed",
+    "stop_reason": "user_stop",
+    "tool_calls": [
+      {
+        "name": "Bash",
+        "output": "(Bash completed with no output)",
+        "status": {
+          "state": "Succeeded"
+        },
+        "summary": "$ touch approved.txt"
+      },
+      {
+        "name": "Bash",
+        "output": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions.",
+        "status": {
+          "state": "Failed"
+        },
+        "summary": "$ python3 -c 'import time; time.sleep(41)'"
+      }
+    ],
+    "turn_end": {
+      "cost_usd_estimate": 0.2373396,
+      "duration_ms": 4291,
+      "is_error": true,
+      "limit": null,
+      "num_turns": 4,
+      "permission_denials": 0,
+      "subtype": "error_during_execution",
+      "text": "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+      "type": "TurnEnd"
+    },
+    "wait_left_10s_after_stop": false,
+    "wait_processes_pgid_is_claude_pgid": [
+      false,
+      false
+    ]
+  },
+  "e_after_drop": {
+    "group_alive": false,
+    "wait_left": []
+  },
+  "e_after_restart": {
+    "card_last_stop_reason": "app_restart",
+    "notices": [
+      {
+        "action": null,
+        "level": "Warn",
+        "text": "Esecuzione interrotta dal riavvio dell'app"
+      }
+    ],
+    "status": "failed",
+    "stop_reason": "app_restart",
+    "task_status": "inreview"
+  },
+  "e_before_drop": {
+    "wait_processes_pgid_is_claude_pgid": [
+      false,
+      false
+    ]
+  },
+  "e_continue": {
+    "approvals": [
+      {
+        "can_remember": true,
+        "reason": "This command requires approval",
+        "summary": "$ python3 -c 'import time; time.sleep(42)'",
+        "tool": "Bash"
+      }
+    ],
+    "argv_resume": true,
+    "notices": [],
+    "result_subtype": "success",
+    "said": "README done, approved.txt done. Redo sleep — prior run got cut off, unsure if finished.\nDONE.\nDONE.",
+    "session_init": {
+      "api_key_source": "none",
+      "mcp_servers": 0,
+      "model": "claude-sonnet-5",
+      "permission_mode": "acceptEdits",
+      "type": "SessionInit",
+      "warnings": []
+    },
+    "status": "completed"
+  },
+  "failed_checks": [],
+  "h_merge": {
+    "diff_files": [
+      "README.md",
+      "approved.txt"
+    ],
+    "files": [
+      "README.md",
+      "approved.txt"
+    ],
+    "main_is_commit": true,
+    "outcome": {
+      "cleanup_warning": null,
+      "commit": "2fa93e78e0c04d84377b263839405703126743d2",
+      "kind": "Merged",
+      "strategy": "FfCheckedOut"
+    },
+    "parents": 1,
+    "readme_has_line": true
+  },
+  "turns": {
+    "checklist-1-readme": {
+      "cost_usd_estimate": 0.16509659999999998,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "acceptEdits",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"printf '%s\\\\n' \\\"Edited by AI Task Manager (M5).\\\" >> README.md\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "(Bash completed with no output)",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ printf '%s\\n' \"Edited by AI Task Manager (M5).\" >> README.md",
+          "tool_use_id": "toolu_0168dhVufP5ryfP7NRNsEZbn",
+          "type": "ToolCall"
+        },
+        {
+          "text": "Line added. Codeword kept, not written.",
+          "type": "AssistantText"
+        },
+        {
+          "cost_usd_estimate": 0.16509659999999998,
+          "duration_ms": 3543,
+          "is_error": false,
+          "limit": null,
+          "num_turns": 2,
+          "permission_denials": 0,
+          "subtype": "success",
+          "text": "Line added. Codeword kept, not written.",
+          "type": "TurnEnd"
+        },
+        {
+          "action": null,
+          "level": "Info",
+          "text": "Commit automatico bffbd51 (1 file)",
+          "type": "Notice"
+        }
+      ],
+      "exit_code": 0,
+      "permission_mode": "acceptEdits",
+      "result_subtype": "success",
+      "resumed": false,
+      "status": "completed",
+      "stop_reason": null
+    },
+    "checklist-2-approvals": {
+      "cost_usd_estimate": 0.2070818,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "default",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"ls\",\"description\":\"List files in current directory\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "Cargo.lock\nCargo.toml\nREADME.md\nsrc",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ ls",
+          "tool_use_id": "toolu_012LPTkA3T7qTnuvfu17P9yx",
+          "type": "ToolCall"
+        },
+        {
+          "input": "{\"command\":\"touch approved.txt\",\"description\":\"Create approved.txt file\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "(Bash completed with no output)",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ touch approved.txt",
+          "tool_use_id": "toolu_01Ne98QKrwdpYWq9H1kLLdda",
+          "type": "ToolCall"
+        },
+        {
+          "text": "PAPAYA-42",
+          "type": "AssistantText"
+        },
+        {
+          "cost_usd_estimate": 0.2070818,
+          "duration_ms": 5393,
+          "is_error": false,
+          "limit": null,
+          "num_turns": 3,
+          "permission_denials": 0,
+          "subtype": "success",
+          "text": "PAPAYA-42",
+          "type": "TurnEnd"
+        },
+        {
+          "action": null,
+          "level": "Info",
+          "text": "Commit automatico 789f3f6 (1 file)",
+          "type": "Notice"
+        }
+      ],
+      "exit_code": 0,
+      "permission_mode": "default",
+      "result_subtype": "success",
+      "resumed": true,
+      "status": "completed",
+      "stop_reason": null
+    },
+    "checklist-3-stop": {
+      "cost_usd_estimate": 0.2373396,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "default",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"touch approved.txt\",\"description\":\"Create approved.txt file\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "(Bash completed with no output)",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ touch approved.txt",
+          "tool_use_id": "toolu_01FE65JKugopm446PCuCLe9m",
+          "type": "ToolCall"
+        },
+        {
+          "input": "{\"command\":\"python3 -c 'import time; time.sleep(41)'\",\"description\":\"Sleep for 41 seconds\",\"timeout\":60000}",
+          "name": "Bash",
+          "output": {
+            "is_error": true,
+            "text": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). STOP what you are doing and wait for the user to tell you how to proceed.\n\nNote: The user's next message may contain a correction or preference. Pay close attention — if they explain what went wrong or how they'd prefer you to work, consider saving that to memory for future sessions.",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Failed"
+          },
+          "summary": "$ python3 -c 'import time; time.sleep(41)'",
+          "tool_use_id": "toolu_01JQQ3zz22td9ytZcC8YKYYT",
+          "type": "ToolCall"
+        },
+        {
+          "cost_usd_estimate": 0.2373396,
+          "duration_ms": 4291,
+          "is_error": true,
+          "limit": null,
+          "num_turns": 4,
+          "permission_denials": 0,
+          "subtype": "error_during_execution",
+          "text": "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use",
+          "type": "TurnEnd"
+        },
+        {
+          "action": null,
+          "level": "Info",
+          "text": "Esecuzione fermata dall'utente",
+          "type": "Notice"
+        }
+      ],
+      "exit_code": 1,
+      "permission_mode": "default",
+      "result_subtype": "error_during_execution",
+      "resumed": true,
+      "status": "killed",
+      "stop_reason": "user_stop"
+    },
+    "checklist-4-interrupted": {
+      "cost_usd_estimate": null,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "default",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"touch approved.txt\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "(Bash completed with no output)",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ touch approved.txt",
+          "tool_use_id": "toolu_01SRucbPXCJiJFtY5mav8G16",
+          "type": "ToolCall"
+        },
+        {
+          "input": "{\"command\":\"python3 -c 'import time; time.sleep(42)'\",\"timeout\":50000}",
+          "name": "Bash",
+          "output": null,
+          "status": {
+            "state": "Cancelled"
+          },
+          "summary": "$ python3 -c 'import time; time.sleep(42)'",
+          "tool_use_id": "toolu_01RKzdm15LrZur1nEXUNuMXF",
+          "type": "ToolCall"
+        },
+        {
+          "action": null,
+          "level": "Warn",
+          "text": "Esecuzione interrotta dal riavvio dell'app",
+          "type": "Notice"
+        }
+      ],
+      "exit_code": null,
+      "permission_mode": "default",
+      "result_subtype": null,
+      "resumed": false,
+      "status": "failed",
+      "stop_reason": "app_restart"
+    },
+    "checklist-5-continue": {
+      "cost_usd_estimate": 0.0450618,
+      "entries": [
+        {
+          "api_key_source": "none",
+          "mcp_servers": 0,
+          "model": "claude-sonnet-5",
+          "permission_mode": "acceptEdits",
+          "type": "SessionInit",
+          "warnings": []
+        },
+        {
+          "input": "{\"command\":\"tail -3 README.md 2>/dev/null; echo ---; ls approved.txt 2>/dev/null && echo \\\"approved exists\\\"\"}",
+          "name": "Bash",
+          "output": {
+            "is_error": false,
+            "text": "cargo test\n```\nEdited by AI Task Manager (M5).\n---\napproved.txt\napproved exists",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "state": "Succeeded"
+          },
+          "summary": "$ tail -3 README.md 2>/dev/null; echo ---; ls approved.txt 2>/dev/null && echo \"approved exists\"",
+          "tool_use_id": "toolu_01QgD6YSPXBdMvQyowbVA11j",
+          "type": "ToolCall"
+        },
+        {
+          "text": "README done, approved.txt done. Redo sleep — prior run got cut off, unsure if finished.",
+          "type": "AssistantText"
+        },
+        {
+          "input": "{\"command\":\"python3 -c 'import time; time.sleep(42)'\",\"timeout\":50000}",
+          "name": "Bash",
+          "output": {
+            "is_error": true,
+            "text": "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: Skip it: do not run commands now, just reply DONE.",
+            "truncated_bytes": 0
+          },
+          "status": {
+            "message": "Skip it: do not run commands now, just reply DONE.",
+            "state": "Denied"
+          },
+          "summary": "$ python3 -c 'import time; time.sleep(42)'",
+          "tool_use_id": "toolu_01J1VNfuJoTucAGiFp5t6zXF",
+          "type": "ToolCall"
+        },
+        {
+          "text": "DONE.",
+          "type": "AssistantText"
+        },
+        {
+          "cost_usd_estimate": 0.0450618,
+          "duration_ms": 5161,
+          "is_error": false,
+          "limit": null,
+          "num_turns": 3,
+          "permission_denials": 1,
+          "subtype": "success",
+          "text": "DONE.",
+          "type": "TurnEnd"
+        }
+      ],
+      "exit_code": 0,
+      "permission_mode": "acceptEdits",
+      "result_subtype": "success",
+      "resumed": true,
+      "status": "completed",
+      "stop_reason": null
+    }
+  }
+}
