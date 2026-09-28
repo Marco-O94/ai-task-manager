@@ -1,0 +1,106 @@
+---
+source: crates/atm-core/tests/db.rs
+expression: board
+---
+[
+  {
+    "task": {
+      "id": "fresh",
+      "project_id": "p",
+      "title": "fresh",
+      "description": "",
+      "status": "todo",
+      "position": 1024.0,
+      "created_at": 1700000000000,
+      "updated_at": 1700000000000
+    },
+    "attempt_id": null,
+    "attempt_state": null,
+    "branch": null,
+    "running": false,
+    "pending_approvals": 0,
+    "last_status": null,
+    "last_stop_reason": null,
+    "worktree_state": null
+  },
+  {
+    "task": {
+      "id": "running",
+      "project_id": "p",
+      "title": "running",
+      "description": "",
+      "status": "inprogress",
+      "position": 1024.0,
+      "created_at": 1700000000000,
+      "updated_at": 1700000000002
+    },
+    "attempt_id": "a-run",
+    "attempt_state": "active",
+    "branch": "atm/a-run",
+    "running": true,
+    "pending_approvals": 0,
+    "last_status": "running",
+    "last_stop_reason": null,
+    "worktree_state": "present"
+  },
+  {
+    "task": {
+      "id": "active",
+      "project_id": "p",
+      "title": "active",
+      "description": "",
+      "status": "inreview",
+      "position": 1024.0,
+      "created_at": 1700000000000,
+      "updated_at": 1700000000031
+    },
+    "attempt_id": "a-act",
+    "attempt_state": "active",
+    "branch": "atm/a-act",
+    "running": false,
+    "pending_approvals": 0,
+    "last_status": "completed",
+    "last_stop_reason": null,
+    "worktree_state": "present"
+  },
+  {
+    "task": {
+      "id": "restarted",
+      "project_id": "p",
+      "title": "restarted",
+      "description": "",
+      "status": "inreview",
+      "position": 2048.0,
+      "created_at": 1700000000000,
+      "updated_at": 1700000000040
+    },
+    "attempt_id": "a-rst",
+    "attempt_state": "active",
+    "branch": "atm/a-rst",
+    "running": false,
+    "pending_approvals": 0,
+    "last_status": "failed",
+    "last_stop_reason": "app_restart",
+    "worktree_state": "present"
+  },
+  {
+    "task": {
+      "id": "merged",
+      "project_id": "p",
+      "title": "merged",
+      "description": "",
+      "status": "done",
+      "position": 1024.0,
+      "created_at": 1700000000000,
+      "updated_at": 1700000000012
+    },
+    "attempt_id": "a-new",
+    "attempt_state": "merged",
+    "branch": "atm/a-new",
+    "running": false,
+    "pending_approvals": 0,
+    "last_status": "failed",
+    "last_stop_reason": null,
+    "worktree_state": "removed"
+  }
+]
