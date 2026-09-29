@@ -3,12 +3,18 @@
 # bundle with the UI's test drivers (`--features testkit`, src-tauri/tauri.testkit.conf.json;
 # assets embedded, CSP active), installs a copy of the bundle in the run's temporary directory
 # and runs it three times on that directory's data:
-# - phase 1: steps 1-7, then Cmd+Q (a ⌘Q key event posted to the app through the window
-#   server -> menu Quit -> `NSApp terminate:` -> RunEvent::Exit) during a [fake:hang] and a
-#   [fake:hang_ignore] turn: two agents running, none left afterwards (`pgrep`);
+# - phase 1: steps 1-7 (step 3 also checks the `mcp` project's Riepilogo: its committed
+#   CLAUDE.md, the `.mcp.json` server with its env key and never the key's value, in neither
+#   the page nor `get_project_overview`), then Cmd+Q (a ⌘Q key event posted to the app through
+#   the window server -> menu Quit -> `NSApp terminate:` -> RunEvent::Exit) during a
+#   [fake:hang] and a [fake:hang_ignore] turn: two agents running, none left afterwards
+#   (`pgrep`);
 # - reinstall: a fresh copy of the bundle over the installed one; phase 2 runs it on phase 1's
 #   data, and every process row and log of phase 1 is still there, unchanged, afterwards;
-# - phase 2: relaunch; step 4's order after the restart, the rest of step 8, steps 9-12, then
+# - phase 2: relaunch; step 4's order after the restart, the rest of step 8, steps 9-12, the
+#   security confirmations, then the feature round's checks: `task_list_view` (Lista on main),
+#   `attachment_to_the_agent` and `subagent_limit` (on the scratch project `da-rimuovere`),
+#   `project_removal` (that project removed from the sidebar menu, main stays selected); then
 #   `app.exit` -> RunEvent::ExitRequested during another [fake:hang_ignore] turn;
 # - phase 3 (perf): [fake:flood] on three concurrent attempts, one of them open; the page stays
 #   responsive and the transcript keeps at most 300 rows in the DOM.

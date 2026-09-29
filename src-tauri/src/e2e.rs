@@ -11,8 +11,8 @@
 //! Everything lives under `ATM_E2E_DIR`: data and cache dirs, `HOME` (hence the worktree
 //! root), the temporary repositories, fake-claude's record and login state. Agents always run
 //! as fake-claude (`ATM_CLAUDE_PATH`, else the `fake-claude` next to this binary, checked by
-//! [`verify_fake`] without running it); `open` is recorded instead of run, the native folder
-//! picker returns queued paths.
+//! [`verify_fake`] without running it); `open` is recorded instead of run, the native pickers
+//! (folder, attachments) return queued paths.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::Write;
@@ -82,10 +82,32 @@ const RECORDED_VARS: [&str; 18] = [
 const GIT_SUBCOMMANDS: [&str; 5] = ["show", "log", "status", "branch", "worktree"];
 /// Options `debug_e2e_git` accepts after the subcommand (a trailing `=` takes a value).
 const GIT_OPTIONS: [&str; 5] = ["-1", "--name-only", "--porcelain", "--list", "--format="];
+/// The `mcp` repository's committed `.mcp.json`: one server whose env value the overview must
+/// never show (only its key), as the UI checks (`MCP_SERVER`, `MCP_SECRET` in ui/src/e2e.rs).
+const MCP_JSON: &str = r#"{
+  "mcpServers": {
+    "e2e-tools": {
+      "command": "e2e-mcp-server",
+      "args": ["--stdio"],
+      "env": { "TOKEN": "secret-value" }
+    }
+  }
+}
+"#;
+/// The `mcp` repository's committed CLAUDE.md, shown by its overview.
+const MCP_CLAUDE_MD: &str = "# Istruzioni E2E\n\nLavora solo nel worktree del task.\n";
+/// Repository the UI adds in phase 2 to try attachments and sub-agent limits on, then removes
+/// from the sidebar menu (`SCRATCH` in ui/src/e2e.rs).
+const SCRATCH_REPO: &str = "da-rimuovere";
+/// The file the UI attaches to a task (`ATTACHMENT` in ui/src/e2e.rs): `<dir>/attach/<name>`,
+/// outside every folder the core refuses to copy from (the run's `HOME/.claude*`, `.ssh`,
+/// `.aws`, `Library/Keychains`, its data and cache dirs).
+const ATTACHMENT: &str = "specifiche-e2e.txt";
 
 /// fake-claude, checked once ([`verify_fake`]).
 static FAKE: OnceLock<PathBuf> = OnceLock::new();
-/// Path returned by the next `pick_repo_folder` (queued by `debug_e2e_queue_pick`).
+/// Path returned by the next native picker, `pick_repo_folder` or `pick_attachment_files`
+/// (queued by `debug_e2e_queue_pick`).
 static PICK: Mutex<Option<String>> = Mutex::new(None);
 /// Answers of the next native confirmations (queued by `debug_e2e_queue_confirm`), in order.
 static CONFIRM: Mutex<VecDeque<bool>> = Mutex::new(VecDeque::new());
@@ -281,7 +303,8 @@ pub fn start_watchdog() {
     }
 }
 
-/// `Some(queued path)` in a run: `pick_repo_folder` must not open the native picker.
+/// `Some(queued path)` in a run: `pick_repo_folder` and `pick_attachment_files` must not open
+/// the native picker.
 pub fn take_pick() -> Option<Option<String>> {
     enabled().then(|| PICK.lock().unwrap_or_else(|e| e.into_inner()).take())
 }
@@ -350,9 +373,10 @@ fn git_ok(p: &Paths, dir: &Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// `repos/{main, mcp}` (one commit on `main`, a local identity), `repos/not-git` (a plain
-/// folder), `repos/bare.git` (a mirror of `main`), `repos/empty` (no commits). Kept if they
-/// exist.
+/// `repos/{main, mcp, da-rimuovere}` (one commit on `main`, a local identity; `mcp` commits a
+/// CLAUDE.md and a `.mcp.json` server with an env value, `main` only its README), `repos/not-git`
+/// (a plain folder), `repos/bare.git` (a mirror of `main`), `repos/empty` (no commits), all kept
+/// if they exist, and the file to attach, `attach/specifiche-e2e.txt`.
 fn create_repos(p: &Paths) -> Result<(), String> {
     let io = |e: std::io::Error| e.to_string();
     let committed = |name: &str, files: &[(&str, &str)]| -> Result<(), String> {
@@ -380,9 +404,18 @@ fn create_repos(p: &Paths) -> Result<(), String> {
         "mcp",
         &[
             ("README.md", "# MCP\n"),
-            (".mcp.json", "{\"mcpServers\": {}}\n"),
+            ("CLAUDE.md", MCP_CLAUDE_MD),
+            (".mcp.json", MCP_JSON),
         ],
     )?;
+    committed(SCRATCH_REPO, &[("README.md", "# Da rimuovere\n")])?;
+    let attach = p.dir.join("attach");
+    std::fs::create_dir_all(&attach).map_err(io)?;
+    std::fs::write(
+        attach.join(ATTACHMENT),
+        "Specifiche E2E: l'agente legge questo file dalla cartella degli allegati.\n",
+    )
+    .map_err(io)?;
     let not_git = p.repo("not-git");
     std::fs::create_dir_all(&not_git).map_err(io)?;
     std::fs::write(not_git.join("notes.txt"), "not a repository\n").map_err(io)?;

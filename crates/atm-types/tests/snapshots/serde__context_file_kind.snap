@@ -1,0 +1,11 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: CONTEXT_FILE_KINDS
+---
+[
+  "Memory",
+  "Agents",
+  "Readme",
+  "Settings",
+  "Mcp"
+]

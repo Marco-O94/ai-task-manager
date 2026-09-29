@@ -473,6 +473,18 @@ pub fn claude_info(found: Option<&Discovered>) -> ClaudeInfo {
     }
 }
 
+/// Tools the main agent spawns a sub-agent with (spec F6): `Task` is `Agent`'s older name,
+/// which the CLI maps to it. Under a limit they are `ask` rules, so that every spawn reaches
+/// the host (`can_use_tool`, whatever the mode), or disallowed once none is left.
+pub const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
+/// Runs agents from a script without any `Agent` call: disallowed whenever a limit applies.
+pub const WORKFLOW_TOOL: &str = "Workflow";
+/// Always disallowed: in v1 questions go in the reply's text (spec §7.8).
+const ASK_USER_QUESTION: &str = "AskUserQuestion";
+/// Model of the sub-agents that ask for none, set in the `env` of `--settings` (flag settings
+/// win over the user's and the repository's).
+pub const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
+
 /// Inputs of one turn's argv (spec §7.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnArgs {
@@ -490,6 +502,15 @@ pub struct TurnArgs {
     pub allow_rules: Vec<String>,
     pub model: Option<String>,
     pub effort: Option<Effort>,
+    /// Sub-agents the main agent may still spawn in the attempt (spec F6): `None` = no limit,
+    /// the argv of an attempt without one; `Some(0)` = [`SUBAGENT_TOOLS`] disallowed; `Some(n)`
+    /// = they are `ask` rules, each spawn is counted by the host. [`WORKFLOW_TOOL`] is
+    /// disallowed with either `Some`.
+    pub subagents_left: Option<u32>,
+    /// [`SUBAGENT_MODEL_ENV`] in the `env` of `--settings`.
+    pub subagent_model: Option<String>,
+    /// The task's attachments folder, canonical, when the task has any (spec F5): `--add-dir=`.
+    pub attachments_dir: Option<PathBuf>,
     /// [`append_prompt`], fixed for the attempt.
     pub append_prompt: String,
 }
@@ -529,8 +550,28 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
         "--session-id"
     };
     argv.push(format!("{session_flag}={}", args.session_id));
-    argv.push("--disallowedTools=AskUserQuestion".into());
-    argv.push(format!("--settings={}", settings_json(&args.allow_rules)));
+    let mut disallowed = vec![ASK_USER_QUESTION];
+    let mut ask: &[&str] = &[];
+    if let Some(left) = args.subagents_left {
+        if left == 0 {
+            disallowed.extend(SUBAGENT_TOOLS);
+        } else {
+            ask = SUBAGENT_TOOLS;
+        }
+        disallowed.push(WORKFLOW_TOOL);
+    }
+    argv.push(format!("--disallowedTools={}", disallowed.join(",")));
+    let env: Vec<(&str, &str)> = args
+        .subagent_model
+        .iter()
+        .map(|model| (SUBAGENT_MODEL_ENV, model.as_str()))
+        .collect();
+    let settings = SettingsParts {
+        allow: &args.allow_rules,
+        ask,
+        env: &env,
+    };
+    argv.push(format!("--settings={}", settings_json(&settings)));
     if args.isolated {
         argv.push("--setting-sources=user".into());
         argv.push("--strict-mcp-config".into());
@@ -541,28 +582,62 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
     if let Some(effort) = args.effort {
         argv.push(format!("--effort={effort}"));
     }
+    if let Some(dir) = &args.attachments_dir {
+        argv.push(format!("--add-dir={}", dir.to_string_lossy()));
+    }
     argv.push(format!("--append-system-prompt={}", args.append_prompt));
     argv
 }
 
-/// `{"permissions":{"deny":DENY_RULES,"allow":allow_rules}}` (spec §7.8).
-pub fn settings_json(allow_rules: &[String]) -> String {
+/// What the `--settings` JSON carries besides [`DENY_RULES`] (spec §7.8).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SettingsParts<'a> {
+    /// `permissions.allow`: `attempts.allow_rules`.
+    pub allow: &'a [String],
+    /// `permissions.ask`: whole tools each call of which goes to the host, whatever the mode;
+    /// left out when empty.
+    pub ask: &'a [&'a str],
+    /// `env` of the CLI's session, in this order; left out when empty.
+    pub env: &'a [(&'a str, &'a str)],
+}
+
+/// `{"permissions":{"deny":DENY_RULES,"allow":…[,"ask":…]}[,"env":{…}]}` (spec §7.8): the
+/// deny rules always first; without `ask` and `env`, exactly the JSON of spec §7.8.
+pub fn settings_json(parts: &SettingsParts<'_>) -> String {
     // Structs rather than `json!`: the key order stays fixed whatever serde_json features
     // the workspace enables.
     #[derive(Serialize)]
     struct Settings<'a> {
         permissions: Permissions<'a>,
+        #[serde(skip_serializing_if = "Env::is_empty")]
+        env: Env<'a>,
     }
     #[derive(Serialize)]
     struct Permissions<'a> {
         deny: &'a [&'a str],
         allow: &'a [String],
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        ask: &'a [&'a str],
+    }
+    /// The pairs as one JSON object, in their order.
+    struct Env<'a>(&'a [(&'a str, &'a str)]);
+    impl Env<'_> {
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+    }
+    impl Serialize for Env<'_> {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            s.collect_map(self.0.iter().copied())
+        }
     }
     serde_json::to_string(&Settings {
         permissions: Permissions {
             deny: DENY_RULES,
-            allow: allow_rules,
+            allow: parts.allow,
+            ask: parts.ask,
         },
+        env: Env(parts.env),
     })
     .expect("a struct of strings always serializes")
 }

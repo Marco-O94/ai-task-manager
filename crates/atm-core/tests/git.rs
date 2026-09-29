@@ -12,7 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atm_core::git::{self, Git, RunOpts, WorktreeEntry};
-use atm_types::{ErrorCode, FileStatus, LineKind, MergeOutcome, MergeStrategy, WorktreeState};
+use atm_core::{AppEvent, Core, CoreConfig};
+use atm_types::{
+    AddProjectReq, ConfigPolicy, ContextFile, ErrorCode, FileStatus, LineKind, MergeOutcome,
+    MergeStrategy, Project, ProjectIdReq, ProjectOverview, SetProjectSecurityReq, Settings,
+    WorktreeState,
+};
 use sha2::{Digest, Sha256};
 
 use common::{Hostile, git as sh};
@@ -257,6 +262,7 @@ fn forbidden_operations_absent_from_the_source() {
         include_str!("../src/git.rs"),
         include_str!("../src/git/diff.rs"),
         include_str!("../src/git/merge.rs"),
+        include_str!("../src/git/overview.rs"),
         include_str!("../src/git/parse.rs"),
     ];
     for src in sources {
@@ -2941,5 +2947,547 @@ async fn autocommit_never_runs_a_repo_filter() {
         .unwrap()
         .expect("a commit");
     assert!(!marker.exists(), "the repo's filter ran");
+    fx.done();
+}
+
+// ---------------------------------------------------------------- project overview (F3)
+
+fn commit_all(fx: &Fx, message: &str) {
+    sh(&fx.repo, &["add", "-A"]);
+    sh(&fx.repo, &["commit", "-q", "-m", message]);
+}
+
+/// `git::overview::read` of the tip of `main`, with the records of its committed configuration
+/// as `Core::get_project_overview` passes them (none when it cannot be walked).
+async fn overview(fx: &Fx, agents_load_config: bool) -> ProjectOverview {
+    let tip = fx.rev("main");
+    let records = fx
+        .git
+        .commit_config_snapshot(&fx.repo, &tip)
+        .await
+        .map_or_else(|_| Vec::new(), |c| c.records);
+    let src = git::overview::Source {
+        repo: &fx.repo,
+        project_id: "project-1",
+        branch: "main",
+        commit: &tip,
+        agents_load_config,
+        records: &records,
+    };
+    let overview = git::overview::read(&fx.git, &src).await.unwrap();
+    assert_eq!(overview.commit, tip);
+    overview
+}
+
+/// `overview` with its commit id fixed, for a snapshot.
+fn pinned(overview: &ProjectOverview) -> ProjectOverview {
+    ProjectOverview {
+        commit: "<tip>".into(),
+        ..overview.clone()
+    }
+}
+
+fn paths(overview: &ProjectOverview) -> Vec<&str> {
+    overview.files.iter().map(|f| f.path.as_str()).collect()
+}
+
+fn file<'a>(overview: &'a ProjectOverview, path: &str) -> &'a ContextFile {
+    overview
+        .files
+        .iter()
+        .find(|f| f.path == path)
+        .unwrap_or_else(|| panic!("{path} missing from {:?}", paths(overview)))
+}
+
+/// Spec F3: the overview reads the tip of the target branch (never the main checkout's edits),
+/// shows the six files in their documented order and leaves out those missing; the listings
+/// come from the committed configuration's records: agents and commands by their `.md` path,
+/// nested or through a link inside the tree, skills by the folder of their `SKILL.md`. How the
+/// agents get each file depends only on whether they load the configuration.
+#[tokio::test]
+async fn overview_shows_the_committed_context_in_order() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let bare = overview(&fx, false).await;
+    assert_eq!(paths(&bare), ["README.md"]);
+    assert!(bare.mcp_servers.is_empty());
+    assert!(bare.claude_agents.is_empty() && bare.claude_commands.is_empty());
+    assert!(bare.claude_skills.is_empty());
+
+    write(
+        &r.join(".mcp.json"),
+        r#"{"mcpServers":{"docs":{"command":"node","args":["tools/docs.js"]}}}"#,
+    );
+    write(
+        &r.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Read(src/**)"]}}"#,
+    );
+    write(&r.join("README.md"), "# Demo\n\nUn progetto di prova.\n");
+    write(&r.join("AGENTS.md"), "Istruzioni per gli agenti.\n");
+    write(&r.join(".claude/CLAUDE.md"), "Memoria del progetto.\n");
+    write(&r.join("CLAUDE.md"), "# Regole\r\n\r\n- Esegui i test.\r\n");
+    write(
+        &r.join(".claude/agents/reviewer.md"),
+        "---\nname: reviewer\n---\n",
+    );
+    write(&r.join(".claude/agents/team/planner.md"), "planner\n");
+    write(&r.join(".claude/agents/notes.txt"), "not an agent\n");
+    write(&r.join("docs/agent.md"), "linked agent\n");
+    std::os::unix::fs::symlink("../../docs/agent.md", r.join(".claude/agents/linked.md")).unwrap();
+    write(&r.join(".claude/commands/release.md"), "release\n");
+    write(&r.join(".claude/commands/frontend/test.md"), "test\n");
+    write(&r.join(".claude/skills/pdf/SKILL.md"), "pdf\n");
+    write(&r.join(".claude/skills/pdf/scripts/fill.py"), "pass\n");
+    write(&r.join(".claude/skills/drafts/README.md"), "no SKILL.md\n");
+    write(&r.join(".claude/skills/group/inner/SKILL.md"), "too deep\n");
+    commit_all(&fx, "context");
+    write(&r.join("CLAUDE.md"), "edited, not committed\n");
+    write(&r.join(".claude/agents/draft.md"), "untracked\n");
+
+    let isolated = overview(&fx, false).await;
+    assert_eq!(
+        paths(&isolated),
+        [
+            "CLAUDE.md",
+            ".claude/CLAUDE.md",
+            "AGENTS.md",
+            "README.md",
+            ".claude/settings.json",
+            ".mcp.json"
+        ]
+    );
+    assert_eq!(
+        file(&isolated, "CLAUDE.md").content.as_deref(),
+        Some("# Regole\n\n- Esegui i test.\n")
+    );
+    assert_eq!(
+        isolated.claude_agents,
+        ["linked", "reviewer", "team/planner"]
+    );
+    assert_eq!(isolated.claude_commands, ["frontend/test", "release"]);
+    assert_eq!(isolated.claude_skills, ["pdf"]);
+    insta::assert_json_snapshot!("overview_files", pinned(&isolated));
+
+    let usage = |o: &ProjectOverview| -> Vec<(String, bool, String)> {
+        o.files
+            .iter()
+            .map(|f| (f.path.clone(), f.used_by_agents, f.usage_note.clone()))
+            .collect()
+    };
+    let expect = |rows: &[(&str, bool, &str)]| -> Vec<(String, bool, String)> {
+        rows.iter()
+            .map(|(p, used, note)| (p.to_string(), *used, note.to_string()))
+            .collect()
+    };
+    let prompt = "letto su istruzione del prompt";
+    let mine = "solo contesto per te";
+    let not_loaded = "non caricato in modalità Isolata";
+    assert_eq!(
+        usage(&isolated),
+        expect(&[
+            (
+                "CLAUDE.md",
+                false,
+                "letto dall'agente su istruzione del prompt"
+            ),
+            (
+                ".claude/CLAUDE.md",
+                false,
+                "non caricato in modalità Isolata: il prompt fa leggere solo il CLAUDE.md \
+                 della radice"
+            ),
+            ("AGENTS.md", false, prompt),
+            ("README.md", false, mine),
+            (".claude/settings.json", false, not_loaded),
+            (".mcp.json", false, not_loaded),
+        ])
+    );
+    let trusted = overview(&fx, true).await;
+    assert!(trusted.agents_load_config && !isolated.agents_load_config);
+    let loaded = "caricato all'avvio";
+    assert_eq!(
+        usage(&trusted),
+        expect(&[
+            ("CLAUDE.md", true, loaded),
+            (".claude/CLAUDE.md", true, loaded),
+            ("AGENTS.md", false, prompt),
+            ("README.md", false, mine),
+            (".claude/settings.json", true, loaded),
+            (".mcp.json", true, loaded),
+        ])
+    );
+    // Nothing else depends on it.
+    let unused = |o: &ProjectOverview| ProjectOverview {
+        agents_load_config: false,
+        files: o
+            .files
+            .iter()
+            .map(|f| ContextFile {
+                used_by_agents: false,
+                usage_note: String::new(),
+                ..f.clone()
+            })
+            .collect(),
+        ..o.clone()
+    };
+    assert_eq!(unused(&trusted), unused(&isolated));
+    fx.done();
+}
+
+/// What the overview does not show, it names: a file over 64 KiB is never asked for (asking
+/// `cat-file` for less than an object's size would leave the reader out of step, and the files
+/// after it unread; the limit itself is read), a file with a NUL or not UTF-8 is binary, a
+/// JSON file that does not parse is neither shown nor summarized (its secrets could not be
+/// masked). A symlink is its target, never followed; a folder where a file is expected is
+/// skipped; hidden and bidirectional characters are shown as `⟨U+XXXX⟩` and flagged, line
+/// feeds and tabs kept, CRLF as LF. A configuration that cannot be walked has no listings,
+/// its files are still shown. A bad revision is `Invalid`, an unknown commit `Git`.
+#[tokio::test]
+async fn overview_notes_what_it_does_not_show() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let limit = git::overview::MAX_FILE_BYTES;
+    write(&r.join("CLAUDE.md"), vec![b'a'; limit as usize + 1]);
+    write(&r.join(".claude/CLAUDE.md"), vec![b'b'; limit as usize]);
+    write(&r.join("AGENTS.md"), "text\0with a NUL\n");
+    write(&r.join("README.md"), b"\xff\xfe not UTF-8\n");
+    write(&r.join(".claude/settings.json"), "{\"permissions\": ");
+    write(
+        &r.join(".mcp.json"),
+        r#"{"mcpServers":{"db":{"command":"node","env":{"TOKEN":"mcp-secret"}}}"#,
+    );
+    commit_all(&fx, "odd files");
+    let o = overview(&fx, false).await;
+    assert_eq!(
+        paths(&o),
+        [
+            "CLAUDE.md",
+            ".claude/CLAUDE.md",
+            "AGENTS.md",
+            "README.md",
+            ".claude/settings.json",
+            ".mcp.json"
+        ]
+    );
+    assert!(o.files.iter().all(|f| !f.hidden_chars));
+    let shown = |path: &str| {
+        let f = file(&o, path);
+        (f.size, f.content.as_ref().map(String::len), f.note.clone())
+    };
+    let note = |text: &str| Some(text.to_owned());
+    assert_eq!(
+        shown("CLAUDE.md"),
+        (limit + 1, None, note("troppo grande (65 KiB)"))
+    );
+    assert_eq!(
+        shown(".claude/CLAUDE.md"),
+        (limit, Some(limit as usize), None)
+    );
+    assert_eq!(shown("AGENTS.md"), (16, None, note("binario")));
+    assert_eq!(shown("README.md"), (13, None, note("binario")));
+    let invalid = note("JSON non valido");
+    assert_eq!(shown(".claude/settings.json"), (16, None, invalid.clone()));
+    assert_eq!(shown(".mcp.json").1, None);
+    assert_eq!(shown(".mcp.json").2, invalid);
+    assert!(o.mcp_servers.is_empty());
+    let wire = serde_json::to_string(&o).unwrap();
+    assert!(!wire.contains("mcp-secret"), "{wire}");
+
+    for path in [
+        "CLAUDE.md",
+        ".claude/CLAUDE.md",
+        "AGENTS.md",
+        ".claude/settings.json",
+        ".mcp.json",
+    ] {
+        std::fs::remove_file(r.join(path)).unwrap();
+    }
+    std::os::unix::fs::symlink("AGENTS.md", r.join("CLAUDE.md")).unwrap();
+    write(&r.join(".claude/CLAUDE.md/notes.md"), "a folder\n");
+    write(
+        &r.join("AGENTS.md"),
+        "Usa \u{202E}txt.exe\u{202C} e\u{200B}basta\r\n\tfine\rX\n",
+    );
+    write(&r.join("README.md"), "# Demo\n");
+    std::os::unix::fs::symlink("conf\u{2066}ig.json", r.join(".claude/settings.json")).unwrap();
+    commit_all(&fx, "links and hidden characters");
+    let o = overview(&fx, false).await;
+    assert_eq!(
+        paths(&o),
+        [
+            "CLAUDE.md",
+            "AGENTS.md",
+            "README.md",
+            ".claude/settings.json"
+        ]
+    );
+    let shown = |path: &str| {
+        let f = file(&o, path);
+        (f.size, f.content.clone(), f.note.clone(), f.hidden_chars)
+    };
+    assert_eq!(
+        shown("CLAUDE.md"),
+        (9, None, Some("→ AGENTS.md".into()), false)
+    );
+    assert_eq!(
+        shown("AGENTS.md").1.as_deref(),
+        Some("Usa ⟨U+202E⟩txt.exe⟨U+202C⟩ e⟨U+200B⟩basta\n\tfine⟨U+000D⟩X\n")
+    );
+    assert!(shown("AGENTS.md").3);
+    assert_eq!(
+        shown("README.md"),
+        (7, Some("# Demo\n".into()), None, false)
+    );
+    assert_eq!(
+        shown(".claude/settings.json"),
+        (14, None, Some("→ conf⟨U+2066⟩ig.json".into()), true)
+    );
+
+    write(&r.join(".claude/commands/release.md"), "release\n");
+    let listed = {
+        commit_all(&fx, "a command");
+        overview(&fx, false).await
+    };
+    assert_eq!(listed.claude_commands, ["release"]);
+    std::os::unix::fs::symlink("/etc/hosts", r.join(".claude/out.json")).unwrap();
+    commit_all(&fx, "a link out of the tree");
+    let unwalkable = overview(&fx, false).await;
+    assert!(unwalkable.claude_commands.is_empty());
+    assert_eq!(unwalkable.files, listed.files);
+
+    let error_of = |commit: String| {
+        let (git, repo) = (fx.git.clone(), r.clone());
+        async move {
+            let src = git::overview::Source {
+                repo: &repo,
+                project_id: "project-1",
+                branch: "main",
+                commit: &commit,
+                agents_load_config: false,
+                records: &[],
+            };
+            git::overview::read(&git, &src).await.unwrap_err()
+        }
+    };
+    assert_eq!(error_of("--output=x".into()).await.code, ErrorCode::Invalid);
+    assert_eq!(error_of("0".repeat(40)).await.code, ErrorCode::Git);
+    fx.done();
+}
+
+/// No secret of `.mcp.json` or `.claude/settings.json` reaches the UI: the servers are names,
+/// transport and target only (`env` and `headers` by name, a URL without userinfo, query and
+/// fragment, a long command cut at 200 characters); both files are shown with every value of
+/// `env` and `headers`, every `*Helper` and credential helper masked and every `url` stripped
+/// the same way, at any depth.
+#[tokio::test]
+async fn overview_masks_every_secret() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let mcp = serde_json::json!({"mcpServers": {
+        "db": {
+            "command": "node",
+            "args": ["tools/db.js", "--port", "5432"],
+            "env": {"TOKEN": "env-secret", "DATABASE_URL": "postgres://u:pg-secret@db/app"},
+        },
+        "remote": {
+            "type": "http",
+            "url": "https://alice:url-secret@mcp.example.com/v1/mcp?key=query-secret#frag-secret",
+            "headers": {"Authorization": "Bearer header-secret", "X-Team": "team-secret"},
+            "headersHelper": "./bin/headers helper-secret",
+        },
+        "events": {"url": "https://events.example.com/sse?token=query2-secret"},
+        "plain": {"type": "sse", "url": "bob:plain-secret@sse.example.com/stream#frag2-secret"},
+        "long": {"command": "run", "args": ["x".repeat(300)]},
+        "empty": {},
+    }});
+    let settings = serde_json::json!({
+        "env": {"DEBUG": "debug-secret", "NUMBER": 42, "UNSET": null},
+        "apiKeyHelper": "./bin/key key-secret",
+        "otelHeadersHelper": "./bin/otel otel-secret",
+        "awsCredentialExport": "./bin/aws aws-secret",
+        "permissions": {"allow": ["Bash(npm test)"]},
+        "extraKnownMarketplaces": {"m": {"source": {
+            "source": "url",
+            "url": "https://user:market-secret@example.com/m.json",
+        }}},
+    });
+    write(&r.join(".mcp.json"), mcp.to_string());
+    write(&r.join(".claude/settings.json"), settings.to_string());
+    commit_all(&fx, "secrets");
+    let o = overview(&fx, true).await;
+    let wire = serde_json::to_string(&o).unwrap();
+    assert!(!wire.contains("secret"), "{wire}");
+
+    let servers: Vec<_> = o
+        .mcp_servers
+        .iter()
+        .map(|s| (s.name.as_str(), s.transport.as_str(), s.target.as_str()))
+        .collect();
+    let long = format!("run {}…", "x".repeat(git::overview::MAX_TARGET_CHARS - 5));
+    assert_eq!(
+        servers,
+        [
+            ("db", "stdio", "node tools/db.js --port 5432"),
+            ("empty", "sconosciuto", ""),
+            ("events", "http", "https://events.example.com/sse"),
+            ("long", "stdio", long.as_str()),
+            ("plain", "sse", "sse.example.com/stream"),
+            ("remote", "http", "https://mcp.example.com/v1/mcp"),
+        ]
+    );
+    assert_eq!(long.chars().count(), git::overview::MAX_TARGET_CHARS);
+    assert_eq!(o.mcp_servers[0].env_keys, ["DATABASE_URL", "TOKEN"]);
+    assert_eq!(o.mcp_servers[5].header_keys, ["Authorization", "X-Team"]);
+    for path in [".claude/settings.json", ".mcp.json"] {
+        let note = file(&o, path).note.as_deref();
+        assert_eq!(note, Some("valori segreti mascherati"), "{path}");
+    }
+    insta::assert_json_snapshot!("overview_masked", pinned(&o));
+    fx.done();
+}
+
+/// URLs a WHATWG parser (the CLI's) accepts with a userinfo although they are not written
+/// `scheme://`: one, three or backslash "slashes", surrounding blanks, tabs and line breaks
+/// inside, an uppercase scheme. Their userinfo, query and fragment go all the same, in the
+/// server list and under a `url` key of the settings; a non-special scheme's authority does
+/// not end at a backslash.
+#[tokio::test]
+async fn overview_strips_lax_urls_too() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let lax = [
+        ("a-one", "https:/u1:one-secret@one.example.com/mcp"),
+        ("b-three", "https:///u3:three-secret@three.example.com/mcp"),
+        (
+            "c-blank",
+            " \nhttps://u4:blank-secret@four.example.com/mcp \t",
+        ),
+        ("d-back", "https:\\\\u5:back-secret@five.example.com\\mcp"),
+        (
+            "e-tab",
+            "ht\ttps://u6:tab-secret@si\nx.example.com/mcp?k=q-secret#f-secret",
+        ),
+        ("f-upper", "HTTPS:\\/u7:upper-secret@seven.example.com"),
+        (
+            "g-custom",
+            "custom://u8:custom-secret@eight.example.com\\x?y=q2-secret",
+        ),
+    ];
+    let servers: serde_json::Map<String, serde_json::Value> = lax
+        .iter()
+        .map(|(name, url)| (name.to_string(), serde_json::json!({ "url": url })))
+        .collect();
+    let settings = serde_json::json!({"extraKnownMarketplaces": {"m": {"source": {
+        "source": "url",
+        "url": "https:/user:market-secret@example.com/m.json?t=q3-secret",
+    }}}});
+    write(
+        &r.join(".mcp.json"),
+        serde_json::json!({ "mcpServers": servers }).to_string(),
+    );
+    write(&r.join(".claude/settings.json"), settings.to_string());
+    commit_all(&fx, "lax urls");
+    let o = overview(&fx, true).await;
+    let wire = serde_json::to_string(&o).unwrap();
+    assert!(!wire.contains("secret"), "{wire}");
+    let targets: Vec<(&str, &str)> = o
+        .mcp_servers
+        .iter()
+        .map(|s| (s.name.as_str(), s.target.as_str()))
+        .collect();
+    assert_eq!(
+        targets,
+        [
+            ("a-one", "https:/one.example.com/mcp"),
+            ("b-three", "https:///three.example.com/mcp"),
+            ("c-blank", "https://four.example.com/mcp"),
+            ("d-back", "https:\\\\five.example.com\\mcp"),
+            ("e-tab", "https://six.example.com/mcp"),
+            ("f-upper", "HTTPS:\\/seven.example.com"),
+            ("g-custom", "custom://eight.example.com\\x"),
+        ]
+    );
+    let shown = file(&o, ".claude/settings.json");
+    let text = shown.content.as_deref().unwrap_or_default();
+    assert!(text.contains("\"https:/example.com/m.json\""), "{text}");
+    assert_eq!(shown.note.as_deref(), Some("valori segreti mascherati"));
+    fx.done();
+}
+
+/// A core on `fx`'s hostile environment with `home` as `HOME` and its worktrees in
+/// `fx.dir/<name>`, with `fx.repo` added as a project.
+async fn overview_core(fx: &Fx, name: &str, home: &Path) -> (Core, Project) {
+    let dir = fx.dir.join(name);
+    let mut extra_env = fx.hostile.env.clone();
+    extra_env.push(("HOME".into(), home.into()));
+    let config = CoreConfig {
+        data_dir: dir.join("data"),
+        cache_dir: dir.join("cache"),
+        claude_path: Some(common::fake_claude()),
+        path_env: std::env::var_os("PATH"),
+        extra_env,
+        open_log: None,
+    };
+    let core = Core::new(config, Arc::new(|_: AppEvent| {})).unwrap();
+    let settings = Settings {
+        worktree_root: dir.join("wt").to_string_lossy().into_owned(),
+        ..core.get_settings().await.unwrap()
+    };
+    core.update_settings(settings).await.unwrap();
+    let req = AddProjectReq {
+        path: fx.repo.to_string_lossy().into_owned(),
+    };
+    let project = core.add_project(req).await.unwrap().project;
+    (core, project)
+}
+
+/// `Core::get_project_overview`: the tip of the default target branch, not the main checkout;
+/// the agents load the configuration only once Trusted is approved; a repository that is the
+/// home directory is refused (spec §10.1: its `.claude` is the user's, never read).
+#[tokio::test]
+async fn core_overview_reads_the_target_tip_and_never_home() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    write(&r.join("CLAUDE.md"), "committed\n");
+    write(
+        &r.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Read(src/**)"]}}"#,
+    );
+    commit_all(&fx, "context");
+    write(&r.join("CLAUDE.md"), "edited, not committed\n");
+
+    let (core, project) = overview_core(&fx, "core", &fx.hostile.home).await;
+    let req = || ProjectIdReq {
+        project_id: project.id.clone(),
+    };
+    let isolated = core.get_project_overview(req()).await.unwrap();
+    assert_eq!(
+        (isolated.branch.as_str(), isolated.commit.clone()),
+        ("main", fx.rev("main"))
+    );
+    assert!(!isolated.agents_load_config);
+    let memory = file(&isolated, "CLAUDE.md");
+    assert_eq!(
+        (memory.content.as_deref(), memory.used_by_agents),
+        (Some("committed\n"), false)
+    );
+    let trust = SetProjectSecurityReq {
+        id: project.id.clone(),
+        config_policy: ConfigPolicy::Trusted,
+        allow_bypass: false,
+    };
+    core.set_project_security(trust).await.unwrap();
+    let trusted = core.get_project_overview(req()).await.unwrap();
+    assert!(trusted.agents_load_config);
+    assert!(file(&trusted, "CLAUDE.md").used_by_agents);
+    assert!(file(&trusted, ".claude/settings.json").used_by_agents);
+
+    let (home, project) = overview_core(&fx, "home", r).await;
+    let req = ProjectIdReq {
+        project_id: project.id,
+    };
+    let err = home.get_project_overview(req).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("home"), "{err}");
     fx.done();
 }

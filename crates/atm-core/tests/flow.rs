@@ -11,12 +11,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use atm_core::claude;
 use atm_core::db::{AttemptRow, Db, ProcessRow, ProjectRow};
 use atm_core::live::{BROADCAST_CAPACITY, Live, LiveMsg, SNAPSHOT_TAIL};
 use atm_core::normalize::TurnResult;
 use atm_core::runner::{self, StopCause, TurnOutcome};
-use atm_core::{AppEvent, Core, CoreConfig, Notify, TranscriptSink};
+use atm_core::{AppEvent, Core, CoreConfig, Notify, TranscriptSink, attachments, claude};
 use atm_types::*;
 use serde_json::Value;
 use tokio::sync::watch;
@@ -222,13 +221,23 @@ impl Flow {
         permission_mode: PermissionMode,
     ) -> Result<AttemptView, AppError> {
         let req = StartAttemptReq {
-            task_id: task.id.clone(),
-            target_branch: "main".into(),
             permission_mode,
-            model: None,
-            effort: None,
+            ..self.start_req(task)
         };
         self.core.start_attempt(req).await
+    }
+
+    /// What [`Flow::try_start`] sends: target `main`, Auto-edit, no other option.
+    fn start_req(&self, task: &Task) -> StartAttemptReq {
+        StartAttemptReq {
+            task_id: task.id.clone(),
+            target_branch: "main".into(),
+            permission_mode: PermissionMode::AcceptEdits,
+            model: None,
+            effort: None,
+            subagent_model: None,
+            max_subagents: None,
+        }
     }
 
     async fn start(&self, task: &Task) -> AttemptView {
@@ -1038,6 +1047,7 @@ async fn bypass_needs_the_project_setting_and_the_env_is_scrubbed() {
         default_target_branch: f.project.default_target_branch.clone(),
         default_permission_mode: bypass,
         default_model: None,
+        description: String::new(),
     };
     let err = f.core.update_project(update).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
@@ -1075,6 +1085,7 @@ async fn bypass_needs_the_project_setting_and_the_env_is_scrubbed() {
         default_target_branch: f.project.default_target_branch.clone(),
         default_permission_mode: bypass,
         default_model: None,
+        description: String::new(),
     };
     let project = f.core.update_project(update).await.unwrap();
     assert_eq!(project.default_permission_mode, bypass);
@@ -1623,6 +1634,7 @@ fn seeded_db() -> (Arc<Db>, String) {
     db.insert_project(&ProjectRow {
         id: "p".into(),
         name: "p".into(),
+        description: String::new(),
         repo_path: "/nonexistent/p".into(),
         default_target_branch: "main".into(),
         default_permission_mode: PermissionMode::AcceptEdits,
@@ -1655,6 +1667,9 @@ fn seeded_db() -> (Arc<Db>, String) {
         permission_mode: PermissionMode::AcceptEdits,
         model: None,
         effort: None,
+        subagent_model: None,
+        max_subagents: None,
+        subagents_used: 0,
         allow_rules: Vec::new(),
         merge_commit: None,
         created_at: 0,
@@ -2663,6 +2678,7 @@ async fn project_names_have_no_hidden_characters() {
                 default_target_branch: "main".into(),
                 default_permission_mode: PermissionMode::AcceptEdits,
                 default_model: None,
+                description: String::new(),
             })
             .await
             .unwrap_err();
@@ -2678,6 +2694,38 @@ async fn project_names_have_no_hidden_characters() {
         .await
         .unwrap();
     assert_eq!(added.project.name, "oddrepo");
+}
+
+/// Feature round 2026-09-29: the project description is trimmed, bounded in characters and
+/// listed with the project; a task starts with no attachments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_description_is_trimmed_and_bounded() {
+    let f = Flow::new(&[]).await;
+    let update = |description: String| UpdateProjectReq {
+        id: f.project.id.clone(),
+        name: f.project.name.clone(),
+        default_target_branch: "main".into(),
+        default_permission_mode: PermissionMode::AcceptEdits,
+        default_model: None,
+        description,
+    };
+    let project = f
+        .core
+        .update_project(update("  Il sito di prova\n".into()))
+        .await
+        .unwrap();
+    assert_eq!(project.description, "Il sito di prova");
+    let err = f
+        .core
+        .update_project(update("è".repeat(MAX_PROJECT_DESCRIPTION + 1)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    let listed = f.core.list_projects().await.unwrap();
+    assert_eq!(listed[0].description, "Il sito di prova");
+
+    let task = f.task("Allegati", "").await;
+    assert!(f.detail(&task.id).await.attachments.is_empty());
 }
 
 /// Finding M6 #15: a configuration that cannot be fingerprinted says why: in the project
@@ -2906,5 +2954,696 @@ async fn a_settings_file_under_another_case_is_checked_like_the_settings() {
             runner::BILLING_WORKTREE_NOTICE
         )),
         "{texts:?}"
+    );
+}
+
+// ---- feature round 2026-09-29: sub-agent limit (F6), attachments (F5) -------------------------
+
+/// The `--settings` JSON of an argv.
+fn settings_of(argv: &[String]) -> Value {
+    serde_json::from_str(flag(argv, "--settings=").unwrap()).unwrap()
+}
+
+/// `(behavior, message)` of every answer the fake got to a sub-agent spawn, oldest first.
+fn subagent_answers(f: &Flow) -> Vec<(String, Option<String>)> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["kind"] == "subagent")
+        .map(|r| {
+            let message = r["message"].as_str().map(str::to_owned);
+            (r["behavior"].as_str().unwrap().to_owned(), message)
+        })
+        .collect()
+}
+
+/// The text of every user message the fake played, oldest first.
+fn prompts(f: &Flow) -> Vec<String> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["kind"] == "turn")
+        .map(|r| r["prompt"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Statuses of the `Agent` calls of a transcript, oldest first.
+fn agent_calls(entries: &[Entry]) -> Vec<ToolStatus> {
+    entries
+        .iter()
+        .filter_map(|e| match &e.body {
+            EntryBody::ToolCall { name, status, .. } if name == "Agent" => Some(status.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn limit_reached(max: u8) -> String {
+    format!(
+        "Sub-agent limit for this task reached ({max}). Complete the work directly without \
+         starting sub-agents."
+    )
+}
+
+/// Spec F6: a limit of 2 and 3 spawns in a turn. The turn asks through an `ask` rule on
+/// `Agent`/`Task` (`Workflow` disallowed) with the sub-agents' model in `--settings`; the host
+/// allows two (counted, persisted) and denies the third with a text for the model, none of
+/// them ever pending. The next turn, with none left, disallows every way to spawn one, and a
+/// spawn that asks anyway is denied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_limit_allows_up_to_the_max_then_denies() {
+    let f = Flow::new(&[("FAKE_CLAUDE_SUBAGENTS", "3")]).await;
+    let task = f.task("Esplora", "[fake:subagents]").await;
+    let req = StartAttemptReq {
+        subagent_model: Some(" sonnet ".into()),
+        max_subagents: Some(2),
+        ..f.start_req(&task)
+    };
+    let attempt = f.core.start_attempt(req).await.unwrap();
+    assert_eq!(attempt.subagent_model.as_deref(), Some("sonnet"));
+    assert_eq!(
+        (attempt.max_subagents, attempt.subagents_used),
+        (Some(2), 0)
+    );
+
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    let a = d.attempt.unwrap();
+    assert_eq!((a.subagents_used, a.pending_approvals), (2, 0));
+    assert_eq!(f.db().attempt(&attempt.id).unwrap().subagents_used, 2);
+    let denied = ("deny".to_owned(), Some(limit_reached(2)));
+    let allowed = ("allow".to_owned(), None);
+    assert_eq!(
+        subagent_answers(&f),
+        [allowed.clone(), allowed, denied.clone()]
+    );
+    assert_eq!(
+        agent_calls(&f.entries(&attempt.id).await),
+        [
+            ToolStatus::Succeeded,
+            ToolStatus::Succeeded,
+            ToolStatus::Denied {
+                message: limit_reached(2)
+            }
+        ]
+    );
+    let first = &f.calls()[0];
+    assert_eq!(
+        flag(first, "--disallowedTools="),
+        Some("AskUserQuestion,Workflow")
+    );
+    let settings = settings_of(first);
+    assert_eq!(
+        settings["permissions"]["ask"],
+        serde_json::json!(["Agent", "Task"])
+    );
+    assert_eq!(
+        settings["env"],
+        serde_json::json!({"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"})
+    );
+
+    f.follow_up(&attempt.id, "Ancora [fake:subagents]", false)
+        .await;
+    let d = f.turn_end(&task.id, 2, TURN).await;
+    assert_eq!(d.attempt.unwrap().subagents_used, 2);
+    assert_eq!(
+        subagent_answers(&f)[3..],
+        [denied.clone(), denied.clone(), denied]
+    );
+    let second = &f.calls()[1];
+    assert_eq!(
+        flag(second, "--disallowedTools="),
+        Some("AskUserQuestion,Agent,Task,Workflow")
+    );
+    let settings = settings_of(second);
+    assert_eq!(settings["permissions"].get("ask"), None);
+    assert_eq!(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "sonnet");
+}
+
+/// Spec F6: a limit of 0 disallows sub-agents from the first turn; a spawn that asks anyway is
+/// denied at once and nothing is counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_zero_limit_disallows_subagents_from_the_first_turn() {
+    let f = Flow::new(&[("FAKE_CLAUDE_SUBAGENTS", "1")]).await;
+    let task = f.task("Da solo", "[fake:subagents]").await;
+    let req = StartAttemptReq {
+        max_subagents: Some(0),
+        ..f.start_req(&task)
+    };
+    f.core.start_attempt(req).await.unwrap();
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    let a = d.attempt.unwrap();
+    assert_eq!((a.subagents_used, a.pending_approvals), (0, 0));
+    assert_eq!(
+        subagent_answers(&f),
+        [("deny".to_owned(), Some(limit_reached(0)))]
+    );
+    let argv = &f.calls()[0];
+    assert_eq!(
+        flag(argv, "--disallowedTools="),
+        Some("AskUserQuestion,Agent,Task,Workflow")
+    );
+    let settings = settings_of(argv);
+    assert_eq!(settings["permissions"].get("ask"), None);
+    assert_eq!(settings.get("env"), None);
+}
+
+/// Without sub-agent options the argv is the one before the feature (no `ask`, no `env`, no
+/// other disallowed tool), and a spawn that asks (a rule of the user's) is an ordinary
+/// approval: pending until answered, never counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_limit_a_subagent_spawn_is_an_ordinary_approval() {
+    let f = Flow::new(&[("FAKE_CLAUDE_SUBAGENTS", "1")]).await;
+    let task = f.task("Libero", "[fake:subagents]").await;
+    let attempt = f.start(&task).await;
+    assert_eq!(
+        (attempt.max_subagents, attempt.subagent_model),
+        (None, None)
+    );
+    f.subscribe(&attempt.id).await;
+    let asking = f
+        .entry("the sub-agent approval", |e| {
+            matches!(&e.body, EntryBody::ToolCall {
+                name,
+                status: ToolStatus::AwaitingApproval { .. },
+                ..
+            } if name == "Agent")
+        })
+        .await;
+    let EntryBody::ToolCall {
+        status: ToolStatus::AwaitingApproval { approval_id, .. },
+        ..
+    } = asking.body
+    else {
+        unreachable!()
+    };
+    assert_eq!(f.card(&task.id).await.pending_approvals, 1);
+    let respond = RespondApprovalReq {
+        attempt_id: attempt.id.clone(),
+        approval_id,
+        decision: ApprovalDecision::Allow { remember: false },
+    };
+    f.core.respond_approval(respond).await.unwrap();
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(d.attempt.unwrap().subagents_used, 0);
+    assert_eq!(subagent_answers(&f), [("allow".to_owned(), None)]);
+    let argv = &f.calls()[0];
+    assert_eq!(flag(argv, "--disallowedTools="), Some("AskUserQuestion"));
+    let settings = settings_of(argv);
+    assert_eq!(settings.as_object().unwrap().len(), 1, "{settings}");
+    assert_eq!(settings["permissions"].as_object().unwrap().len(), 2);
+    assert!(!argv.iter().any(|a| a.starts_with("--add-dir")));
+}
+
+/// Spec F6: the sub-agent options are checked before any worktree or spawn: a model that is
+/// not one of `MODEL_ALIASES` (case included) and a limit over `MAX_SUBAGENTS` are `Invalid`;
+/// a blank model is the CLI's default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subagent_options_are_checked_before_the_worktree() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Opzioni", "[fake:simple]").await;
+    for (model, max) in [
+        (Some("gpt-5"), None),
+        (Some("Opus"), Some(1)),
+        (Some("claude-opus-4-1"), None),
+        (None, Some(MAX_SUBAGENTS + 1)),
+    ] {
+        let req = StartAttemptReq {
+            subagent_model: model.map(str::to_owned),
+            max_subagents: max,
+            ..f.start_req(&task)
+        };
+        let err = f.core.start_attempt(req).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{model:?} {max:?}: {err}");
+        let expected = if max.is_some_and(|n| n > MAX_SUBAGENTS) {
+            "Il limite di sub-agent va da 0 a 10"
+        } else {
+            "Il modello dei sub-agent deve essere uno di: opus, sonnet, haiku, fable"
+        };
+        assert_eq!(err.message, expected);
+    }
+    assert_eq!(f.worktrees(), 0);
+    assert!(f.calls().is_empty());
+    let req = StartAttemptReq {
+        subagent_model: Some("  ".into()),
+        max_subagents: Some(MAX_SUBAGENTS),
+        ..f.start_req(&task)
+    };
+    let attempt = f.core.start_attempt(req).await.unwrap();
+    assert_eq!(
+        (attempt.subagent_model, attempt.max_subagents),
+        (None, Some(MAX_SUBAGENTS))
+    );
+    f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(settings_of(&f.calls()[0]).get("env"), None);
+}
+
+/// Writes each file (its name as content) under `dir` and stages them: their tokens.
+async fn stage(f: &Flow, dir: &Path, names: &[&str]) -> Vec<Id> {
+    std::fs::create_dir_all(dir).unwrap();
+    let paths: Vec<PathBuf> = names
+        .iter()
+        .map(|name| {
+            let path = dir.join(name);
+            std::fs::write(&path, name).unwrap();
+            path
+        })
+        .collect();
+    let picked = f.core.stage_picks(paths).await.unwrap();
+    picked.into_iter().map(|p| p.token).collect()
+}
+
+async fn add(f: &Flow, task: &Task, tokens: Vec<Id>) -> Result<Vec<Attachment>, AppError> {
+    let req = AddTaskAttachmentsReq {
+        task_id: task.id.clone(),
+        tokens,
+    };
+    f.core.add_task_attachments(req).await
+}
+
+/// Folders in the task's attachments folder (one per copy).
+fn copies(f: &Flow, task: &Task) -> usize {
+    let dir = attachments::task_dir(&f.config.data_dir, &task.project_id, &task.id);
+    std::fs::read_dir(dir).map_or(0, |d| d.count())
+}
+
+fn mkfifo(path: &Path) {
+    let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path that outlives the call.
+    let rc = unsafe { libc::mkfifo(path_c.as_ptr(), 0o600) };
+    assert_eq!(rc, 0, "mkfifo {}", path.display());
+}
+
+/// Spec F5 end to end: a staged file (only its token, name and size reach the webview) is
+/// copied into the task's folder (0700 folders, a 0600 copy) and listed by the detail; the
+/// first prompt and a fresh session's list it as a read-only copy, and every turn gets the
+/// task's folder, canonical, through `--add-dir`. Once removed, its copy and the flag are gone;
+/// deleting the task removes its folder and the attempt's raw logs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attachments_reach_the_agent_and_go_with_the_task() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let f = Flow::new(&[]).await;
+    let task = f
+        .task("Con allegato", "Leggi lo schema [fake:simple]")
+        .await;
+    let original = f.dir.path().join("picked/schema db.png");
+    std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+    std::fs::write(&original, b"\x89PNG fake").unwrap();
+    let picked = f.core.stage_picks(vec![original.clone()]).await.unwrap();
+    assert_eq!(
+        (picked[0].name.as_str(), picked[0].size),
+        ("schema db.png", 9)
+    );
+    let added = add(&f, &task, vec![picked[0].token.clone()]).await.unwrap();
+    let a = &added[0];
+    assert_eq!((a.task_id.as_str(), a.size), (task.id.as_str(), 9));
+    let task_dir = attachments::task_dir(&f.config.data_dir, &f.project.id, &task.id);
+    assert_eq!(
+        PathBuf::from(&a.path),
+        task_dir.join(&a.id).join("schema db.png")
+    );
+    assert_eq!(std::fs::read(&a.path).unwrap(), b"\x89PNG fake");
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(Path::new(&a.path)), 0o600);
+    for dir in [&task_dir.join(&a.id), &task_dir, task_dir.parent().unwrap()] {
+        assert_eq!(mode(dir), 0o700, "{}", dir.display());
+    }
+    assert_eq!(f.detail(&task.id).await.attachments, added);
+
+    let attempt = f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let real = task_dir.canonicalize().unwrap();
+    let copy = format!("`{}`", real.join(&a.id).join("schema db.png").display());
+    let add_dir = format!("--add-dir={}", real.display());
+    let first = &prompts(&f)[0];
+    assert!(
+        first.starts_with("# Con allegato\n\nLeggi lo schema [fake:simple]\n\n## Attachments\n\n"),
+        "{first}"
+    );
+    assert!(first.contains("read-only copies"), "{first}");
+    assert!(first.ends_with(&format!("\n- {copy}")), "{first}");
+    assert!(f.calls()[0].contains(&add_dir), "{:?}", f.calls()[0]);
+
+    // A fresh session lists it again; every turn gets the folder.
+    f.follow_up(&attempt.id, "Riprendi", true).await;
+    f.turn_end(&task.id, 2, TURN).await;
+    assert!(prompts(&f)[1].contains(&copy));
+    assert!(f.calls()[1].contains(&add_dir));
+
+    f.core
+        .remove_task_attachment(IdReq { id: a.id.clone() })
+        .await
+        .unwrap();
+    assert!(!task_dir.join(&a.id).exists());
+    assert!(f.detail(&task.id).await.attachments.is_empty());
+    let err = f
+        .core
+        .remove_task_attachment(IdReq { id: a.id.clone() })
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    f.follow_up(&attempt.id, "Senza allegati [fake:simple]", false)
+        .await;
+    f.turn_end(&task.id, 3, TURN).await;
+    assert!(!f.calls()[2].iter().any(|a| a.starts_with("--add-dir")));
+    assert_eq!(std::fs::read(&original).unwrap(), b"\x89PNG fake");
+
+    let again = stage(&f, &f.dir.path().join("picked"), &["notes.txt"]).await;
+    add(&f, &task, again).await.unwrap();
+    let logs = runner::attempt_log_dir(&f.config.data_dir, &attempt.id);
+    let first_turn = &f.detail(&task.id).await.processes[0].id;
+    assert!(logs.join(first_turn).join("stdin.jsonl").exists());
+    f.core
+        .delete_task(IdReq {
+            id: task.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(!task_dir.exists());
+    assert!(!logs.exists());
+}
+
+/// Removing a project removes its tasks' attachments (one folder) and the raw logs of every
+/// attempt, closed ones included, once its rows are gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_project_removes_its_attachments_and_logs() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Da rimuovere", "[fake:simple]").await;
+    let tokens = stage(&f, &f.dir.path().join("picked"), &["spec.md"]).await;
+    add(&f, &task, tokens).await.unwrap();
+    let attempt = f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let req = AttemptIdReq {
+        attempt_id: attempt.id.clone(),
+    };
+    f.core.discard_attempt(req).await.unwrap();
+    let logs = runner::attempt_log_dir(&f.config.data_dir, &attempt.id);
+    let project_dir = attachments::project_dir(&f.config.data_dir, &f.project.id);
+    assert!(logs.exists() && project_dir.exists());
+    let req = IdReq {
+        id: f.project.id.clone(),
+    };
+    f.core.remove_project(req).await.unwrap();
+    assert!(!project_dir.exists());
+    assert!(!logs.exists());
+    assert!(f.config.data_dir.join("atm.sqlite3").exists());
+}
+
+/// Spec F5, the checks behind the picker (with a HOME and a `CLAUDE_CONFIG_DIR` of the test's
+/// own): the user's Claude Code configuration (`~/.claude*`, a link to it or from it
+/// included), `$CLAUDE_CONFIG_DIR`, `~/.ssh`, `~/.aws`, the Keychain and the app's data and
+/// cache are never staged; nor is a FIFO (without hanging), a folder, a dangling link, a file
+/// over 25 MB, a name the prompt could not quote, or more files than a task may hold. Each
+/// refusal names the file and stages nothing of its batch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn picks_outside_the_rules_are_refused() {
+    use std::os::unix::fs::symlink;
+    let dir = common::tempdir();
+    let root = dir.path().to_path_buf();
+    let (home, config) = (root.join("home"), root.join("claude-config"));
+    let env = hermetic(&[
+        ("HOME", home.to_str().unwrap()),
+        ("CLAUDE_CONFIG_DIR", config.to_str().unwrap()),
+    ]);
+    let f = Flow::setup(dir, env, common::fake_claude()).await;
+    let file = |path: PathBuf, content: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        path
+    };
+    let ok = file(home.join("notes/ok.txt"), "ok\n");
+    let ssh_key = file(home.join(".ssh/id_ed25519"), "key");
+    let key_link = home.join("notes/key.txt");
+    symlink(&ssh_key, &key_link).unwrap();
+    let dotfiles = file(root.join("dotfiles/claude-work/CLAUDE.md"), "# work\n");
+    symlink(dotfiles.parent().unwrap(), home.join(".claude-work")).unwrap();
+    const CLAUDE: &str = "la configurazione di Claude Code";
+    let refused = [
+        (file(home.join(".claude/settings.json"), "{}"), CLAUDE),
+        (file(home.join(".claude.json"), "{}"), CLAUDE),
+        (dotfiles, CLAUDE),
+        (file(config.join("settings.json"), "{}"), CLAUDE),
+        (ssh_key, "~/.ssh"),
+        (key_link, "~/.ssh"),
+        (file(home.join(".aws/credentials"), "[default]"), "~/.aws"),
+        (
+            file(home.join("Library/Keychains/login.keychain-db"), "k"),
+            "il Portachiavi (~/Library/Keychains)",
+        ),
+        (
+            f.config.data_dir.join("atm.sqlite3"),
+            "la cartella dei dati dell'app",
+        ),
+        (
+            file(f.config.cache_dir.join("claude-login.command"), "#!/bin/sh"),
+            "la cartella della cache dell'app",
+        ),
+    ];
+    for (path, what) in &refused {
+        let err = f
+            .core
+            .stage_picks(vec![ok.clone(), path.clone()])
+            .await
+            .unwrap_err();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+        assert_eq!(
+            err.message,
+            format!("«{name}» non si può allegare: è dentro {what}, che l'app non legge")
+        );
+    }
+
+    let fifo = root.join("pipe");
+    mkfifo(&fifo);
+    let folder = root.join("folder");
+    std::fs::create_dir(&folder).unwrap();
+    let dangling = root.join("dangling");
+    symlink(root.join("nowhere"), &dangling).unwrap();
+    let big = root.join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(MAX_ATTACHMENT_BYTES + 1)
+        .unwrap();
+    let tick = file(root.join("a`b.txt"), "x");
+    let hidden = file(root.join("\u{202E}\u{200B}"), "x");
+    for (path, start) in [
+        (&fifo, "«pipe» non è un file normale"),
+        (&folder, "«folder» non è un file normale"),
+        (&dangling, "«dangling» non si può leggere"),
+        (&big, "«big.bin» è troppo grande: il massimo è 25 MB"),
+        (&tick, "Il nome «a`b.txt» non va bene per un allegato"),
+        (&hidden, "Il nome «» non va bene per un allegato"),
+    ] {
+        let staged = tokio::time::timeout(TURN, f.core.stage_picks(vec![path.clone()]));
+        let err = staged.await.expect("a pick never hangs").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+        assert!(err.message.starts_with(start), "{err}");
+    }
+    let err = f
+        .core
+        .stage_picks(vec![ok.clone(); MAX_ATTACHMENTS_PER_TASK + 1])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.message,
+        "Si possono scegliere al massimo 20 file alla volta"
+    );
+
+    // Accepted: a file of the home, also through a link (named after its target), a name
+    // without its hidden characters, a long one cut keeping its extension, 25 MB exactly.
+    let link = home.join("notes/link.txt");
+    symlink(&ok, &link).unwrap();
+    let bidi = file(root.join("re\u{202E}port.txt"), "x");
+    let long = file(root.join(format!("{}.md", "n".repeat(130))), "x");
+    let max = root.join("max.bin");
+    std::fs::File::create(&max)
+        .unwrap()
+        .set_len(MAX_ATTACHMENT_BYTES)
+        .unwrap();
+    let picked = f
+        .core
+        .stage_picks(vec![ok, link, bidi, long, max])
+        .await
+        .unwrap();
+    let cut = format!("{}.md", "n".repeat(attachments::MAX_NAME_CHARS - 3));
+    let names: Vec<(&str, u64)> = picked.iter().map(|p| (p.name.as_str(), p.size)).collect();
+    assert_eq!(
+        names,
+        [
+            ("ok.txt", 3),
+            ("ok.txt", 3),
+            ("report.txt", 1),
+            (cut.as_str(), 1),
+            ("max.bin", MAX_ATTACHMENT_BYTES)
+        ]
+    );
+
+    // Compared ASCII case-insensitively (APFS folds case), directly under the home only.
+    let deny = attachments::DenyList::new(&home, None, &f.config.data_dir, &f.config.cache_dir);
+    assert_eq!(deny.refusal(&home.join(".SSH/id_rsa")), Some("~/.ssh"));
+    assert_eq!(deny.refusal(&home.join(".Claude/x.md")), Some(CLAUDE));
+    assert_eq!(deny.refusal(&home.join("notes/.claude/x.md")), None);
+    assert_eq!(deny.refusal(&home.join("notes/ok.txt")), None);
+}
+
+/// Spec F5: a token is redeemed once (used again, unknown, or in a batch with such a token, it
+/// is used up all the same); the copy checks the original again, so a file replaced by a link
+/// or a FIFO (without hanging), by a hard link to another file or by a rename over it, a file
+/// whose folder became a link to another folder, or one grown past the limit after the pick is
+/// refused, and a refused batch leaves no copy behind.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tokens_are_single_use_and_the_copy_checks_again() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Allegati", "").await;
+    let src = f.dir.path().join("picked");
+    let gone = |e: AppError| {
+        assert_eq!(e.code, ErrorCode::Invalid, "{e}");
+        assert_eq!(e.message, "File non più disponibile: sceglilo di nuovo");
+    };
+    let a = stage(&f, &src, &["a.txt"]).await;
+    assert_eq!(add(&f, &task, a.clone()).await.unwrap().len(), 1);
+    gone(add(&f, &task, a).await.unwrap_err());
+    let b = stage(&f, &src, &["b.txt"]).await;
+    gone(
+        add(&f, &task, vec![b[0].clone(), "unknown".into()])
+            .await
+            .unwrap_err(),
+    );
+    gone(add(&f, &task, b).await.unwrap_err());
+
+    let c = stage(&f, &src, &["c.txt"]).await;
+    std::fs::remove_file(src.join("c.txt")).unwrap();
+    std::os::unix::fs::symlink(src.join("a.txt"), src.join("c.txt")).unwrap();
+    let err = add(&f, &task, c).await.unwrap_err();
+    assert!(
+        err.message.starts_with("«c.txt» non è un file normale"),
+        "{err}"
+    );
+    let d = stage(&f, &src, &["d.txt"]).await;
+    std::fs::remove_file(src.join("d.txt")).unwrap();
+    mkfifo(&src.join("d.txt"));
+    let err = tokio::time::timeout(TURN, add(&f, &task, d))
+        .await
+        .expect("a FIFO never blocks the copy")
+        .unwrap_err();
+    assert!(
+        err.message.starts_with("«d.txt» non è un file normale"),
+        "{err}"
+    );
+    let e = stage(&f, &src, &["e.bin"]).await;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(src.join("e.bin"))
+        .unwrap()
+        .set_len(MAX_ATTACHMENT_BYTES + 1)
+        .unwrap();
+    let err = add(&f, &task, e).await.unwrap_err();
+    assert!(err.message.starts_with("«e.bin» è troppo grande"), "{err}");
+    // Same path, another file: every check but the identity would pass.
+    let changed = |e: AppError, name: &str| {
+        assert_eq!(e.code, ErrorCode::Invalid, "{e}");
+        assert_eq!(
+            e.message,
+            format!(
+                "«{name}» è cambiato dopo la scelta (sostituito o spostato): sceglilo di nuovo"
+            )
+        );
+    };
+    let k = stage(&f, &src, &["k.txt"]).await;
+    std::fs::remove_file(src.join("k.txt")).unwrap();
+    std::fs::hard_link(src.join("a.txt"), src.join("k.txt")).unwrap();
+    changed(add(&f, &task, k).await.unwrap_err(), "k.txt");
+    let m = stage(&f, &src, &["m.txt"]).await;
+    std::fs::write(src.join("m.new"), "other").unwrap();
+    std::fs::rename(src.join("m.new"), src.join("m.txt")).unwrap();
+    changed(add(&f, &task, m).await.unwrap_err(), "m.txt");
+    let nested = f.dir.path().join("nested");
+    let n = stage(&f, &nested.join("sub"), &["n.txt"]).await;
+    std::fs::create_dir_all(nested.join("other")).unwrap();
+    std::fs::write(nested.join("other/n.txt"), "other").unwrap();
+    std::fs::rename(nested.join("sub"), nested.join("sub-old")).unwrap();
+    std::os::unix::fs::symlink(nested.join("other"), nested.join("sub")).unwrap();
+    changed(add(&f, &task, n).await.unwrap_err(), "n.txt");
+    // Written in place (same file): copied with its new content.
+    let p = stage(&f, &src, &["p.txt"]).await;
+    std::fs::write(src.join("p.txt"), "edited").unwrap();
+    let edited = add(&f, &task, p).await.unwrap();
+    assert_eq!(std::fs::read(&edited[0].path).unwrap(), b"edited");
+    let batch = stage(&f, &src, &["g1.txt", "g2.txt"]).await;
+    std::fs::remove_file(src.join("g2.txt")).unwrap();
+    mkfifo(&src.join("g2.txt"));
+    let err = add(&f, &task, batch).await.unwrap_err();
+    assert!(err.message.starts_with("«g2.txt»"), "{err}");
+    assert_eq!(f.detail(&task.id).await.attachments.len(), 2);
+    assert_eq!(copies(&f, &task), 2);
+
+    let h = stage(&f, &src, &["h.txt"]).await;
+    let req = AddTaskAttachmentsReq {
+        task_id: "nope".into(),
+        tokens: h.clone(),
+    };
+    let err = f.core.add_task_attachments(req).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    gone(add(&f, &task, h).await.unwrap_err());
+    assert!(add(&f, &task, Vec::new()).await.unwrap().is_empty());
+}
+
+/// `MAX_ATTACHMENTS_PER_TASK` is counted again in the insertion's transaction: past it
+/// nothing is added and the copies just made are removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_attachment_limit_removes_the_copies_it_refuses() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Tanti allegati", "").await;
+    let src = f.dir.path().join("picked");
+    let names: Vec<String> = (1..=MAX_ATTACHMENTS_PER_TASK)
+        .map(|n| format!("f{n}.txt"))
+        .collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let tokens = stage(&f, &src, &names).await;
+    let added = add(&f, &task, tokens).await.unwrap();
+    assert_eq!(added.len(), MAX_ATTACHMENTS_PER_TASK);
+    let extra = stage(&f, &src, &["extra.txt"]).await;
+    let err = add(&f, &task, extra).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert_eq!(err.message, "Un task può avere al massimo 20 allegati");
+    assert_eq!(copies(&f, &task), MAX_ATTACHMENTS_PER_TASK);
+    assert_eq!(
+        f.detail(&task.id).await.attachments.len(),
+        MAX_ATTACHMENTS_PER_TASK
+    );
+}
+
+/// The staged picks without any clock but the caller's: redeemed once within `PICK_TTL`,
+/// expired at it, and past `MAX_STAGED` the oldest are dropped first.
+#[test]
+fn staged_picks_expire_and_the_oldest_go_first() {
+    let pick = |n: u64| attachments::Picked {
+        path: PathBuf::from(format!("/picked/{n}")),
+        name: format!("{n}.txt"),
+        size: n,
+        id: (1, n),
+    };
+    let t0 = std::time::Instant::now();
+    let mut staging = attachments::Staging::default();
+    let a = staging.stage(vec![pick(1)], t0);
+    let b = staging.stage(vec![pick(2)], t0);
+    assert_eq!(
+        (a[0].name.as_str(), a[0].size, a[0].token != b[0].token),
+        ("1.txt", 1, true)
+    );
+    let almost = t0 + attachments::PICK_TTL - Duration::from_secs(1);
+    assert_eq!(staging.redeem(&a[0].token, almost), Some(pick(1)));
+    assert_eq!(staging.redeem(&a[0].token, almost), None);
+    assert_eq!(
+        staging.redeem(&b[0].token, t0 + attachments::PICK_TTL),
+        None
+    );
+
+    let files: Vec<_> = (0..=attachments::MAX_STAGED as u64).map(pick).collect();
+    let many = staging.stage(files, t0);
+    assert_eq!(staging.redeem(&many[0].token, t0), None);
+    assert_eq!(staging.redeem(&many[1].token, t0), Some(pick(1)));
+    let last = attachments::MAX_STAGED;
+    assert_eq!(
+        staging.redeem(&many[last].token, t0),
+        Some(pick(last as u64))
     );
 }

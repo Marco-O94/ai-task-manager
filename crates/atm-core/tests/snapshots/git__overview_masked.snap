@@ -1,0 +1,95 @@
+---
+source: crates/atm-core/tests/git.rs
+expression: pinned(&o)
+---
+{
+  "project_id": "project-1",
+  "branch": "main",
+  "commit": "<tip>",
+  "agents_load_config": true,
+  "files": [
+    {
+      "path": "README.md",
+      "kind": "Readme",
+      "size": 6,
+      "content": "hello\n",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "solo contesto per te"
+    },
+    {
+      "path": ".claude/settings.json",
+      "kind": "Settings",
+      "size": 341,
+      "content": "{\n  \"apiKeyHelper\": \"•••\",\n  \"awsCredentialExport\": \"•••\",\n  \"env\": {\n    \"DEBUG\": \"•••\",\n    \"NUMBER\": \"•••\",\n    \"UNSET\": null\n  },\n  \"extraKnownMarketplaces\": {\n    \"m\": {\n      \"source\": {\n        \"source\": \"url\",\n        \"url\": \"https://example.com/m.json\"\n      }\n    }\n  },\n  \"otelHeadersHelper\": \"•••\",\n  \"permissions\": {\n    \"allow\": [\n      \"Bash(npm test)\"\n    ]\n  }\n}",
+      "note": "valori segreti mascherati",
+      "hidden_chars": false,
+      "used_by_agents": true,
+      "usage_note": "caricato all'avvio"
+    },
+    {
+      "path": ".mcp.json",
+      "kind": "Mcp",
+      "size": 887,
+      "content": "{\n  \"mcpServers\": {\n    \"db\": {\n      \"args\": [\n        \"tools/db.js\",\n        \"--port\",\n        \"5432\"\n      ],\n      \"command\": \"node\",\n      \"env\": {\n        \"DATABASE_URL\": \"•••\",\n        \"TOKEN\": \"•••\"\n      }\n    },\n    \"empty\": {},\n    \"events\": {\n      \"url\": \"https://events.example.com/sse\"\n    },\n    \"long\": {\n      \"args\": [\n        \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"\n      ],\n      \"command\": \"run\"\n    },\n    \"plain\": {\n      \"type\": \"sse\",\n      \"url\": \"sse.example.com/stream\"\n    },\n    \"remote\": {\n      \"headers\": {\n        \"Authorization\": \"•••\",\n        \"X-Team\": \"•••\"\n      },\n      \"headersHelper\": \"•••\",\n      \"type\": \"http\",\n      \"url\": \"https://mcp.example.com/v1/mcp\"\n    }\n  }\n}",
+      "note": "valori segreti mascherati",
+      "hidden_chars": false,
+      "used_by_agents": true,
+      "usage_note": "caricato all'avvio"
+    }
+  ],
+  "mcp_servers": [
+    {
+      "name": "db",
+      "transport": "stdio",
+      "target": "node tools/db.js --port 5432",
+      "env_keys": [
+        "DATABASE_URL",
+        "TOKEN"
+      ],
+      "header_keys": []
+    },
+    {
+      "name": "empty",
+      "transport": "sconosciuto",
+      "target": "",
+      "env_keys": [],
+      "header_keys": []
+    },
+    {
+      "name": "events",
+      "transport": "http",
+      "target": "https://events.example.com/sse",
+      "env_keys": [],
+      "header_keys": []
+    },
+    {
+      "name": "long",
+      "transport": "stdio",
+      "target": "run xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…",
+      "env_keys": [],
+      "header_keys": []
+    },
+    {
+      "name": "plain",
+      "transport": "sse",
+      "target": "sse.example.com/stream",
+      "env_keys": [],
+      "header_keys": []
+    },
+    {
+      "name": "remote",
+      "transport": "http",
+      "target": "https://mcp.example.com/v1/mcp",
+      "env_keys": [],
+      "header_keys": [
+        "Authorization",
+        "X-Team"
+      ]
+    }
+  ],
+  "claude_agents": [],
+  "claude_commands": [],
+  "claude_skills": []
+}

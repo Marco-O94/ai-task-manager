@@ -3,15 +3,16 @@
 //! transaction. Constraint violations map to typed errors (`Conflict`, `Busy`), everything
 //! else from rusqlite to `Db`. Timestamps are passed in (`now`) so tests are deterministic.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, MutexGuard};
 
 use atm_types::{
-    AppError, AttemptState, AttemptView, ConfigPolicy, CreateTaskReq, Effort, Entry, EntryBody,
-    EntryPage, Id, Millis, PermissionMode, ProcessInfo, ProcessStatus, Project, Settings,
-    StopReason, Task, TaskCard, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq,
-    WorktreeState,
+    AppError, Attachment, AttemptState, AttemptView, ConfigPolicy, CreateTaskReq, Effort, Entry,
+    EntryBody, EntryPage, Id, MAX_ATTACHMENTS_PER_TASK, Millis, PermissionMode, ProcessInfo,
+    ProcessStatus, Project, Settings, StopReason, Task, TaskCard, TaskStatus, ToolStatus,
+    UpdateProjectReq, UpdateTaskReq, WorktreeState,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
@@ -23,7 +24,10 @@ use serde::de::DeserializeOwned;
 pub const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;";
 
 /// Migration `i` brings `PRAGMA user_version` from `i` to `i + 1`.
-pub const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_init.sql")];
+pub const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_init.sql"),
+    include_str!("../migrations/0002_overview_attachments_subagents.sql"),
+];
 
 /// Gap between consecutive positions (appends use `max + GAP`, renumbering uses `k * GAP`).
 pub const POSITION_GAP: f64 = 1024.0;
@@ -60,6 +64,8 @@ fn apply_migrations(conn: &mut Connection) -> Res<()> {
 pub struct ProjectRow {
     pub id: Id,
     pub name: String,
+    /// At most `MAX_PROJECT_DESCRIPTION` characters (CHECK); `''` by default.
+    pub description: String,
     pub repo_path: String,
     pub default_target_branch: String,
     pub default_permission_mode: PermissionMode,
@@ -79,6 +85,7 @@ impl ProjectRow {
         Project {
             id: self.id.clone(),
             name: self.name.clone(),
+            description: self.description.clone(),
             repo_path: self.repo_path.clone(),
             default_target_branch: self.default_target_branch.clone(),
             default_permission_mode: self.default_permission_mode,
@@ -128,6 +135,12 @@ pub struct AttemptRow {
     pub permission_mode: PermissionMode,
     pub model: Option<String>,
     pub effort: Option<Effort>,
+    /// `CLAUDE_CODE_SUBAGENT_MODEL` of every turn; `None` = the CLI's default.
+    pub subagent_model: Option<String>,
+    /// Sub-agents the main agent may spawn over the attempt (CHECK 0..=10); `None` = no limit.
+    pub max_subagents: Option<u8>,
+    /// Sub-agent spawns allowed so far ([`Db::count_subagent`]).
+    pub subagents_used: u32,
     /// `Tool(ruleContent)` strings from "Consenti sempre" (spec §7.8); JSON array in the DB.
     pub allow_rules: Vec<String>,
     pub merge_commit: Option<String>,
@@ -151,12 +164,41 @@ impl AttemptRow {
             permission_mode: self.permission_mode,
             model: self.model.clone(),
             effort: self.effort,
+            subagent_model: self.subagent_model.clone(),
+            max_subagents: self.max_subagents,
+            subagents_used: self.subagents_used,
             session_started: self.session_started,
             merge_commit: self.merge_commit.clone(),
             running,
             pending_approvals,
             created_at: self.created_at,
             closed_at: self.closed_at,
+        }
+    }
+}
+
+/// `task_attachments` row (spec F5). The copy's path is not stored: it follows from the ids
+/// and the name (`attachments::attachment_path`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachmentRow {
+    pub id: Id,
+    pub task_id: Id,
+    /// 1..=255 characters (CHECK).
+    pub name: String,
+    pub size: u64,
+    pub created_at: Millis,
+}
+
+impl AttachmentRow {
+    /// IPC view; `path` is the copy's absolute path.
+    pub fn view(&self, path: &Path) -> Attachment {
+        Attachment {
+            id: self.id.clone(),
+            task_id: self.task_id.clone(),
+            name: self.name.clone(),
+            size: self.size,
+            path: path.to_string_lossy().into_owned(),
+            created_at: self.created_at,
         }
     }
 }
@@ -338,8 +380,8 @@ impl Db {
             c.execute(
                 "INSERT INTO projects (id, name, repo_path, default_target_branch,
                     default_permission_mode, default_model, config_policy, trusted_fingerprint,
-                    allow_bypass, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    allow_bypass, created_at, updated_at, description)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     p.id,
                     p.name,
@@ -352,6 +394,7 @@ impl Db {
                     p.allow_bypass,
                     p.created_at,
                     p.updated_at,
+                    p.description,
                 ],
             )?;
             Ok(())
@@ -375,7 +418,8 @@ impl Db {
         })
     }
 
-    /// Updates the editable fields and `updated_at`. Errors: `NotFound`.
+    /// Updates the editable fields (description included) and `updated_at`. Errors:
+    /// `NotFound`, `Invalid` (Autonomo without the opt-in, a CHECK).
     pub fn update_project(
         &self,
         req: &UpdateProjectReq,
@@ -387,7 +431,8 @@ impl Db {
             let row = c
                 .query_row(
                     "UPDATE projects SET name = ?2, default_target_branch = ?3,
-                        default_permission_mode = ?4, default_model = ?5, updated_at = ?6
+                        default_permission_mode = ?4, default_model = ?5, updated_at = ?6,
+                        description = ?7
                      WHERE id = ?1 AND (?4 <> 'bypassPermissions' OR allow_bypass = 1)
                      RETURNING *",
                     params![
@@ -397,6 +442,7 @@ impl Db {
                         req.default_permission_mode.as_str(),
                         req.default_model,
                         now,
+                        req.description,
                     ],
                     project_row,
                 )
@@ -466,11 +512,39 @@ impl Db {
         })
     }
 
-    /// Deletes the project; tasks, attempts, processes and entries cascade.
+    /// Deletes the project; tasks, attempts, processes, entries and attachment rows cascade
+    /// (their files and logs are the caller's: [`Db::project_task_ids`],
+    /// [`Db::project_attempt_ids`] first).
     pub fn delete_project(&self, id: &str) -> Result<(), AppError> {
         self.write(|c| {
             c.execute("DELETE FROM projects WHERE id = ?1", [id])?;
             Ok(())
+        })
+    }
+
+    /// Ids of the project's tasks (to clean up their attachment folders before
+    /// [`Db::delete_project`]).
+    pub fn project_task_ids(&self, project_id: &str) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT id FROM tasks WHERE project_id = ?1 ORDER BY created_at, id",
+                [project_id],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    /// Ids of every attempt of the project's tasks, closed ones included (their logs).
+    pub fn project_attempt_ids(&self, project_id: &str) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT a.id FROM attempts a JOIN tasks t ON t.id = a.task_id
+                 WHERE t.project_id = ?1 ORDER BY a.created_at, a.rowid",
+                [project_id],
+                |r| r.get(0),
+            )
         })
     }
 
@@ -586,7 +660,8 @@ impl Db {
         })
     }
 
-    /// Deletes the task and, by cascade, its attempts, processes and entries.
+    /// Deletes the task and, by cascade, its attempts, processes, entries and attachment rows
+    /// (files and logs are the caller's: [`Db::task_attempt_ids`] first).
     pub fn delete_task(&self, id: &str) -> Result<(), AppError> {
         self.write(|c| {
             c.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
@@ -641,9 +716,10 @@ impl Db {
             c.execute(
                 "INSERT INTO attempts (id, task_id, state, branch, target_branch, base_commit,
                     worktree_path, worktree_state, session_id, session_started, permission_mode,
-                    model, effort, allow_rules, merge_commit, created_at, updated_at, closed_at)
+                    model, effort, allow_rules, merge_commit, created_at, updated_at, closed_at,
+                    subagent_model, max_subagents, subagents_used)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18)",
+                    ?17, ?18, ?19, ?20, ?21)",
                 params![
                     a.id,
                     a.task_id,
@@ -663,6 +739,9 @@ impl Db {
                     a.created_at,
                     a.updated_at,
                     a.closed_at,
+                    a.subagent_model,
+                    a.max_subagents,
+                    a.subagents_used,
                 ],
             )?;
             insert_process(c, process)?;
@@ -708,6 +787,18 @@ impl Db {
                 "SELECT * FROM attempts WHERE task_id = ?1 ORDER BY created_at, rowid",
                 [task_id],
                 attempt_row,
+            )
+        })
+    }
+
+    /// Ids of every attempt of the task, oldest first (their logs, before [`Db::delete_task`]).
+    pub fn task_attempt_ids(&self, task_id: &str) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT id FROM attempts WHERE task_id = ?1 ORDER BY created_at, rowid",
+                [task_id],
+                |r| r.get(0),
             )
         })
     }
@@ -798,6 +889,29 @@ impl Db {
         })
     }
 
+    /// Counts one sub-agent spawn of the attempt if its limit allows it, in one statement:
+    /// `Some(subagents_used)` after the increment, `None` (nothing written) once
+    /// `subagents_used` has reached `max_subagents`. No limit (`NULL`) always counts.
+    /// Errors: `NotFound`.
+    pub fn count_subagent(&self, attempt_id: &str, now: Millis) -> Result<Option<u32>, AppError> {
+        self.write(|c| {
+            let used = c
+                .query_row(
+                    "UPDATE attempts SET subagents_used = subagents_used + 1, updated_at = ?2
+                     WHERE id = ?1
+                        AND (max_subagents IS NULL OR subagents_used < max_subagents)
+                     RETURNING subagents_used",
+                    params![attempt_id, now],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if used.is_none() {
+                get_attempt(c, attempt_id)?;
+            }
+            Ok(used)
+        })
+    }
+
     /// One transaction (spec §8.7 step 7): attempt → merged with `merge_commit` and
     /// `closed_at`, task → done. Errors: `NotFound`.
     pub fn finish_merge(
@@ -834,6 +948,80 @@ impl Db {
                 .or_missing("Attempt", attempt_id)?;
             let from = [TaskStatus::InProgress, TaskStatus::InReview];
             transition(c, &task_id, &from, TaskStatus::Todo, now)
+        })
+    }
+
+    // ---- attachments ----------------------------------------------------------------------
+
+    /// The task's attachments, oldest first.
+    pub fn task_attachments(&self, task_id: &str) -> Result<Vec<AttachmentRow>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT * FROM task_attachments WHERE task_id = ?1 ORDER BY created_at, rowid",
+                [task_id],
+                attachment_row,
+            )
+        })
+    }
+
+    /// How many attachments the task has.
+    pub fn attachment_count(&self, task_id: &str) -> Result<usize, AppError> {
+        self.read(|c| count_attachments(c, task_id))
+    }
+
+    /// Inserts `rows` in one transaction, then counts each of their tasks' attachments again:
+    /// past [`MAX_ATTACHMENTS_PER_TASK`] nothing is inserted. Errors: `Invalid` (the limit, a
+    /// CHECK), `NotFound` (the task is gone), `Conflict` (an id already used).
+    pub fn insert_attachments(&self, rows: &[AttachmentRow]) -> Result<(), AppError> {
+        self.write(|c| {
+            let mut stmt = c.prepare_cached(
+                "INSERT INTO task_attachments (id, task_id, name, size, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for a in rows {
+                stmt.execute(params![
+                    a.id,
+                    a.task_id,
+                    a.name,
+                    a.size as i64,
+                    a.created_at
+                ])?;
+            }
+            let tasks: BTreeSet<&str> = rows.iter().map(|a| a.task_id.as_str()).collect();
+            for task_id in tasks {
+                if count_attachments(c, task_id)? > MAX_ATTACHMENTS_PER_TASK {
+                    return Err(AppError::invalid(format!(
+                        "Un task può avere al massimo {MAX_ATTACHMENTS_PER_TASK} allegati"
+                    ))
+                    .into());
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Errors: `NotFound`.
+    pub fn attachment(&self, id: &str) -> Result<AttachmentRow, AppError> {
+        self.read(|c| {
+            c.query_row(
+                "SELECT * FROM task_attachments WHERE id = ?1",
+                [id],
+                attachment_row,
+            )
+            .or_missing("Allegato", id)
+        })
+    }
+
+    /// Deletes the row and returns it (its file is the caller's). Errors: `NotFound`.
+    pub fn delete_attachment(&self, id: &str) -> Result<AttachmentRow, AppError> {
+        self.write(|c| {
+            c.query_row(
+                "DELETE FROM task_attachments WHERE id = ?1 RETURNING *",
+                [id],
+                attachment_row,
+            )
+            .or_missing("Allegato", id)
         })
     }
 
@@ -1212,6 +1400,7 @@ fn project_row(r: &Row<'_>) -> rusqlite::Result<ProjectRow> {
     Ok(ProjectRow {
         id: r.get("id")?,
         name: r.get("name")?,
+        description: r.get("description")?,
         repo_path: r.get("repo_path")?,
         default_target_branch: r.get("default_target_branch")?,
         default_permission_mode: text(r, "default_permission_mode")?,
@@ -1252,6 +1441,9 @@ fn attempt_row(r: &Row<'_>) -> rusqlite::Result<AttemptRow> {
         permission_mode: text(r, "permission_mode")?,
         model: r.get("model")?,
         effort: opt_text(r, "effort")?,
+        subagent_model: r.get("subagent_model")?,
+        max_subagents: r.get("max_subagents")?,
+        subagents_used: r.get("subagents_used")?,
         allow_rules: r.get::<_, Json<_>>("allow_rules")?.0,
         merge_commit: r.get("merge_commit")?,
         created_at: r.get("created_at")?,
@@ -1286,6 +1478,16 @@ fn process_row(r: &Row<'_>) -> rusqlite::Result<ProcessRow> {
         head_after: r.get("head_after")?,
         started_at: r.get("started_at")?,
         finished_at: r.get("finished_at")?,
+    })
+}
+
+fn attachment_row(r: &Row<'_>) -> rusqlite::Result<AttachmentRow> {
+    Ok(AttachmentRow {
+        id: r.get("id")?,
+        task_id: r.get("task_id")?,
+        name: r.get("name")?,
+        size: r.get::<_, i64>("size")? as u64,
+        created_at: r.get("created_at")?,
     })
 }
 
@@ -1334,6 +1536,15 @@ fn get_task(c: &Connection, id: &str) -> Res<Task> {
 fn get_attempt(c: &Connection, id: &str) -> Res<AttemptRow> {
     c.query_row("SELECT * FROM attempts WHERE id = ?1", [id], attempt_row)
         .or_missing("Attempt", id)
+}
+
+fn count_attachments(c: &Connection, task_id: &str) -> Res<usize> {
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM task_attachments WHERE task_id = ?1",
+        [task_id],
+        |r| r.get(0),
+    )?;
+    Ok(n as usize)
 }
 
 fn insert_process(c: &Connection, p: &ProcessRow) -> Res<()> {

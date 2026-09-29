@@ -1,13 +1,16 @@
-//! Task panel (right split, 55 %): header (Avvia, Stop, Scarta, Apri in…, "Sposta in…") and
-//! the Agente / Modifiche tabs (spec §9.2). Refetches `get_task_detail` when
-//! `AppCtx::detail_version` changes. Owner: M2-UI-TASK.
+//! Task panel (right split, 55 %): header (Avvia, Stop, Scarta, Apri in…, "Sposta in…", the
+//! attachments, the attempt's model and sub-agent limit) and the Agente / Modifiche tabs
+//! (spec §9.2). Refetches `get_task_detail` when `AppCtx::detail_version` changes.
+//! Owner: M2-UI-TASK, attachments and model line UI-TASKS.
 
 use atm_types::{
     AppError, AttemptIdReq, AttemptView, CONTINUE_PROMPT, GetTaskDetail, Id, IdReq, MoveTask,
     MoveTaskReq, OpenAttempt, OpenAttemptReq, OpenTarget, ProcessStatus, SendFollowUp,
     SendFollowUpReq, StopAttempt, Task, TaskDetail, TaskStatus, WorktreeState,
 };
-use icons::{Code, FolderOpen, GitBranch, Play, RotateCw, Square, SquareTerminal, Trash2, X};
+use icons::{
+    Code, FolderOpen, GitBranch, Paperclip, Play, RotateCw, Square, SquareTerminal, Trash2, X,
+};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -27,6 +30,7 @@ use crate::views::composer::Composer;
 use crate::views::diff::{ClosedAttempt, DiffView};
 use crate::views::merge_dialog::DiscardDialog;
 use crate::views::start_dialog::StartDialog;
+use crate::views::task_dialog::format_size;
 use crate::views::transcript::{ON_DESTRUCTIVE, Transcript};
 
 const TAB_AGENT: &str = "agent";
@@ -137,6 +141,14 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
     });
     let last_process =
         Memo::new(move |_| detail.with(|d| d.as_ref().and_then(|d| d.processes.last().cloned())));
+    let attachments = Memo::new(move |_| {
+        detail.with(|d| {
+            d.as_ref()
+                .map(|d| d.attachments.clone())
+                .unwrap_or_default()
+        })
+    });
+    let meta = Memo::new(move |_| active.with(|a| a.as_ref().and_then(attempt_meta)));
     let active_id = Memo::new(move |_| active.with(|a| a.as_ref().map(|a| a.id.clone())));
     let active_ref =
         Memo::new(move |_| active.with(|a| a.as_ref().map(|a| (a.id.clone(), a.branch.clone()))));
@@ -256,6 +268,31 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                             <Badge variant=BadgeVariant::Warning>"Interrotto"</Badge>
                         </Show>
                     </div>
+                    {move || {
+                        meta.get()
+                            .map(|line| {
+                                view! {
+                                    <p class="text-muted-foreground mt-1.5 text-xs" data-testid="attempt-meta">
+                                        {line}
+                                    </p>
+                                }
+                            })
+                    }}
+                    <Show when=move || attachments.with(|a| !a.is_empty())>
+                        <ul class="mt-1.5 flex flex-wrap gap-1.5" aria-label="Allegati">
+                            <For each=move || attachments.get() key=|a| a.id.clone() let:a>
+                                <li
+                                    class="bg-muted text-muted-foreground inline-flex max-w-60 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs"
+                                    title=a.path.clone()
+                                    data-attachment=a.name.clone()
+                                >
+                                    <Paperclip class="size-3 shrink-0" />
+                                    <span class="text-foreground truncate">{a.name.clone()}</span>
+                                    <span class="shrink-0">{format_size(a.size)}</span>
+                                </li>
+                            </For>
+                        </ul>
+                    </Show>
                 </div>
                 <Button
                     variant=ButtonVariant::Ghost
@@ -449,6 +486,40 @@ fn MoveSelect(
     }
 }
 
+/// "Modello: opus · Sub-agent: sonnet, max 3 (usati 1)" for the active attempt, without the
+/// parts it leaves to the defaults; `None` when it sets none.
+fn attempt_meta(a: &AttemptView) -> Option<String> {
+    meta_line(
+        a.model.as_deref(),
+        a.subagent_model.as_deref(),
+        a.max_subagents,
+        a.subagents_used,
+    )
+}
+
+fn meta_line(
+    model: Option<&str>,
+    subagent_model: Option<&str>,
+    max_subagents: Option<u8>,
+    used: u32,
+) -> Option<String> {
+    let subagents = match (max_subagents, subagent_model) {
+        (Some(0), _) => Some("nessuno".to_owned()),
+        (Some(max), Some(m)) => Some(format!("{m}, max {max} (usati {used})")),
+        (Some(max), None) => Some(format!("max {max} (usati {used})")),
+        (None, Some(m)) => Some(m.to_owned()),
+        (None, None) => None,
+    };
+    let parts: Vec<String> = [
+        model.map(|m| format!("Modello: {m}")),
+        subagents.map(|s| format!("Sub-agent: {s}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
 fn status_label(status: TaskStatus) -> &'static str {
     match status {
         TaskStatus::Todo => "Da fare",
@@ -491,4 +562,35 @@ fn attempt_command(ctx: AppCtx, active: Memo<Option<AttemptView>>, command: Comm
             ctx.toasts.app_error(&e);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::meta_line;
+
+    #[test]
+    fn the_meta_line_omits_what_the_attempt_leaves_to_the_defaults() {
+        assert_eq!(
+            meta_line(Some("opus"), Some("sonnet"), Some(3), 1).as_deref(),
+            Some("Modello: opus · Sub-agent: sonnet, max 3 (usati 1)")
+        );
+        assert_eq!(
+            meta_line(None, None, Some(2), 0).as_deref(),
+            Some("Sub-agent: max 2 (usati 0)")
+        );
+        assert_eq!(
+            meta_line(Some("fable"), Some("haiku"), None, 0).as_deref(),
+            Some("Modello: fable · Sub-agent: haiku")
+        );
+        // No sub-agents at all: their model does not matter.
+        assert_eq!(
+            meta_line(Some("opus"), Some("haiku"), Some(0), 0).as_deref(),
+            Some("Modello: opus · Sub-agent: nessuno")
+        );
+        assert_eq!(
+            meta_line(Some("sonnet"), None, None, 0).as_deref(),
+            Some("Modello: sonnet")
+        );
+        assert_eq!(meta_line(None, None, None, 0), None);
+    }
 }

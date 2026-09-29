@@ -23,6 +23,7 @@ mod views {
     pub mod diff;
     pub mod merge_dialog;
     pub mod onboarding;
+    pub mod overview;
     pub mod settings;
     pub mod sidebar;
     pub mod start_dialog;
@@ -31,6 +32,7 @@ mod views {
     pub mod transcript;
 }
 mod widgets {
+    pub mod context_menu;
     pub mod dnd;
     pub mod toast;
 }

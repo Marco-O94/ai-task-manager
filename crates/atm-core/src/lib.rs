@@ -3,8 +3,10 @@
 //! to `app.emit` and [`TranscriptSink`] to a `Channel`.
 //!
 //! Module owners after M1 (spec §11.2): `db` M2-DB, `git` M2-GIT, `claude`/`wire`/`normalize`
-//! M2-CLAUDE, `lib`/`runner`/`live` M3-CORE. Public signatures are frozen; owners only add.
+//! M2-CLAUDE, `lib`/`runner`/`live` M3-CORE; `attachments` CORE-RUNNER (feature round of
+//! 2026-09-29). Public signatures are frozen; owners only add.
 
+pub mod attachments;
 pub mod claude;
 pub mod db;
 pub mod git;
@@ -20,16 +22,18 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use atm_types::{
-    AddProjectReq, AddProjectRes, AppError, AttemptIdReq, AttemptState, AttemptView, AuthState,
-    BranchList, BranchStatus, Changed, ConfigPolicy, CreateTaskReq, DiffResult, EVENT_CHANGED,
-    EVENT_ENV_CHANGED, EntryPage, EnvStatus, ErrorCode, GetEntriesReq, GetEnvReq, Id, IdReq,
-    MergeAttemptReq, MergeOutcome, Millis, MoveTaskReq, OpenAttemptReq, OpenLoginTerminalReq,
-    OpenTarget, OpenUrlReq, PermissionMode, ProcessInfo, Project, ProjectIdReq, RespondApprovalReq,
-    SendFollowUpReq, SetProjectSecurityReq, Settings, StartAttemptReq, TaskCard, TaskDetail,
-    TaskStatus, UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq, WorktreeState,
+    AddProjectReq, AddProjectRes, AddTaskAttachmentsReq, AppError, Attachment, AttemptIdReq,
+    AttemptState, AttemptView, AuthState, BranchList, BranchStatus, Changed, ConfigPolicy,
+    CreateTaskReq, DiffResult, EVENT_CHANGED, EVENT_ENV_CHANGED, EntryPage, EnvStatus, ErrorCode,
+    GetEntriesReq, GetEnvReq, Id, IdReq, MAX_ATTACHMENTS_PER_TASK, MAX_PROJECT_DESCRIPTION,
+    MAX_SUBAGENTS, MODEL_ALIASES, MergeAttemptReq, MergeOutcome, Millis, MoveTaskReq,
+    OpenAttemptReq, OpenLoginTerminalReq, OpenTarget, OpenUrlReq, PermissionMode, PickedFile,
+    ProcessInfo, Project, ProjectIdReq, ProjectOverview, RespondApprovalReq, SendFollowUpReq,
+    SetProjectSecurityReq, Settings, StartAttemptReq, Task, TaskCard, TaskDetail, TaskStatus,
+    UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq, WorktreeState,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -134,6 +138,8 @@ struct Inner {
     /// `Invalid` answer (a limit, a link, …) is as final as a snapshot and kept too: a crafted
     /// tip is walked once, not on every read of a Trusted project.
     commit_configs: Mutex<HashMap<(String, String), Result<ConfigSnapshot, AppError>>>,
+    /// Files the picker returned, by one-use token (spec F5).
+    picks: Mutex<attachments::Staging>,
 }
 
 /// Size of [`Inner::commit_configs`] past which it starts over.
@@ -233,6 +239,7 @@ impl Core {
                 home,
                 home_canonical,
                 commit_configs: Mutex::default(),
+                picks: Mutex::default(),
             }),
         })
     }
@@ -454,6 +461,7 @@ impl Core {
         let row = ProjectRow {
             id: new_id(),
             name,
+            description: String::new(),
             repo_path,
             default_target_branch: target,
             default_permission_mode: PermissionMode::AcceptEdits,
@@ -472,7 +480,8 @@ impl Core {
         })
     }
 
-    /// Errors: `NotFound`, `Invalid` (target branch not in `refs/heads`).
+    /// The description is trimmed. Errors: `NotFound`, `Invalid` (target branch not in
+    /// `refs/heads`, description over [`MAX_PROJECT_DESCRIPTION`] characters).
     pub async fn update_project(&self, req: UpdateProjectReq) -> Result<Project, AppError> {
         let s = &self.inner;
         let row = s.db.project(&req.id)?;
@@ -486,6 +495,12 @@ impl Core {
                 "Il nome non può contenere a capo, caratteri di controllo o di direzione",
             ));
         }
+        let description = req.description.trim();
+        if description.chars().count() > MAX_PROJECT_DESCRIPTION {
+            return Err(AppError::invalid(format!(
+                "La descrizione può avere al massimo {MAX_PROJECT_DESCRIPTION} caratteri"
+            )));
+        }
         check_bypass(req.default_permission_mode, &row)?;
         s.git()
             .await
@@ -498,6 +513,7 @@ impl Core {
         let req = UpdateProjectReq {
             name: name.to_owned(),
             default_model: non_empty(req.default_model),
+            description: description.to_owned(),
             ..req
         };
         let row = s.db.update_project(&req, now_ms())?;
@@ -594,7 +610,8 @@ impl Core {
         Ok(s.project_view(&row).await)
     }
 
-    /// Errors: `Busy` with running turns. Snapshots and removes the worktrees, keeps branches.
+    /// Errors: `Busy` with running turns. Snapshots and removes the worktrees, keeps branches;
+    /// once the rows are gone, removes the attachments and the attempts' raw logs.
     pub async fn remove_project(&self, req: IdReq) -> Result<(), AppError> {
         let s = &self.inner;
         let project = s.db.project(&req.id)?;
@@ -614,15 +631,19 @@ impl Core {
             let _repo = s.lock(repo_key(&project.repo_path)).await;
             tolerate_missing(s.remove_worktree(&git, &project.repo_path, &attempt).await)?;
         }
-        {
+        let attempt_ids = {
             // `start_attempt` reserves its slot before writing any row: checked together with
             // the deletion, a new turn is either seen here or finds no project.
             let turns = guard(&s.turns);
             if running(&turns) {
                 return Err(busy());
             }
+            let attempt_ids = s.db.project_attempt_ids(&req.id)?;
             s.db.delete_project(&req.id)?;
-        }
+            attempt_ids
+        };
+        let folder = attachments::project_dir(&s.config.data_dir, &req.id);
+        s.remove_files(folder, &attempt_ids).await;
         s.emit_changed(None, None);
         Ok(())
     }
@@ -631,6 +652,54 @@ impl Core {
         let project = self.inner.db.project(&req.project_id)?;
         let git = self.inner.git().await;
         git.list_branches(Path::new(&project.repo_path)).await
+    }
+
+    /// The overview page (spec F3): what the agents find in the repository, read by
+    /// [`git::overview::read`] from the commit at the tip of the default target branch (where
+    /// worktrees start, what a Trusted approval approves), with the records of that commit's
+    /// configuration (cached) and whether the agents load it (Trusted and trusted). Errors:
+    /// `NotFound`, `Invalid` (the repository is the home directory, whose `.claude` is the
+    /// user's own and never read, spec §10.1), the branch's (it cannot be read), the reader's.
+    pub async fn get_project_overview(
+        &self,
+        req: ProjectIdReq,
+    ) -> Result<ProjectOverview, AppError> {
+        let s = &self.inner;
+        let row = s.db.project(&req.project_id)?;
+        let repo = Path::new(&row.repo_path);
+        if s.is_home(repo) {
+            return Err(home_refusal());
+        }
+        let git = s.git().await;
+        let branch = &row.default_target_branch;
+        let commit = git.branch_tip(repo, branch).await.map_err(|e| {
+            AppError::new(
+                e.code,
+                format!(
+                    "Il branch target predefinito {branch} non si può leggere ({})",
+                    e.message
+                ),
+            )
+        })?;
+        let base = ConfigBase {
+            branch: branch.clone(),
+            commit,
+        };
+        // The configuration as committed: its records list `.claude/` even when billing keys
+        // keep it from being approved (then the agents do not load it).
+        let config = s.commit_config(&git, repo, &base.commit).await;
+        let approvable = config
+            .clone()
+            .and_then(|c| billing_refusal(&c, &base).map_or(Ok(c), Err));
+        let source = git::overview::Source {
+            repo,
+            project_id: &row.id,
+            branch: &base.branch,
+            commit: &base.commit,
+            agents_load_config: s.view_with(&row, &approvable).trusted,
+            records: config.as_ref().map_or(&[], |c| c.records.as_slice()),
+        };
+        git::overview::read(&git, &source).await
     }
 
     /// DB board merged with the live registry (`running`, `pending_approvals`).
@@ -682,7 +751,8 @@ impl Core {
         Ok(())
     }
 
-    /// Errors: `Busy` if running. Discards the active attempt first.
+    /// Errors: `Busy` if running. Discards the active attempt first; once the rows are gone,
+    /// removes the attachments and the attempts' raw logs.
     pub async fn delete_task(&self, req: IdReq) -> Result<(), AppError> {
         let s = &self.inner;
         let task = s.db.task(&req.id)?;
@@ -706,7 +776,10 @@ impl Core {
             let _repo = s.lock(repo_key(&project.repo_path)).await;
             tolerate_missing(s.remove_worktree(&git, &project.repo_path, &attempt).await)?;
         }
+        let attempt_ids = s.db.task_attempt_ids(&task.id)?;
         s.db.delete_task(&task.id)?;
+        let folder = attachments::task_dir(&s.config.data_dir, &task.project_id, &task.id);
+        s.remove_files(folder, &attempt_ids).await;
         s.emit_changed(Some(&task.project_id), Some(&task.id));
         Ok(())
     }
@@ -723,27 +796,127 @@ impl Core {
             Some(a) => s.db.attempt_processes(&a.id)?,
             None => Vec::new(),
         };
+        let attachments: Vec<Attachment> =
+            s.db.task_attachments(&task.id)?
+                .iter()
+                .map(|a| attachments::view(&s.config.data_dir, &task.project_id, a))
+                .collect();
         Ok(TaskDetail {
             task,
             attempt: active.map(|a| s.attempt_view(&a)),
             processes: processes.iter().map(|p| p.info()).collect(),
             closed_attempts: closed.iter().map(|a| a.view(false, 0)).collect(),
+            attachments,
         })
     }
 
+    /// Stages files the native picker returned (the shell's `pick_attachment_files`, spec
+    /// F5): each one checked ([`attachments::check_pick`]: outside the user's Claude Code
+    /// configuration, `~/.ssh`, `~/.aws`, the Keychain and the app's own folders, a regular
+    /// file within the size limit, a usable name), then given a one-use token that expires
+    /// ([`attachments::Staging`]); the webview only ever gets the tokens. All or nothing.
+    /// Errors: `Invalid` (more than `MAX_ATTACHMENTS_PER_TASK` files, a file refused, named).
+    pub async fn stage_picks(&self, paths: Vec<PathBuf>) -> Result<Vec<PickedFile>, AppError> {
+        let s = &self.inner;
+        if paths.len() > MAX_ATTACHMENTS_PER_TASK {
+            return Err(AppError::invalid(format!(
+                "Si possono scegliere al massimo {MAX_ATTACHMENTS_PER_TASK} file alla volta"
+            )));
+        }
+        let home = s.home();
+        let config_dir = s.claude_config_dir();
+        let (data_dir, cache_dir) = (s.config.data_dir.clone(), s.config.cache_dir.clone());
+        let picked = tokio::task::spawn_blocking(move || {
+            let deny =
+                attachments::DenyList::new(&home, config_dir.as_deref(), &data_dir, &cache_dir);
+            paths
+                .iter()
+                .map(|path| attachments::check_pick(path, &deny))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("controllo dei file: {e}")))??;
+        Ok(guard(&s.picks).stage(picked, Instant::now()))
+    }
+
+    /// Copies the staged files of `req.tokens` into the task's folder
+    /// ([`attachments::copy_picks`]) and records them in one transaction that counts the
+    /// task's attachments again; on any error the copies are removed. Every token is used up,
+    /// whatever the outcome. Runs under the task's lock (other changes of its attachments, its
+    /// deletion). Emits `changed`. Errors: `NotFound` (task), `Invalid` (unknown, used or
+    /// expired token, past `MAX_ATTACHMENTS_PER_TASK`, a file that changed since it was
+    /// picked), `Io`.
+    pub async fn add_task_attachments(
+        &self,
+        req: AddTaskAttachmentsReq,
+    ) -> Result<Vec<Attachment>, AppError> {
+        let s = &self.inner;
+        let _task = s.lock(task_key(&req.task_id)).await;
+        let redeemed: Vec<Option<attachments::Picked>> = {
+            let mut picks = guard(&s.picks);
+            let now = Instant::now();
+            req.tokens.iter().map(|t| picks.redeem(t, now)).collect()
+        };
+        let task = s.db.task(&req.task_id)?;
+        let picks: Vec<attachments::Picked> = redeemed
+            .into_iter()
+            .collect::<Option<_>>()
+            .ok_or_else(|| AppError::invalid("File non più disponibile: sceglilo di nuovo"))?;
+        if picks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let dir = attachments::task_dir(&s.config.data_dir, &task.project_id, &task.id);
+        let rows = {
+            let (dir, task_id) = (dir.clone(), task.id.clone());
+            tokio::task::spawn_blocking(move || {
+                attachments::copy_picks(&picks, &dir, &task_id, now_ms())
+            })
+            .await
+            .map_err(|e| AppError::internal(format!("copia degli allegati: {e}")))??
+        };
+        if let Err(e) = s.db.insert_attachments(&rows) {
+            remove_dirs(rows.iter().map(|r| dir.join(&r.id)).collect()).await;
+            return Err(e);
+        }
+        s.emit_changed(Some(&task.project_id), Some(&task.id));
+        Ok(rows
+            .iter()
+            .map(|r| attachments::view(&s.config.data_dir, &task.project_id, r))
+            .collect())
+    }
+
+    /// Deletes the attachment's row, then its copy (best effort), under the task's lock. A
+    /// running agent sees it gone from its folder at once. Emits `changed`. Errors:
+    /// `NotFound`.
+    pub async fn remove_task_attachment(&self, req: IdReq) -> Result<(), AppError> {
+        let s = &self.inner;
+        let task_id = s.db.attachment(&req.id)?.task_id;
+        let _task = s.lock(task_key(&task_id)).await;
+        let task = s.db.task(&task_id)?;
+        let row = s.db.delete_attachment(&req.id)?;
+        let dir = attachments::task_dir(&s.config.data_dir, &task.project_id, &task.id);
+        remove_dirs(vec![dir.join(&row.id)]).await;
+        s.emit_changed(Some(&task.project_id), Some(&task.id));
+        Ok(())
+    }
+
     /// Preflight (spec §7.7 step 2), worktree under the repo lock, rows, then spawns the
-    /// first turn in the background. Errors: `ClaudeNotFound`, `NotLoggedIn`, `UsageLimited`,
-    /// `ConcurrencyLimit`, `Conflict` (active attempt exists), `Invalid` (bypass without the
-    /// project's `allow_bypass`), `Git`.
+    /// first turn in the background; the prompt lists the task's attachments. Errors:
+    /// `ClaudeNotFound`, `NotLoggedIn`, `UsageLimited`, `ConcurrencyLimit`, `Conflict` (active
+    /// attempt exists), `Invalid` (bypass without the project's `allow_bypass`, sub-agent
+    /// options, before any worktree), `Git`.
     pub async fn start_attempt(&self, req: StartAttemptReq) -> Result<AttemptView, AppError> {
         let s = &self.inner;
         let task = s.db.task(&req.task_id)?;
         let project = s.db.project(&task.project_id)?;
         check_bypass(req.permission_mode, &project)?;
+        let subagent_model = subagent_options(req.subagent_model, req.max_subagents)?;
         let _task = s.lock(task_key(&task.id)).await;
         if s.db.active_attempt(&task.id)?.is_some() {
             return Err(AppError::conflict("Il task ha già un tentativo attivo"));
         }
+        // Under the task's lock: what the prompt lists is what the folder holds.
+        let attached = s.agent_attachments(&task)?;
         let settings = s.db.settings()?;
         let attempt_id = new_id();
         let preflight = s
@@ -799,13 +972,20 @@ impl Core {
                 .or_else(|| project.default_model.clone())
                 .or_else(|| settings.default_model.clone()),
             effort: req.effort,
+            subagent_model,
+            max_subagents: req.max_subagents,
+            subagents_used: 0,
             allow_rules: Vec::new(),
             merge_commit: None,
             created_at: now,
             updated_at: now,
             closed_at: None,
         };
-        let prompt = first_prompt(&task.title, &task.description);
+        let prompt = first_prompt(
+            &task.title,
+            &task.description,
+            attached_paths(attached.as_ref()),
+        );
         let ctx = AttemptCtx {
             attempt,
             task,
@@ -823,6 +1003,7 @@ impl Core {
                 resume: false,
                 head_before: Some(base),
                 next_idx: 0,
+                attachments_dir: attached.map(|a| a.dir),
             })
             .await;
         if let Err(e) = s.db.begin_attempt(&ctx.attempt, &plan.process, now) {
@@ -837,7 +1018,8 @@ impl Core {
     }
 
     /// `permission_mode` applies to this turn only (`processes.permission_mode`); the
-    /// attempt's mode is unchanged. Errors: `Busy` (turn running), `WorktreeMissing`,
+    /// attempt's mode is unchanged. The task's attachments folder is given on every turn, and
+    /// a fresh session's prompt lists them. Errors: `Busy` (turn running), `WorktreeMissing`,
     /// `BranchMismatch`, plus the preflight errors of `start_attempt`.
     pub async fn send_follow_up(&self, req: SendFollowUpReq) -> Result<ProcessInfo, AppError> {
         let s = &self.inner;
@@ -866,6 +1048,7 @@ impl Core {
         let worktree = Path::new(&ctx.attempt.worktree_path);
         let head_before = git.head(worktree).await.ok();
         let resume = ctx.attempt.session_started && !req.fresh_session;
+        let attached = s.agent_attachments(&ctx.task)?;
         if !resume {
             // A session that never started (or a failed resume) gets a new id (spec §7.9).
             ctx.attempt.session_id = new_id();
@@ -877,7 +1060,14 @@ impl Core {
                 .log_oneline(worktree, &ctx.attempt.base_commit)
                 .await
                 .unwrap_or_default();
-            fresh_prompt(&ctx.task.title, &ctx.task.description, &log, &req.prompt)
+            let (task, attachments) = (&ctx.task, attached_paths(attached.as_ref()));
+            fresh_prompt(
+                &task.title,
+                &task.description,
+                attachments,
+                &log,
+                &req.prompt,
+            )
         } else {
             req.prompt.clone()
         };
@@ -893,6 +1083,7 @@ impl Core {
                 resume,
                 head_before,
                 next_idx: s.db.next_entry_idx(&ctx.attempt.id)?,
+                attachments_dir: attached.map(|a| a.dir),
             })
             .await;
         s.db.begin_turn(&plan.process, now_ms())?;
@@ -1141,6 +1332,37 @@ impl Inner {
 
     fn home(&self) -> PathBuf {
         self.home.clone()
+    }
+
+    /// `CLAUDE_CONFIG_DIR` of the app's environment plus `extra_env`, when set: the user's
+    /// Claude Code configuration, never attached.
+    fn claude_config_dir(&self) -> Option<PathBuf> {
+        self.base_env()
+            .into_iter()
+            .rev()
+            .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+            .map(|(_, v)| PathBuf::from(v))
+            .filter(|dir| !dir.as_os_str().is_empty())
+    }
+
+    /// What the agent of `task` is given of its attachments (spec F5); `None` without any.
+    fn agent_attachments(&self, task: &Task) -> Result<Option<attachments::ForAgent>, AppError> {
+        let rows = self.db.task_attachments(&task.id)?;
+        Ok(attachments::for_agent(
+            &self.config.data_dir,
+            &task.project_id,
+            &task.id,
+            &rows,
+        ))
+    }
+
+    /// Once a task's or a project's rows are gone, best effort: its attachments `folder` and
+    /// the raw logs of `attempt_ids`, which no cascade reaches.
+    async fn remove_files(&self, folder: PathBuf, attempt_ids: &[Id]) {
+        let logs = attempt_ids
+            .iter()
+            .map(|id| runner::attempt_log_dir(&self.config.data_dir, id));
+        remove_dirs(std::iter::once(folder).chain(logs).collect()).await;
     }
 
     fn child_env(&self, tools: &Tools, settings: &Settings) -> ChildEnv {
@@ -1742,14 +1964,62 @@ fn tolerate_missing(result: Result<(), AppError>) -> Result<(), AppError> {
     }
 }
 
-/// First turn (spec §7.4 step 2): `# {title}\n\n{description}`.
-fn first_prompt(title: &str, description: &str) -> String {
-    format!("# {title}\n\n{description}").trim_end().to_owned()
+/// `StartAttemptReq`'s sub-agent options (spec F6), checked before any worktree exists: the
+/// model trimmed (empty = the CLI's default) and one of `MODEL_ALIASES`, the limit at most
+/// `MAX_SUBAGENTS`. The model to store. Errors: `Invalid`.
+fn subagent_options(model: Option<String>, max: Option<u8>) -> Result<Option<String>, AppError> {
+    if max.is_some_and(|n| n > MAX_SUBAGENTS) {
+        return Err(AppError::invalid(format!(
+            "Il limite di sub-agent va da 0 a {MAX_SUBAGENTS}"
+        )));
+    }
+    let model = non_empty(model);
+    if model
+        .as_deref()
+        .is_some_and(|m| !MODEL_ALIASES.contains(&m))
+    {
+        return Err(AppError::invalid(format!(
+            "Il modello dei sub-agent deve essere uno di: {}",
+            MODEL_ALIASES.join(", ")
+        )));
+    }
+    Ok(model)
+}
+
+/// Removes `dirs` with their content on the blocking pool, best effort
+/// ([`attachments::remove_dir_logged`]).
+async fn remove_dirs(dirs: Vec<PathBuf>) {
+    let removed = tokio::task::spawn_blocking(move || {
+        dirs.iter()
+            .for_each(|dir| attachments::remove_dir_logged(dir));
+    });
+    if let Err(e) = removed.await {
+        eprintln!("cleanup: {e}");
+    }
+}
+
+/// The copies' paths of [`Inner::agent_attachments`] (none without attachments).
+fn attached_paths(attached: Option<&attachments::ForAgent>) -> &[PathBuf] {
+    attached.map_or(&[], |a| a.paths.as_slice())
+}
+
+/// First turn (spec §7.4 step 2): `# {title}\n\n{description}`, then the attachments
+/// ([`attachments::prompt_section`]).
+fn first_prompt(title: &str, description: &str, attachments: &[PathBuf]) -> String {
+    let mut prompt = format!("# {title}\n\n{description}").trim_end().to_owned();
+    prompt.push_str(&attachments::prompt_section(attachments));
+    prompt
 }
 
 /// `fresh_session` (spec §7.4 step 2): the task, the attempt's commits and the user's text.
-fn fresh_prompt(title: &str, description: &str, log: &str, text: &str) -> String {
-    let mut prompt = first_prompt(title, description);
+fn fresh_prompt(
+    title: &str,
+    description: &str,
+    attachments: &[PathBuf],
+    log: &str,
+    text: &str,
+) -> String {
+    let mut prompt = first_prompt(title, description, attachments);
     if !log.trim().is_empty() {
         prompt.push_str("\n\nCommits already made on this branch:\n");
         prompt.push_str(log.trim_end());

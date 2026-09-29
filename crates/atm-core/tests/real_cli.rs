@@ -68,6 +68,8 @@ const MODEL: &str = "sonnet";
 const TURN: Duration = Duration::from_secs(240);
 const CODEWORD: &str = "PAPAYA-42";
 const KEYWORD: &str = "TANGERINE-7031";
+/// Written in the attachment of the `--add-dir` check.
+const ATTACHMENT_WORD: &str = "KIWI-5150";
 /// Stand-in for the temp root in captures (the worktree becomes `/tmp/atm-real/wt/<id>`).
 const TMP_ROOT: &str = "/tmp/atm-real";
 /// Bound of a preflight spawn (the user's `SessionStart` hooks run before the answer).
@@ -778,6 +780,17 @@ struct Real {
 
 impl Real {
     async fn new(guard: Arc<Guard>, test: &'static str, source: Source<'_>) -> Real {
+        Real::with_data_dir(guard, test, source, "data").await
+    }
+
+    /// [`Real::new`] with the app's data dir at `<temp root>/<data>` (e.g. with a space, like
+    /// `~/Library/Application Support`).
+    async fn with_data_dir(
+        guard: Arc<Guard>,
+        test: &'static str,
+        source: Source<'_>,
+        data: &str,
+    ) -> Real {
         let dir = common::tempdir();
         let root = dir.path().canonicalize().unwrap();
         let repo = root.join("repo");
@@ -824,7 +837,7 @@ impl Real {
             );
         }
         let config = CoreConfig {
-            data_dir: root.join("data"),
+            data_dir: root.join(data),
             cache_dir: root.join("cache"),
             claude_path: Some(guard.claude.clone()),
             path_env: Some(guard.path.clone()),
@@ -910,9 +923,27 @@ impl Real {
     }
 
     async fn start(&self, task: &Task, mode: PermissionMode, label: &str) -> AttemptView {
+        self.start_with(task, mode, label, None, None).await
+    }
+
+    /// [`Real::start`] with the sub-agent options (spec F6), which the preflight's argv has too.
+    async fn start_with(
+        &self,
+        task: &Task,
+        mode: PermissionMode,
+        label: &str,
+        max_subagents: Option<u8>,
+        subagent_model: Option<&str>,
+    ) -> AttemptView {
         // The worktree does not exist yet: the preflight runs in the repo, the same user
         // settings apply (Isolated reads no project settings).
-        let argv = turn_argv(&self.guard, &self.repo, mode, &[]);
+        let args = TurnArgs {
+            allow_bypass: mode == PermissionMode::BypassPermissions,
+            subagents_left: max_subagents.map(u32::from),
+            subagent_model: subagent_model.map(str::to_owned),
+            ..turn_args(&self.guard, &self.repo, mode, &[])
+        };
+        let argv = claude::build_argv(&args);
         let env = self.guard.env().for_attempt(&self.repo, "m5-preflight");
         self.guard.before_turn(&argv, &self.repo, &env).await;
         let req = StartAttemptReq {
@@ -921,6 +952,8 @@ impl Real {
             permission_mode: mode,
             model: Some(MODEL.into()),
             effort: Some(Effort::Low),
+            subagent_model: subagent_model.map(str::to_owned),
+            max_subagents,
         };
         let view = self.core.start_attempt(req).await.unwrap();
         self.guard.count_turn();
@@ -1738,6 +1771,9 @@ fn turn_args(guard: &Guard, cwd: &Path, mode: PermissionMode, allow_rules: &[Str
         allow_rules: allow_rules.to_vec(),
         model: Some(MODEL.into()),
         effort: Some(Effort::Low),
+        subagents_left: None,
+        subagent_model: None,
+        attachments_dir: None,
         append_prompt: claude::append_prompt(cwd, "main", "main"),
     }
 }
@@ -2443,6 +2479,358 @@ fn real_cli_isolated_project_config() {
         real.finish().await;
     });
     drop(marker_dir);
+}
+
+// ---- feature round 2026-09-29: sub-agent limit (F6), attachments (F5) -------------------------
+
+/// The `--settings` JSON of an argv.
+fn settings_of(argv: &[String]) -> Value {
+    argv.iter()
+        .find_map(|a| a.strip_prefix("--settings="))
+        .and_then(|json| serde_json::from_str(json).ok())
+        .unwrap_or_default()
+}
+
+/// The `Agent` calls of a process, as [`Real::tool_calls`] shows them.
+fn agent_calls(real: &Real, process_id: &str) -> Vec<Value> {
+    real.tool_calls(process_id)
+        .into_iter()
+        .filter(|c| c["name"] == "Agent")
+        .collect()
+}
+
+/// Every approval of these steps is a failure: the host answers the sub-agent spawns itself.
+fn nothing_to_approve(real: &Real, step: &str, a: &Asked) -> ApprovalDecision {
+    real.gate(step, a, |_| false, false)
+}
+
+/// Spec F6 [V]: under a limit the `ask` rule on `Agent` sends every spawn to the host
+/// (`can_use_tool`) in every mode, bypass included; the host allows it at once and counts it.
+/// 3 real turns (sonnet, low), each spawning one tiny sub-agent.
+#[test]
+#[ignore = "real Claude Code CLI: ATM_REAL_CLAUDE=1, see the module docs"]
+fn real_cli_subagent_ask_rule_reaches_the_host_in_every_mode() {
+    let Some((_serial, guard)) = guard() else {
+        return;
+    };
+    runtime().block_on(async {
+        let real = Real::new(guard, "subagent-ask", Source::Fresh(&[])).await;
+        let security = SetProjectSecurityReq {
+            id: real.project.id.clone(),
+            config_policy: ConfigPolicy::Isolated,
+            allow_bypass: true,
+        };
+        real.core.set_project_security(security).await.unwrap();
+        for (n, mode) in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let task = real
+                .task(
+                    &format!("Sub-agent check {}", n + 1),
+                    "This task is a validation run of the host app. Use the Agent tool exactly \
+                     once to start one general-purpose sub-agent whose prompt is: `Reply with \
+                     the single word OK. Do not use any tool.` Do not use any other tool. Then \
+                     reply with the sub-agent's answer.",
+                )
+                .await;
+            let label = format!("{}-{mode}", n + 1);
+            let attempt = real.start_with(&task, mode, &label, Some(2), None).await;
+            let (asked, d) = real
+                .drive(&attempt.id, &task.id, 1, |a| {
+                    nothing_to_approve(&real, "ask", a)
+                })
+                .await;
+            let p = &d.processes[0];
+            let argv = argv_of(&real.processes(&attempt.id)[0]);
+            let asks: Vec<Value> = real
+                .raw_can_use_tool(&attempt.id, &p.id)
+                .into_iter()
+                .filter(|r| r["tool_name"] == "Agent" || r["tool_name"] == "Task")
+                .collect();
+            let calls = agent_calls(&real, &p.id);
+            let used = d.attempt.as_ref().map(|a| a.subagents_used);
+            real.note(
+                &format!("subagent_ask_{mode}"),
+                json!({
+                "asks": asks, "agent_calls": calls, "subagents_used": used,
+                "approvals": asked.iter().map(Asked::json).collect::<Vec<_>>(),
+                "said": real.said(&p.id), "status": p.status}),
+            );
+            real.check(
+                argv.contains(&"--disallowedTools=AskUserQuestion,Workflow".to_owned()),
+                format!("{mode}: argv {argv:?}"),
+            );
+            real.check(
+                settings_of(&argv)["permissions"]["ask"] == json!(["Agent", "Task"]),
+                format!("{mode}: no ask rule in --settings"),
+            );
+            real.check(
+                !asks.is_empty(),
+                format!("{mode}: the spawn never reached the host"),
+            );
+            real.check(used == Some(1), format!("{mode}: subagents_used {used:?}"));
+            real.check(
+                calls.iter().any(|c| c["status"]["state"] == "Succeeded"),
+                format!("{mode}: no sub-agent ran: {calls:?}"),
+            );
+            real.check(
+                p.status == ProcessStatus::Completed,
+                format!("{mode}: {p:?}"),
+            );
+        }
+        real.finish().await;
+    });
+}
+
+/// Spec F6 [V]: the host's deny is respected (the sub-agent past the limit never runs, the
+/// model goes on without it), and with none left the next turn's `--disallowedTools` keeps
+/// the model from even trying. 2 real turns.
+#[test]
+#[ignore = "real Claude Code CLI: ATM_REAL_CLAUDE=1, see the module docs"]
+fn real_cli_subagent_deny_is_respected() {
+    let Some((_serial, guard)) = guard() else {
+        return;
+    };
+    runtime().block_on(async {
+        let real = Real::new(guard, "subagent-deny", Source::Fresh(&[])).await;
+        let task = real
+            .task(
+                "Two sub-agents",
+                "This task is a validation run of the host app. Use the Agent tool twice, one \
+                 call after the other (never in parallel), each time starting one \
+                 general-purpose sub-agent whose prompt is: `Reply with the single word OK. Do \
+                 not use any tool.` If a call is denied, do not retry it and do not use any \
+                 other tool: reply with the exact message you got. Otherwise reply with both \
+                 answers.",
+            )
+            .await;
+        let attempt = real
+            .start_with(&task, PermissionMode::AcceptEdits, "1-two", Some(1), None)
+            .await;
+        let (_, d) = real
+            .drive(&attempt.id, &task.id, 1, |a| {
+                nothing_to_approve(&real, "deny", a)
+            })
+            .await;
+        let p = &d.processes[0];
+        let calls = agent_calls(&real, &p.id);
+        let used = d.attempt.as_ref().map(|a| a.subagents_used);
+        let result = real
+            .raw_log(&attempt.id, &p.id)
+            .into_iter()
+            .find(|v| v["type"] == "result")
+            .unwrap_or_default();
+        real.note(
+            "subagent_deny",
+            json!({
+            "agent_calls": calls, "subagents_used": used, "said": real.said(&p.id),
+            "permission_denials": result["permission_denials"], "status": p.status}),
+        );
+        real.check(used == Some(1), format!("deny: subagents_used {used:?}"));
+        let states: Vec<&Value> = calls.iter().map(|c| &c["status"]["state"]).collect();
+        real.check(
+            states == [&json!("Succeeded"), &json!("Denied")],
+            format!("deny: Agent calls {calls:?}"),
+        );
+        real.check(
+            real.said(&p.id)
+                .contains("Sub-agent limit for this task reached (1)"),
+            "deny: the model did not see the host's message",
+        );
+
+        let info = real
+            .follow_up(
+                &attempt.id,
+                "Now try once more to start one sub-agent with the Agent tool, with the same \
+                 prompt. If you cannot, say why in one sentence and stop.",
+                None,
+                false,
+                "2-none-left",
+            )
+            .await;
+        let (_, d) = real
+            .drive(&attempt.id, &task.id, info.seq, |a| {
+                nothing_to_approve(&real, "none left", a)
+            })
+            .await;
+        let p = &d.processes[info.seq as usize - 1];
+        let argv = argv_of(&real.processes(&attempt.id)[info.seq as usize - 1]);
+        let asks = real.raw_can_use_tool(&attempt.id, &p.id);
+        let used = d.attempt.as_ref().map(|a| a.subagents_used);
+        real.note(
+            "subagent_none_left",
+            json!({
+            "argv_disallowed": argv.iter().find(|a| a.starts_with("--disallowedTools=")),
+            "agent_calls": agent_calls(&real, &p.id), "asks": asks, "said": real.said(&p.id)}),
+        );
+        real.check(
+            argv.contains(&"--disallowedTools=AskUserQuestion,Agent,Task,Workflow".to_owned()),
+            format!("none left: argv {argv:?}"),
+        );
+        real.check(
+            !asks.iter().any(|r| r["tool_name"] == "Agent"),
+            "none left: a disallowed Agent call still asked",
+        );
+        real.check(
+            used == Some(1),
+            format!("none left: subagents_used {used:?}"),
+        );
+        real.finish().await;
+    });
+}
+
+/// Spec F6 [V]: `CLAUDE_CODE_SUBAGENT_MODEL` in the `env` of `--settings` runs a sub-agent that
+/// asks for no model on that model: `opus` here, which nothing else of a `sonnet` session uses
+/// (the CLI's own small tasks use haiku), seen in the `result`'s `modelUsage`. 1 real turn.
+#[test]
+#[ignore = "real Claude Code CLI: ATM_REAL_CLAUDE=1, see the module docs"]
+fn real_cli_subagent_model_applies_without_an_explicit_model() {
+    let Some((_serial, guard)) = guard() else {
+        return;
+    };
+    runtime().block_on(async {
+        let real = Real::new(guard, "subagent-model", Source::Fresh(&[])).await;
+        let task = real
+            .task(
+                "Sub-agent model",
+                "This task is a validation run of the host app. Use the Agent tool exactly \
+                 once to start one general-purpose sub-agent, without choosing a model for \
+                 it, whose prompt is: `Reply with the exact name of the model you run on. Do \
+                 not use any tool.` Do not use any other tool. Then reply with its answer \
+                 verbatim.",
+            )
+            .await;
+        let attempt = real
+            .start_with(
+                &task,
+                PermissionMode::AcceptEdits,
+                "1-model",
+                None,
+                Some("opus"),
+            )
+            .await;
+        let (_, d) = real
+            .drive(&attempt.id, &task.id, 1, |a| {
+                nothing_to_approve(&real, "model", a)
+            })
+            .await;
+        let p = &d.processes[0];
+        let argv = argv_of(&real.processes(&attempt.id)[0]);
+        let raw = real.raw_log(&attempt.id, &p.id);
+        let result = raw
+            .iter()
+            .find(|v| v["type"] == "result")
+            .cloned()
+            .unwrap_or_default();
+        let models: Vec<String> = result["modelUsage"]
+            .as_object()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        let inputs: Vec<Value> = raw
+            .iter()
+            .filter(|v| v["type"] == "assistant")
+            .flat_map(|v| {
+                v["message"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .filter(|c| c["type"] == "tool_use" && c["name"] == "Agent")
+            .map(|c| c["input"].clone())
+            .collect();
+        real.note(
+            "subagent_model",
+            json!({
+            "settings_env": settings_of(&argv)["env"], "model_usage": models,
+            "agent_inputs": inputs, "said": real.said(&p.id), "status": p.status}),
+        );
+        real.check(
+            settings_of(&argv)["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] == "opus",
+            "model: not in --settings",
+        );
+        real.check(
+            inputs.iter().any(|i| i.get("model").is_none()),
+            format!("model: every Agent call chose a model: {inputs:?}"),
+        );
+        real.check(
+            models.iter().any(|m| m.contains("opus")),
+            format!("model: no opus in modelUsage {models:?}"),
+        );
+        real.finish().await;
+    });
+}
+
+/// Spec F5 [V]: an attachment in a data dir whose path has a space (like `~/Library/Application
+/// Support`) is readable through `--add-dir` in Supervisionato without any approval, from the
+/// path the prompt lists. 1 real turn.
+#[test]
+#[ignore = "real Claude Code CLI: ATM_REAL_CLAUDE=1, see the module docs"]
+fn real_cli_add_dir_with_spaces_is_readable() {
+    let Some((_serial, guard)) = guard() else {
+        return;
+    };
+    let picked_dir = common::tempdir();
+    let picked = picked_dir.path().join("attachment notes.txt");
+    std::fs::write(
+        &picked,
+        format!("The attachment codeword is {ATTACHMENT_WORD}.\n"),
+    )
+    .unwrap();
+    runtime().block_on(async {
+        let real =
+            Real::with_data_dir(guard, "add-dir", Source::Fresh(&[]), "Application Support").await;
+        let task = real
+            .task(
+                "Read the attachment",
+                "This task is a validation run of the host app. Read the attached file listed \
+                 below with the Read tool, from its listed path, and reply with the codeword it \
+                 contains. Do not use any other tool.",
+            )
+            .await;
+        let staged = real.core.stage_picks(vec![picked.clone()]).await.unwrap();
+        let req = AddTaskAttachmentsReq {
+            task_id: task.id.clone(),
+            tokens: staged.into_iter().map(|p| p.token).collect(),
+        };
+        let added = real.core.add_task_attachments(req).await.unwrap();
+        let attempt = real.start(&task, PermissionMode::Default, "1-read").await;
+        let (asked, d) = real
+            .drive(&attempt.id, &task.id, 1, |a| {
+                nothing_to_approve(&real, "add-dir", a)
+            })
+            .await;
+        let p = &d.processes[0];
+        let argv = argv_of(&real.processes(&attempt.id)[0]);
+        let add_dir: Vec<&String> = argv
+            .iter()
+            .filter(|a| a.starts_with("--add-dir="))
+            .collect();
+        let calls = real.tool_calls(&p.id);
+        let said = real.said(&p.id);
+        real.note(
+            "add_dir",
+            json!({
+            "add_dir": add_dir, "attachment": added[0].name, "tool_calls": calls,
+            "approvals": asked.iter().map(Asked::json).collect::<Vec<_>>(), "said": said,
+            "status": p.status}),
+        );
+        real.check(
+            add_dir.len() == 1 && add_dir[0].contains("Application Support"),
+            format!("add-dir: argv {add_dir:?}"),
+        );
+        real.check(
+            asked.is_empty(),
+            "add-dir: reading the attachment asked for approval",
+        );
+        real.check(said.contains(ATTACHMENT_WORD), "add-dir: codeword not read");
+        real.finish().await;
+    });
+    drop(picked_dir);
 }
 
 /// The sanitizer itself (no CLI): runs with the normal test suite.

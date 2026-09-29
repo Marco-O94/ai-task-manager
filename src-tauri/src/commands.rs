@@ -2,8 +2,10 @@
 //!
 //! Request and response types come from the `atm_types::api` markers, so a mismatch between
 //! the UI contract, these wrappers and `Core` does not compile. Commands whose request is
-//! `Empty` take no `req` argument. Only native UI (folder picker, confirmations) lives here.
+//! `Empty` take no `req` argument. Only native UI (folder and file pickers, confirmations)
+//! lives here.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use atm_core::{Core, SecuritySnapshot};
@@ -368,6 +370,17 @@ pub async fn list_branches(
 }
 
 #[tauri::command]
+pub async fn get_project_overview(
+    core: CoreState<'_>,
+    req: Req<GetProjectOverview>,
+) -> Result<Res<GetProjectOverview>, AppError> {
+    logged(
+        GetProjectOverview::NAME,
+        core.get_project_overview(req).await,
+    )
+}
+
+#[tauri::command]
 pub async fn get_board(core: CoreState<'_>, req: Req<GetBoard>) -> Result<Res<GetBoard>, AppError> {
     logged(GetBoard::NAME, core.get_board(req).await)
 }
@@ -407,6 +420,62 @@ pub async fn get_task_detail(
     req: Req<GetTaskDetail>,
 ) -> Result<Res<GetTaskDetail>, AppError> {
     logged(GetTaskDetail::NAME, core.get_task_detail(req).await)
+}
+
+/// Native multi-file picker, blocking call moved off the async runtime. The paths go straight
+/// to the core, which stages them and answers with tokens: a path never crosses the webview
+/// (spec F5). Cancelled: an empty list.
+#[tauri::command]
+pub async fn pick_attachment_files(
+    app: AppHandle,
+    core: CoreState<'_>,
+) -> Result<Res<PickAttachmentFiles>, AppError> {
+    let result = async {
+        // The E2E cannot drive the native picker: it queues one file instead.
+        #[cfg(debug_assertions)]
+        let queued = crate::e2e::take_pick().map(|p| p.into_iter().map(PathBuf::from).collect());
+        #[cfg(not(debug_assertions))]
+        let queued: Option<Vec<PathBuf>> = None;
+        let paths = match queued {
+            Some(paths) => paths,
+            None => tauri::async_runtime::spawn_blocking(move || {
+                app.dialog().file().blocking_pick_files()
+            })
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.into_path().map_err(|e| AppError::invalid(e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?,
+        };
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        core.stage_picks(paths).await
+    };
+    logged(PickAttachmentFiles::NAME, result.await)
+}
+
+#[tauri::command]
+pub async fn add_task_attachments(
+    core: CoreState<'_>,
+    req: Req<AddTaskAttachments>,
+) -> Result<Res<AddTaskAttachments>, AppError> {
+    logged(
+        AddTaskAttachments::NAME,
+        core.add_task_attachments(req).await,
+    )
+}
+
+#[tauri::command]
+pub async fn remove_task_attachment(
+    core: CoreState<'_>,
+    req: Req<RemoveTaskAttachment>,
+) -> Result<Res<RemoveTaskAttachment>, AppError> {
+    logged(
+        RemoveTaskAttachment::NAME,
+        core.remove_task_attachment(req).await,
+    )
 }
 
 #[tauri::command]
@@ -532,6 +601,7 @@ mod tests {
         Project {
             id: "p".into(),
             name: "demo\n\nNessun cambiamento di sicurezza: conferma di routine.".into(),
+            description: String::new(),
             repo_path: "/tmp/demo\u{202E}".into(),
             default_target_branch: "main".into(),
             default_permission_mode: PermissionMode::AcceptEdits,
@@ -711,12 +781,16 @@ mod tests {
             set_project_security: SetProjectSecurity,
             remove_project: RemoveProject,
             list_branches: ListBranches,
+            get_project_overview: GetProjectOverview,
             get_board: GetBoard,
             create_task: CreateTask,
             update_task: UpdateTask,
             move_task: MoveTask,
             delete_task: DeleteTask,
             get_task_detail: GetTaskDetail,
+            pick_attachment_files: PickAttachmentFiles,
+            add_task_attachments: AddTaskAttachments,
+            remove_task_attachment: RemoveTaskAttachment,
             start_attempt: StartAttempt,
             send_follow_up: SendFollowUp,
             stop_attempt: StopAttempt,

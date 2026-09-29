@@ -13,14 +13,19 @@
 //!   `[fake:hang_ignore]` turns: a ⌘Q key event posted through the window server (the menu's
 //!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
-//!   then the report on stdout; the app then exits through `app.exit` (`ExitRequested`)
-//!   during one more `[fake:hang_ignore]` turn, which the script checks afterwards;
+//!   the security confirmations, then the feature round's checks (the task list view on main,
+//!   attachments and sub-agent limits on a scratch project, whose removal from the sidebar
+//!   menu comes last) and the report on stdout; the app then exits through `app.exit`
+//!   (`ExitRequested`) during one more `[fake:hang_ignore]` turn, which the script checks
+//!   afterwards;
 //! - phase 3 (M6, also alone with `scripts/e2e.sh --perf`): `[fake:flood]` on three concurrent
 //!   attempts, one of them open, with the page's responsiveness and the transcript's DOM window
 //!   measured ([`perf_flood`]).
 //!
-//! Step 2 runs inside step 1, at the login gate: "Accedi" is only on the gate. Every IPC
-//! command that fails is counted by the backend: only the three rejected folders of step 3 may.
+//! A project opens on its Riepilogo (overview): the helpers reach the board through the
+//! topbar's Task tab ([`select_tasks`]). Step 2 runs inside step 1, at the login gate: "Accedi"
+//! is only on the gate. Every IPC command that fails is counted by the backend: only those the
+//! run provokes may, in order ([`EXPECTED_FAILURES`], [`EXPECTED_FAILURES_PHASE2`]).
 
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -34,10 +39,10 @@ use atm_types::debug::{
     ReportReq,
 };
 use atm_types::{
-    AttemptIdReq, AttemptState, CONTINUE_PROMPT, ConfigPolicy, Empty, Entry, EntryBody, FileStatus,
-    GetBoard, GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq,
-    GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, Project, ProjectIdReq,
-    StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, WorktreeState,
+    AttemptIdReq, AttemptState, CONTINUE_PROMPT, ConfigPolicy, Empty, Entry, EntryBody, ErrorCode,
+    FileStatus, GetBoard, GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq,
+    GetProjectOverview, GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, Project,
+    ProjectIdReq, StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, WorktreeState,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use leptos::prelude::*;
@@ -49,6 +54,8 @@ use web_sys::{Element, HtmlElement};
 
 use crate::ipc;
 use crate::selftest::{channel_in_order, csp_violations, sleep};
+use crate::state::board::by_column;
+use crate::views::board::column_title;
 
 /// `sessionStorage` key carrying the run across the page reloads of phase 1.
 const STATE_KEY: &str = "atm-e2e-state";
@@ -97,8 +104,26 @@ const KEPT_BY_THE_APP: [&str; 3] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN",
 /// A user Stop of a turn that ignores the interrupt, EOF and SIGTERM ends with the SIGKILL of
 /// its group: interrupt 5 s + EOF 3 s + SIGTERM 3 s (spec §7.9), within the 13 s objective.
 const ESCALATION_MS: (f64, f64) = (10_000.0, 13_000.0);
-/// The only command failures the run provokes: the three folders of step 3.
+/// The only command failures phase 1 provokes: the three folders of step 3.
 const EXPECTED_FAILURES: [&str; 3] = ["add_project: Invalid"; 3];
+/// Those of phase 2, all after step 10 (whose merges must fail nothing): Attendibile answered
+/// Annulla ([`security_confirmations`]), then the detail of a task of the removed scratch
+/// project ([`project_removal`]).
+const EXPECTED_FAILURES_PHASE2: [&str; 2] =
+    ["set_project_security: Invalid", "get_task_detail: NotFound"];
+/// The MCP server the `mcp` repository commits in `.mcp.json` (src-tauri/src/e2e.rs), with
+/// the env key the overview shows and the value it must never show.
+const MCP_SERVER: &str = "e2e-tools";
+const MCP_ENV_KEY: &str = "TOKEN";
+const MCP_SECRET: &str = "secret-value";
+/// Repository (`repos/<name>`, also the project's name) added in phase 2 to try attachments
+/// and sub-agent limits on, then removed from the sidebar menu (src-tauri/src/e2e.rs).
+const SCRATCH: &str = "da-rimuovere";
+/// The file attached to a task: `<dir>/attach/<name>`, created by the backend outside every
+/// folder the core refuses to copy from (src-tauri/src/e2e.rs).
+const ATTACHMENT: &str = "specifiche-e2e.txt";
+/// The `--disallowedTools` of a turn that may start no sub-agent (none allowed, or none left).
+const NO_SUBAGENTS: &str = "--disallowedTools=AskUserQuestion,Agent,Task,Workflow";
 /// Default wait of a UI reaction.
 const UI: u32 = 10_000;
 /// Wait of a whole agent turn.
@@ -332,7 +357,20 @@ async fn phase2(run: &mut Run) -> R<Next> {
         Err("eval allowed: the CSP is not applied".into())
     };
     run.check("csp_enforced", r)?;
-    let r = only_expected_failures(&["set_project_security: Invalid"]).await;
+    // The feature round's checks (spec F1, F4–F6): after step 10, since the removal provokes
+    // one command failure.
+    let r = task_list_view(run).await;
+    run.check("task_list_view", r)?;
+    let (mut scratch, r) = match attachment_to_the_agent(run).await {
+        Ok((scratch, text)) => (scratch, Ok(text)),
+        Err(e) => (Scratch::default(), Err(e)),
+    };
+    run.check("attachment_to_the_agent", r)?;
+    let r = subagent_limit(&mut scratch).await;
+    run.check("subagent_limit", r)?;
+    let r = project_removal(&scratch).await;
+    run.check("project_removal", r)?;
+    let r = only_expected_failures(&EXPECTED_FAILURES_PHASE2).await;
     run.check("command_failures_phase2", r)?;
     let r = exit_during_turn(run).await;
     run.check("exit_requested_armed", r)?;
@@ -571,7 +609,7 @@ async fn perf_board(run: &Run) -> R {
 
 /// Agenti in parallelo = `n` from the app settings; the dialog closes on success.
 async fn set_max_running(n: u32) -> R {
-    let dialog = open_settings("Generali").await?;
+    let dialog = open_app_settings().await?;
     let save = until("settings loaded", UI, || {
         find_in(&dialog, "[data-action=save-settings]").filter(|b| !b.has_attribute("disabled"))
     })
@@ -593,18 +631,17 @@ async fn set_max_running(n: u32) -> R {
 /// M6: the native confirmations guard every raise of trust and nothing else. They are answered
 /// by the run (`debug_e2e_queue_confirm`: a native dialog cannot be clicked from the page),
 /// which still sees each one asked and its text. On main: Attendibile with Annulla leaves it
-/// Isolated (the refused command is the phase's one expected failure); with OK it is Trusted
-/// and in effect, as the project settings say; the bypass opt-in with OK is allowed; lowering
+/// Isolated (the refused command is the phase's first expected failure); with OK it is Trusted
+/// and in effect, as main's settings page says; the bypass opt-in with OK is allowed; lowering
 /// both asks nothing. In the app settings the API key passthrough with OK shows the topbar
 /// banner (`scripts/e2e.sh` gives the app a dummy key), turning it off asks nothing and hides
 /// it: no agent runs meanwhile, and `child_env_scrubbed` sees no key in any agent.
 async fn security_confirmations() -> R<String> {
-    select_main().await?;
     let before = main_project().await?;
     if before.config_policy != ConfigPolicy::Isolated || before.allow_bypass {
         return Err(format!("main before: {before:?}"));
     }
-    let settings = open_settings("Progetto").await?;
+    let settings = open_project_settings().await?;
     let policy = find_in(&settings, "#project-policy").ok_or("no policy select")?;
     let bypass = find_in(&settings, "#project-bypass").ok_or("no bypass checkbox")?;
     let apply = find_in(&settings, "[data-action=apply-security]").ok_or("no Applica")?;
@@ -706,43 +743,43 @@ async fn security_confirmations() -> R<String> {
     ))
 }
 
-/// Opens the settings dialog on its `tab` ("Generali", "Progetto"); returns the dialog.
-async fn open_settings(tab: &str) -> R<Element> {
+/// Opens the "Impostazioni app" dialog of the sidebar (the app settings alone, no tabs);
+/// returns the dialog once its form is there.
+async fn open_app_settings() -> R<Element> {
     if open_dialog("Settings").is_none() {
         let button = q_all("nav button")
             .into_iter()
-            .find(|b| text(b).contains("Impostazioni"))
-            .ok_or("no Impostazioni")?;
+            .find(|b| text(b).contains("Impostazioni app"))
+            .ok_or("no Impostazioni app")?;
         click(&button);
     }
     let dialog = until("settings dialog", UI, || open_dialog("Settings")).await?;
-    let trigger = find_all(&dialog, "[data-name=TabsTrigger]")
-        .into_iter()
-        .find(|t| text(t).trim() == tab)
-        .ok_or(format!("no settings tab {tab}"))?;
-    if trigger.get_attribute("data-state").as_deref() != Some("Active") {
-        click(&trigger);
-    }
-    until(&format!("settings tab {tab}"), UI, || {
-        (trigger.get_attribute("data-state")? == "Active").then_some(())
-    })
-    .await?;
-    let testid = if tab == "Progetto" {
-        "project-settings"
-    } else {
-        "app-settings"
-    };
-    until(&format!("{testid} loaded"), UI, || {
-        find_in(&dialog, &format!("[data-testid={testid}]"))
+    until("app-settings loaded", UI, || {
+        find_in(&dialog, "[data-testid=app-settings]")
     })
     .await?;
     Ok(dialog)
 }
 
+/// main's Impostazioni page (the topbar tab), once filled from the project; returns
+/// `[data-testid=project-settings]`.
+async fn open_project_settings() -> R<Element> {
+    select_main().await?;
+    click(&wait_q("[data-project-view=settings]").await?);
+    until("project settings filled", UI, || {
+        q("[data-testid=project-settings]").filter(|page| {
+            find_in(page, "#project-policy")
+                .and_then(|p| Reflect::get(&p, &"value".into()).ok()?.as_string())
+                .is_some_and(|v| !v.is_empty())
+        })
+    })
+    .await
+}
+
 /// Sets `allow_env_api_key` from the app settings (answering OK to the confirmation it may
 /// ask) and saves; the dialog closes on success.
 async fn api_key_passthrough(on: bool) -> R {
-    let dialog = open_settings("Generali").await?;
+    let dialog = open_app_settings().await?;
     // The form is filled once the settings are loaded (the Salva button is enabled).
     let save = until("settings loaded", UI, || {
         find_in(&dialog, "[data-action=save-settings]").filter(|b| !b.has_attribute("disabled"))
@@ -772,13 +809,21 @@ async fn api_key_passthrough(on: bool) -> R {
 }
 
 async fn main_project() -> R<Project> {
-    let projects = ipc::call::<ListProjects>(&Empty {})
-        .await
-        .map_err(|e| e.to_string())?;
-    projects
+    project_named("main").await
+}
+
+async fn project_named(name: &str) -> R<Project> {
+    projects()
+        .await?
         .into_iter()
-        .find(|p| p.name == "main")
-        .ok_or_else(|| "no project main".into())
+        .find(|p| p.name == name)
+        .ok_or_else(|| format!("no project {name}"))
+}
+
+async fn projects() -> R<Vec<Project>> {
+    ipc::call::<ListProjects>(&Empty {})
+        .await
+        .map_err(|e| e.to_string())
 }
 
 async fn queue_confirm(accept: bool) -> R {
@@ -814,6 +859,7 @@ async fn only_expected_failures(expected: &[&str]) -> R<String> {
 async fn exit_during_turn(run: &mut Run) -> R<String> {
     let t4 = run.st.t4.clone();
     let grandchildren = recorded_grandchildren().await?;
+    select_main().await?;
     open_panel(&t4).await?;
     tab("Agente").await?;
     follow_up(&t4, "Attendi ancora [fake:hang_ignore]").await?;
@@ -976,8 +1022,9 @@ async fn step_2(run: &Run) -> R<String> {
     ))
 }
 
-/// Folder, bare and empty repositories rejected with a toast; `.mcp.json` warns; the main
-/// repository is added and selected.
+/// Folder, bare and empty repositories rejected with a toast; `.mcp.json` warns and `mcp`
+/// opens on its Riepilogo ([`overview_of_mcp`]); the main repository is added and selected,
+/// on its own Riepilogo, then its Task page.
 async fn step_3(run: &Run) -> R<String> {
     let setup = &run.setup;
     for (path, expected) in [
@@ -1014,21 +1061,144 @@ async fn step_3(run: &Run) -> R<String> {
         t.contains(".mcp.json") && t.contains("Isolato")
     })
     .await?;
+    let overview = overview_of_mcp().await?;
     let since = last_toast();
     add_repository(&setup.repo).await?;
     toast_after(since, "main added", |t| {
         t.contains("Progetto «main» aggiunto")
     })
     .await?;
-    until("main selected with its board", UI, || {
+    // main's own Riepilogo (its README alone), not mcp's.
+    until("main selected on its Riepilogo", UI, || {
         let selected = project_button("main")?.get_attribute("aria-current")?;
-        (selected == "true" && q("[data-testid=columns]").is_some()).then_some(())
+        (selected == "true"
+            && q("[data-view=overview] [data-overview-file=\"README.md\"]").is_some()
+            && q("[data-overview-file=\"CLAUDE.md\"]").is_none())
+        .then_some(())
+    })
+    .await?;
+    select_main().await?;
+    Ok(format!(
+        "not-git, bare and empty rejected (Invalid toast, list_projects empty); .mcp.json \
+         warned; {overview}; main selected on its Riepilogo, then its board; projects {:?}",
+        project_names()
+    ))
+}
+
+/// F3 on the project just added: `mcp` lands on its Riepilogo, read from its committed files.
+/// The CLAUDE.md card shows the file and how an Isolated project's agents get it; the MCP
+/// server of `.mcp.json` is listed with its env key and never the value, which is neither in
+/// the page (text or attributes) nor in the `get_project_overview` reply; the CTA "Apri task
+/// (0)" opens its empty Task page. The page is a `tabpanel` inside the `main` landmark (which
+/// keeps its own role), and each file block's trigger says whether its text is expanded and
+/// controls it: CLAUDE.md expanded, README.md collapsed with its text `inert` until clicked.
+async fn overview_of_mcp() -> R<String> {
+    until("mcp selected", UI, || {
+        (project_button("mcp")?.get_attribute("aria-current")? == "true").then_some(())
+    })
+    .await?;
+    let server = until("MCP server row", UI, || {
+        q(&format!(
+            "[data-view=overview] [data-mcp-server=\"{MCP_SERVER}\"]"
+        ))
+    })
+    .await?;
+    let row = text(&server);
+    if !row.contains(MCP_ENV_KEY) || !row.contains("stdio") {
+        return Err(format!("MCP server row {row:?}"));
+    }
+    let memory = wait_q("[data-view=overview] [data-overview-file=\"CLAUDE.md\"]").await?;
+    let card = text(&memory);
+    if !card.contains("Istruzioni E2E")
+        || !card.contains("non caricato")
+        || !card.contains("letto dall'agente su istruzione del prompt")
+    {
+        return Err(format!("CLAUDE.md card {card:?}"));
+    }
+    for file in ["README.md", ".mcp.json"] {
+        wait_q(&format!(
+            "[data-view=overview] [data-overview-file=\"{file}\"]"
+        ))
+        .await?;
+    }
+    if q("main[role]").is_some()
+        || q("main > #project-page-overview[role=tabpanel][aria-labelledby=project-tab-overview]")
+            .is_none()
+    {
+        return Err("the Riepilogo is not a tabpanel inside the main landmark".into());
+    }
+    let (claude, readme) = (disclosure("CLAUDE.md"), disclosure("README.md"));
+    if claude != Some(("true".into(), false)) || readme != Some(("false".into(), true)) {
+        return Err(format!(
+            "file blocks (aria-expanded, inert): CLAUDE.md {claude:?}, README.md {readme:?}"
+        ));
+    }
+    let trigger = q("[data-overview-file=\"README.md\"] [data-name=CollapsibleTrigger]")
+        .ok_or("no README.md trigger")?;
+    click(&trigger);
+    until("README.md expanded, not inert", UI, || {
+        (disclosure("README.md")? == ("true".to_owned(), false)).then_some(())
+    })
+    .await?;
+    let config = wait_q("[data-testid=overview-config]").await?;
+    if !text(&config).contains("Isolata") {
+        return Err(format!("overview config {:?}", text(&config)));
+    }
+    let page = document()
+        .document_element()
+        .and_then(|root| Reflect::get(&root, &"outerHTML".into()).ok()?.as_string())
+        .ok_or("no page markup")?;
+    let project = project_named("mcp").await?;
+    let reply = ipc::call::<GetProjectOverview>(&ProjectIdReq {
+        project_id: project.id,
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let reply = serde_json::to_string(&reply).map_err(|e| e.to_string())?;
+    if page.contains(MCP_SECRET) || reply.contains(MCP_SECRET) {
+        return Err(format!(
+            "{MCP_SECRET:?} in the page ({}) or in the reply ({})",
+            page.contains(MCP_SECRET),
+            reply.contains(MCP_SECRET)
+        ));
+    }
+    let cta = until("Apri task (0)", UI, || {
+        q("[data-view=overview] [data-action=open-tasks]")
+            .filter(|b| text(b).contains("Apri task (0)"))
+    })
+    .await?;
+    click(&cta);
+    until("mcp's Task page", UI, || {
+        (q("[data-project-view=tasks][aria-selected=true]").is_some()
+            && q("[data-view=overview]").is_none()
+            && q("[data-column=todo] [data-card-list]").is_some()
+            && card_ids().is_empty())
+        .then_some(())
     })
     .await?;
     Ok(format!(
-        "not-git, bare and empty rejected (Invalid toast, list_projects empty); .mcp.json \
-         warned; projects {:?}",
-        project_names()
+        "mcp on its Riepilogo (a tabpanel in main): CLAUDE.md «letto dall'agente su istruzione \
+         del prompt» (Isolata), expanded; README.md collapsed and inert, then expanded by its \
+         trigger; server {MCP_SERVER} with env key {MCP_ENV_KEY} and its value in neither the \
+         page nor get_project_overview; «Apri task (0)» → its empty board"
+    ))
+}
+
+/// `(aria-expanded, inert)` of the Riepilogo's block of `file`: its collapsible trigger's
+/// state and whether the text that trigger controls (`aria-controls`) is inert.
+fn disclosure(file: &str) -> Option<(String, bool)> {
+    let block = q(&format!(
+        "[data-view=overview] [data-overview-file=\"{file}\"]"
+    ))?;
+    let trigger = find_in(&block, "[data-name=CollapsibleTrigger]")?;
+    let controls = trigger.get_attribute("aria-controls")?;
+    let text = find_in(
+        &block,
+        &format!("[data-name=CollapsibleContent]#{controls}"),
+    )?;
+    Some((
+        trigger.get_attribute("aria-expanded")?,
+        text.has_attribute("inert"),
     ))
 }
 
@@ -1920,6 +2090,389 @@ async fn channel_big(t4: &str) -> R<String> {
     ))
 }
 
+// ---- feature round: list view, attachments, sub-agents, removal (spec F1, F4–F6) -------------
+
+/// F4 on main's board as the run left it (tasks in Da fare, In revisione and Fatto): Lista
+/// replaces the columns with one row per task, in column order then position as `get_board`
+/// says, each with its column's title and no card id; a row's title opens the task panel,
+/// which hides Branch and Aggiornato; Kanban brings the columns back (every card helper needs
+/// them).
+async fn task_list_view(run: &Run) -> R<String> {
+    select_main().await?;
+    let cards = board(&run.setup.repo).await?;
+    let expected: Vec<(String, TaskStatus)> = by_column(&cards)
+        .into_iter()
+        .map(|c| (c.task.id, c.task.status))
+        .collect();
+    click(&wait_q("[data-task-view=list]").await?);
+    let rows = until("list rows", UI, || {
+        let rows = q_all("[data-view=task-list] tr[data-row-task-id]");
+        (rows.len() == expected.len()
+            && q("[data-testid=columns]").is_none()
+            && q("[data-task-view=list][aria-pressed=true]").is_some())
+        .then_some(rows)
+    })
+    .await?;
+    let shown: Vec<(String, String)> = rows
+        .iter()
+        .map(|row| {
+            let id = row.get_attribute("data-row-task-id").unwrap_or_default();
+            let status = find_all(row, "td")
+                .get(1)
+                .map(|td| text(td).trim().to_owned())
+                .unwrap_or_default();
+            (id, status)
+        })
+        .collect();
+    let wanted: Vec<(String, String)> = expected
+        .iter()
+        .map(|(id, status)| (id.clone(), column_title(*status).to_owned()))
+        .collect();
+    if shown != wanted || q("[data-view=task-list] [data-task-id]").is_some() {
+        return Err(format!("list rows {shown:?}, expected {wanted:?}"));
+    }
+    let t4 = run.st.t4.clone();
+    let title = rows
+        .iter()
+        .find(|r| r.get_attribute("data-row-task-id").as_deref() == Some(t4.as_str()))
+        .and_then(|r| find_in(r, "td button"))
+        .ok_or("no title button in T4's row")?;
+    click(&title);
+    until(
+        "T4's panel from the list, narrow columns hidden",
+        UI,
+        || {
+            (q(&format!("[data-view=task-panel][data-task-id=\"{t4}\"]")).is_some()
+                && q_all("[data-view=task-list] thead th.hidden").len() == 2)
+                .then_some(())
+        },
+    )
+    .await?;
+    click(&wait_q("[data-task-view=kanban]").await?);
+    until("columns back", UI, || {
+        (q("[data-view=task-list]").is_none()
+            && q("[data-task-view=kanban][aria-pressed=true]").is_some()
+            && q("[data-column=todo] [data-card-list]").is_some())
+        .then_some(())
+    })
+    .await?;
+    Ok(format!(
+        "Lista: {} rows in column order then position, as get_board ({:?}); T4's title opened \
+         its panel, Branch and Aggiornato hidden meanwhile; Kanban → columns again",
+        wanted.len(),
+        wanted.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>()
+    ))
+}
+
+/// What the scratch project leaves for its removal to clean up.
+#[derive(Debug, Default)]
+struct Scratch {
+    project_id: String,
+    repo: String,
+    /// The core's data dir, as an attachment's path names it.
+    data_dir: String,
+    /// A task of the project (with the attachment).
+    task: String,
+    /// `(id, branch, worktree)` of its attempts.
+    attempts: Vec<(String, String, String)>,
+}
+
+/// F5 on a project added for it (`repos/da-rimuovere`, removed at the end): "Aggiungi file…"
+/// in the new-task dialog takes the file queued for the native picker (the core stages it,
+/// only a token reaches the page) and the task is created with it, a copy in the app's data
+/// dir. The attempt starts with "Nessun sub-agent" (F6); its first turn gets the copy: the
+/// prompt's `## Attachments` lists its path, `--add-dir` is the task's attachment folder, and
+/// Agent, Task and Workflow are disallowed with AskUserQuestion. The panel shows the chip and
+/// "Sub-agent: nessuno".
+async fn attachment_to_the_agent(run: &Run) -> R<(Scratch, String)> {
+    let repo = format!("{}/repos/{SCRATCH}", run.setup.dir);
+    let since = last_toast();
+    add_repository(&repo).await?;
+    toast_after(since, "scratch project added", |t| {
+        t.contains(&format!("Progetto «{SCRATCH}» aggiunto"))
+    })
+    .await?;
+    until("scratch project on its Riepilogo", UI, || {
+        (project_button(SCRATCH)?.get_attribute("aria-current")? == "true"
+            && q("[data-view=overview]").is_some())
+        .then_some(())
+    })
+    .await?;
+    let project = project_named(SCRATCH).await?;
+    select_tasks(SCRATCH).await?;
+    let source = format!("{}/attach/{ATTACHMENT}", run.setup.dir);
+    let task = create_task_with(
+        "Da fare",
+        "Leggi le specifiche",
+        "Segui il file allegato.",
+        Some(&source),
+    )
+    .await?;
+    let d = detail(&task).await?;
+    let [copy] = d.attachments.as_slice() else {
+        return Err(format!("attachments {:?}", d.attachments));
+    };
+    let copy_suffix = format!(
+        "/attachments/{}/{task}/{}/{ATTACHMENT}",
+        project.id, copy.id
+    );
+    let data_dir = copy
+        .path
+        .strip_suffix(&copy_suffix)
+        .ok_or(format!("attachment path {:?}", copy.path))?
+        .to_owned();
+    if copy.name != ATTACHMENT || copy.size == 0 || !exists(&copy.path).await? {
+        return Err(format!("attachment {copy:?}"));
+    }
+
+    start_attempt_with(&task, "acceptEdits", Some(("0", ""))).await?;
+    wait_turn(&task, "inreview").await?;
+    let attempt = detail(&task).await?.attempt.ok_or("no attempt")?;
+    let call = call_records_in(&attempt.worktree_path)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("no fake-claude call in the attempt's worktree")?;
+    let argv: Vec<String> = serde_json::from_value(call["argv"].clone()).unwrap_or_default();
+    let prompt = records("turn")
+        .await?
+        .into_iter()
+        .find(|t| t["pid"] == call["pid"])
+        .and_then(|t| t["prompt"].as_str().map(str::to_owned))
+        .ok_or("no turn recorded for the call")?;
+    let add_dir = flag(&argv, "--add-dir=").unwrap_or_default();
+    let listed = prompt
+        .lines()
+        .filter_map(|l| l.strip_prefix("- `")?.strip_suffix('`'))
+        .any(|path| path.ends_with(&copy_suffix));
+    if !add_dir.ends_with(&format!("/attachments/{}/{task}", project.id))
+        || !argv.iter().any(|a| a == NO_SUBAGENTS)
+        || !prompt.contains("\n## Attachments\n")
+        || !prompt.contains("read-only")
+        || !listed
+    {
+        return Err(format!("first turn argv {argv:?}, prompt {prompt:?}"));
+    }
+    if attempt.max_subagents != Some(0) {
+        return Err(format!("attempt max_subagents {:?}", attempt.max_subagents));
+    }
+    until(
+        "attachment chip and Sub-agent: nessuno in the panel",
+        UI,
+        || {
+            let chip = q(&format!(
+                "[data-view=task-panel] header li[data-attachment=\"{ATTACHMENT}\"]"
+            ))?;
+            (chip
+                .get_attribute("title")
+                .is_some_and(|t| t.ends_with(&copy_suffix))
+                && q("[data-view=task-panel] [data-testid=attempt-meta]")
+                    .is_some_and(|m| text(&m).contains("Sub-agent: nessuno")))
+            .then_some(())
+        },
+    )
+    .await?;
+    let scratch = Scratch {
+        project_id: project.id,
+        repo: project.repo_path,
+        data_dir,
+        task,
+        attempts: vec![(attempt.id, attempt.branch, attempt.worktree_path)],
+    };
+    Ok((
+        scratch,
+        format!(
+            "{ATTACHMENT} picked (token), copied to …{copy_suffix} ({} B); first turn: \
+             `## Attachments` lists the copy, --add-dir=…/attachments/<project>/<task>, \
+             {NO_SUBAGENTS} (Nessun sub-agent); panel chip + «Sub-agent: nessuno»",
+            copy.size
+        ),
+    ))
+}
+
+/// F6 with a limit: "Sub-agent (max)" 2 and "Modello dei sub-agent" haiku for a
+/// `[fake:subagents]` turn, which spawns three sub-agents. Its argv disallows only
+/// AskUserQuestion and Workflow, its `--settings` make Agent and Task ask the host and set
+/// CLAUDE_CODE_SUBAGENT_MODEL; the host allows two spawns and denies the third with the
+/// limit's text; the attempt counts 2 used, in the DB and in the panel.
+async fn subagent_limit(scratch: &mut Scratch) -> R<String> {
+    let task = quick_create("todo", "Sub-agent [fake:subagents]").await?;
+    start_attempt_with(&task, "acceptEdits", Some(("2", "haiku"))).await?;
+    wait_turn(&task, "inreview").await?;
+    let attempt = detail(&task).await?.attempt.ok_or("no attempt")?;
+    let argv = calls_in(&attempt.worktree_path)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("no fake-claude call in the attempt's worktree")?;
+    let settings = flag(&argv, "--settings=").unwrap_or_default();
+    if !argv
+        .iter()
+        .any(|a| a == "--disallowedTools=AskUserQuestion,Workflow")
+        || argv.iter().any(|a| a.starts_with("--add-dir="))
+        || !settings.contains(r#""ask":["Agent","Task"]"#)
+        || !settings.contains(r#""env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku"}"#)
+    {
+        return Err(format!("argv {argv:?}"));
+    }
+    let spawns = records("subagent").await?;
+    let answers: Vec<&str> = spawns
+        .iter()
+        .filter_map(|s| s["behavior"].as_str())
+        .collect();
+    let denial = spawns
+        .last()
+        .and_then(|s| s["message"].as_str())
+        .unwrap_or_default();
+    if answers != ["allow", "allow", "deny"]
+        || !denial.starts_with("Sub-agent limit for this task reached (2).")
+    {
+        return Err(format!("sub-agent answers {spawns:?}"));
+    }
+    if (
+        attempt.max_subagents,
+        attempt.subagents_used,
+        attempt.subagent_model.as_deref(),
+    ) != (Some(2), 2, Some("haiku"))
+    {
+        return Err(format!("attempt {attempt:?}"));
+    }
+    let meta = until("usati 2 in the panel", UI, || {
+        q("[data-view=task-panel] [data-testid=attempt-meta]")
+            .map(|m| text(&m))
+            .filter(|m| m.contains("Sub-agent: haiku, max 2 (usati 2)"))
+    })
+    .await?;
+    scratch
+        .attempts
+        .push((attempt.id, attempt.branch, attempt.worktree_path));
+    Ok(format!(
+        "max 2 + haiku: --disallowedTools=AskUserQuestion,Workflow, --settings ask \
+         [Agent, Task] and CLAUDE_CODE_SUBAGENT_MODEL=haiku; three spawns answered {answers:?} \
+         («{denial}»); DB and panel «{meta}»"
+    ))
+}
+
+/// F1: the scratch project is removed from its sidebar menu while main stays selected. A
+/// right click (a synthetic `contextmenu`: the page prevents the native menu) opens the menu
+/// on it, a pointerdown outside closes it; opened again, "Rimuovi dalla lista…" asks with
+/// RemoveProjectDialog, whose "Rimuovi" removes that project, not the selected one. It leaves
+/// the sidebar and `list_projects`; its tasks leave the DB (`get_task_detail`: NotFound, the
+/// failure this provokes), its attachments and its attempts' logs the data dir, its worktrees
+/// the disk and git; its branches and its checkout stay; main stays on its board.
+async fn project_removal(scratch: &Scratch) -> R<String> {
+    let attachments = format!("{}/attachments/{}", scratch.data_dir, scratch.project_id);
+    let mut data = vec![attachments];
+    for (id, ..) in &scratch.attempts {
+        data.push(format!("{}/logs/{id}", scratch.data_dir));
+    }
+    for dir in &data {
+        if !exists(dir).await? {
+            return Err(format!("{dir} missing before the removal"));
+        }
+    }
+    select_main().await?;
+    open_project_menu(SCRATCH).await?;
+    let body = document().body().ok_or("no body")?;
+    fire(&body, &event("PointerEvent", "pointerdown", &[])?);
+    until("menu closed by a pointerdown outside", UI, || {
+        q("[data-name=ContextMenuContent]").is_none().then_some(())
+    })
+    .await?;
+    let menu = open_project_menu(SCRATCH).await?;
+    click(&find_in(&menu, "[data-action=menu-remove]").ok_or("no Rimuovi dalla lista…")?);
+    let dialog = until("remove dialog", UI, || open_dialog("RemoveProjectDialog")).await?;
+    let asked = text(&dialog);
+    if !asked.contains(&format!("Rimuovere «{SCRATCH}» dalla lista?")) {
+        return Err(format!("remove dialog {asked:?}"));
+    }
+    let since = last_toast();
+    click(&find_in(&dialog, "[data-action=confirm-remove]").ok_or("no Rimuovi")?);
+    toast_after(since, "project removed", |t| {
+        t.contains(&format!("«{SCRATCH}» rimosso dalla lista"))
+    })
+    .await?;
+    until("scratch gone, main still on its board", UI, || {
+        (project_button(SCRATCH).is_none()
+            && open_dialog("RemoveProjectDialog").is_none()
+            && project_button("main")?.get_attribute("aria-current")? == "true"
+            && q("[data-column=todo] [data-card-list]").is_some())
+        .then_some(())
+    })
+    .await?;
+    if projects().await?.iter().any(|p| p.id == scratch.project_id) {
+        return Err("still in list_projects".into());
+    }
+    match ipc::call::<GetTaskDetail>(&IdReq {
+        id: scratch.task.clone(),
+    })
+    .await
+    {
+        Err(e) if e.code == ErrorCode::NotFound => {}
+        other => return Err(format!("get_task_detail of its task: {other:?}")),
+    }
+    for dir in &data {
+        if exists(dir).await? {
+            return Err(format!("{dir} still there"));
+        }
+    }
+    for (_, branch, worktree) in &scratch.attempts {
+        worktree_gone(&scratch.repo, worktree).await?;
+        let listed = git(&scratch.repo, &["branch", "--list", branch]).await?;
+        if listed.stdout.trim().is_empty() {
+            return Err(format!("branch {branch} deleted"));
+        }
+    }
+    let status = git(&scratch.repo, &["status", "--porcelain"]).await?;
+    if !status.stdout.is_empty() {
+        return Err(format!("checkout changed: {:?}", status.stdout));
+    }
+    Ok(format!(
+        "contextmenu opened the menu (native one prevented), pointerdown outside closed it; \
+         Rimuovi dalla lista… → RemoveProjectDialog → Rimuovi: {SCRATCH} gone from the sidebar \
+         and list_projects, main still selected on its board; its task NotFound, attachments \
+         and {} attempt logs gone, worktrees removed, branches and checkout kept",
+        scratch.attempts.len()
+    ))
+}
+
+/// The sidebar menu of project `name`, opened with a right click on its entry (a synthetic
+/// `contextmenu`, which the page must prevent); returns the menu once it names the project,
+/// with its trigger expanded.
+async fn open_project_menu(name: &str) -> R<Element> {
+    let button = project_button(name).ok_or(format!("no project {name}"))?;
+    let rect = button.get_bounding_client_rect();
+    let at = [
+        ("clientX", JsValue::from(rect.left() + 8.0)),
+        ("clientY", JsValue::from(rect.top() + 8.0)),
+    ];
+    if fire(&button, &event("MouseEvent", "contextmenu", &at)?) {
+        return Err("contextmenu not prevented: the native menu would open".into());
+    }
+    let label = format!("Azioni per «{name}»");
+    let menu = until("project menu", UI, || {
+        q("[data-name=ContextMenuContent][role=menu]")
+            .filter(|m| m.get_attribute("aria-label").as_deref() == Some(label.as_str()))
+    })
+    .await?;
+    let expanded = button
+        .closest("li")
+        .ok()
+        .flatten()
+        .and_then(|li| find_in(&li, "[data-action=project-menu]"))
+        .and_then(|t| t.get_attribute("aria-expanded"));
+    let items = find_all(&menu, "[role=menuitem]")
+        .iter()
+        .filter_map(|i| i.get_attribute("data-action"))
+        .collect::<Vec<_>>();
+    if expanded.as_deref() != Some("true") || items != ["menu-settings", "menu-remove"] {
+        return Err(format!(
+            "menu items {items:?}, trigger expanded {expanded:?}"
+        ));
+    }
+    Ok(menu)
+}
+
 // ---- app actions ------------------------------------------------------------------------------
 
 async fn add_repository(path: &str) -> R {
@@ -1933,6 +2486,18 @@ async fn add_repository(path: &str) -> R {
 
 /// TaskDialog from the "+" of the column titled `column`; returns the new card's id.
 async fn create_task(column: &str, title: &str, description: &str) -> R<String> {
+    create_task_with(column, title, description, None).await
+}
+
+/// [`create_task`], with the file at `attachment` (queued for the native picker, whose token
+/// the dialog keeps) added through "Aggiungi file…" before "Crea task". The dialog closes only
+/// once the task and its attachments exist.
+async fn create_task_with(
+    column: &str,
+    title: &str,
+    description: &str,
+    attachment: Option<&str>,
+) -> R<String> {
     let before = card_ids();
     click(&wait_q(&format!("button[aria-label=\"Nuovo task in {column}\"]")).await?);
     let dialog = until("task dialog", UI, || open_dialog("TaskDialog")).await?;
@@ -1941,7 +2506,27 @@ async fn create_task(column: &str, title: &str, description: &str) -> R<String> 
         &find_in(&dialog, "#task-description").ok_or("no description")?,
         description,
     )?;
-    click(&button_in(&dialog, "Crea task").ok_or("no Crea task")?);
+    if let Some(path) = attachment {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        ipc::call::<DebugE2eQueuePick>(&E2ePathReq { path: path.into() })
+            .await
+            .map_err(|e| e.to_string())?;
+        click(
+            &until("Aggiungi file… enabled", UI, || {
+                find_in(&dialog, "[data-action=add-attachment]:not([disabled])")
+            })
+            .await?,
+        );
+        until(&format!("{name} in the dialog"), UI, || {
+            find_in(&dialog, &format!("[data-attachment=\"{name}\"]"))
+        })
+        .await?;
+    }
+    let create = until("Crea task enabled", UI, || {
+        button_in(&dialog, "Crea task").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&create);
     until("task dialog closed", UI, || {
         open_dialog("TaskDialog").is_none().then_some(())
     })
@@ -1988,6 +2573,13 @@ async fn new_card(before: &[String], title: &str) -> R<String> {
 
 /// Opens the task's panel and starts an attempt with the Avvia dialog in `mode`.
 async fn start_attempt(task: &str, mode: &str) -> R {
+    start_attempt_with(task, mode, None).await
+}
+
+/// [`start_attempt`], with `subagents` = `(max, model)` set in the dialog when given: the
+/// "Sub-agent (max)" value ("" = the CLI's default, "0".."10"), then the "Modello dei
+/// sub-agent" one unless `model` is empty. With "0" the model select must leave the dialog.
+async fn start_attempt_with(task: &str, mode: &str, subagents: Option<(&str, &str)>) -> R {
     open_panel(task).await?;
     tab("Agente").await?;
     click(&wait_q("[data-view=task-panel] [data-action=open-start]").await?);
@@ -1996,6 +2588,24 @@ async fn start_attempt(task: &str, mode: &str) -> R {
     })
     .await?;
     set_select(&find_in(&dialog, "#start-mode").ok_or("no mode")?, mode)?;
+    if let Some((max, model)) = subagents {
+        let limit = find_in(&dialog, "#start-max-subagents").ok_or("no Sub-agent (max)")?;
+        set_select(&limit, max)?;
+        if max == "0" {
+            until("no sub-agent model without sub-agents", UI, || {
+                find_in(&dialog, "#start-subagent-model")
+                    .is_none()
+                    .then_some(())
+            })
+            .await?;
+        } else if !model.is_empty() {
+            let select = until("Modello dei sub-agent", UI, || {
+                find_in(&dialog, "#start-subagent-model")
+            })
+            .await?;
+            set_select(&select, model)?;
+        }
+    }
     let start = until("Avvia enabled", UI, || {
         find_in(&dialog, "[data-action=start]:not([disabled])")
     })
@@ -2099,13 +2709,29 @@ async fn tab(label: &str) -> R {
 }
 
 async fn select_main() -> R {
-    let main = until("project main", UI, || project_button("main")).await?;
-    if main.get_attribute("aria-current").as_deref() != Some("true") {
-        click(&main);
+    select_tasks("main").await
+}
+
+/// Project `name` selected (a selection lands on its Riepilogo) and its Task page shown, with
+/// the columns (the board mounts on Kanban). The Task tab is always clicked: it is a no-op on
+/// that page, and main may be selected on another one (after a reload, a relaunch, the
+/// settings page).
+async fn select_tasks(name: &str) -> R {
+    let button = until(&format!("project {name}"), UI, || project_button(name)).await?;
+    let selected = || project_button(name)?.get_attribute("aria-current");
+    if selected().as_deref() != Some("true") {
+        click(&button);
+        until(&format!("{name} selected"), UI, || {
+            (selected()? == "true").then_some(())
+        })
+        .await?;
     }
-    until("board of main", UI, || {
-        let selected = project_button("main")?.get_attribute("aria-current")?;
-        (selected == "true" && q("[data-column=todo] [data-card-list]").is_some()).then_some(())
+    click(&wait_q("[data-project-view=tasks]").await?);
+    until(&format!("board of {name}"), UI, || {
+        (selected()? == "true"
+            && q("[data-project-view=tasks][aria-selected=true]").is_some()
+            && q("[data-column=todo] [data-card-list]").is_some())
+        .then_some(())
     })
     .await
 }
@@ -2217,6 +2843,15 @@ async fn calls() -> R<Vec<Vec<String>>> {
 
 /// argv of the fake-claude `-p` calls that ran in `worktree`, in order.
 async fn calls_in(worktree: &str) -> R<Vec<Vec<String>>> {
+    Ok(call_records_in(worktree)
+        .await?
+        .into_iter()
+        .filter_map(|l| serde_json::from_value(l["argv"].clone()).ok())
+        .collect())
+}
+
+/// fake-claude's records of the `-p` calls that ran in `worktree` (pid, argv…), in order.
+async fn call_records_in(worktree: &str) -> R<Vec<Value>> {
     let name = worktree.rsplit('/').next().unwrap_or(worktree);
     Ok(records("call")
         .await?
@@ -2226,7 +2861,6 @@ async fn calls_in(worktree: &str) -> R<Vec<Vec<String>>> {
                 .as_str()
                 .is_some_and(|cwd| cwd == worktree || cwd.ends_with(&format!("/{name}")))
         })
-        .filter_map(|l| serde_json::from_value(l["argv"].clone()).ok())
         .collect())
 }
 
@@ -2300,13 +2934,11 @@ async fn closed_in_db(
 
 /// The board of the project of `repo`.
 async fn board(repo: &str) -> R<Vec<TaskCard>> {
-    let projects = ipc::call::<ListProjects>(&Empty {})
-        .await
-        .map_err(|e| e.to_string())?;
-    let project = projects
+    let project = projects()
+        .await?
         .into_iter()
         .find(|p| p.repo_path == repo)
-        .ok_or("project main not found")?;
+        .ok_or(format!("no project of {repo}"))?;
     ipc::call::<GetBoard>(&ProjectIdReq {
         project_id: project.id,
     })
@@ -2331,15 +2963,21 @@ fn position(board: &[TaskCard], task: &str) -> f64 {
 
 /// What is on screen, for the details of a failed check.
 fn dom_summary() -> String {
-    let projects: Vec<String> = q_all("[data-testid=projects] button")
+    let projects: Vec<String> = q_all("[data-testid=projects] [data-project]")
         .iter()
         .map(|b| {
             format!(
                 "{}{}",
-                project_label(b),
+                b.get_attribute("data-project").unwrap_or_default(),
                 b.get_attribute("aria-current").map_or("", |_| "*")
             )
         })
+        .collect();
+    let page = q("[data-project-view][aria-selected=true]")
+        .and_then(|t| t.get_attribute("data-project-view"));
+    let errors: Vec<String> = q_all("[data-overview-error], [data-remove-error]")
+        .iter()
+        .map(text)
         .collect();
     let columns: Vec<String> = q_all("[data-column]")
         .iter()
@@ -2361,8 +2999,8 @@ fn dom_summary() -> String {
         .collect::<Vec<_>>();
     let panel: String = panel_text().chars().take(600).collect();
     format!(
-        "views {view:?}; projects {projects:?}; columns {columns:?}; dialogs {dialogs:?}; \
-         toasts {:?}; panel {panel:?}",
+        "views {view:?}; page {page:?}; projects {projects:?}; columns {columns:?}; dialogs \
+         {dialogs:?}; errors {errors:?}; toasts {:?}; panel {panel:?}",
         toasts()
     )
 }
@@ -2469,23 +3107,15 @@ fn badge(task: &str, name: &str) -> Option<Element> {
     ))
 }
 
-/// The project's button in the sidebar (its label span: the icon's SVG has a `<title>`).
+/// The project's button in the sidebar (not its "⋯" menu trigger).
 fn project_button(name: &str) -> Option<Element> {
-    q_all("[data-testid=projects] button")
-        .into_iter()
-        .find(|b| project_label(b) == name)
-}
-
-fn project_label(button: &Element) -> String {
-    find_in(button, "span")
-        .map(|s| text(&s).trim().to_owned())
-        .unwrap_or_default()
+    q(&format!("[data-testid=projects] [data-project=\"{name}\"]"))
 }
 
 fn project_names() -> Vec<String> {
-    q_all("[data-testid=projects] button")
+    q_all("[data-testid=projects] [data-project]")
         .iter()
-        .map(project_label)
+        .filter_map(|b| b.get_attribute("data-project"))
         .collect()
 }
 

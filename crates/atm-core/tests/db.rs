@@ -3,15 +3,17 @@
 
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
+use atm_core::attachments;
 use atm_core::db::{
-    self, AttemptRow, Db, MAX_ENTRY_PAGE, MIGRATIONS, POSITION_GAP, ProcessFinish, ProcessRow,
-    ProjectRow,
+    self, AttachmentRow, AttemptRow, Db, MAX_ENTRY_PAGE, MIGRATIONS, POSITION_GAP, ProcessFinish,
+    ProcessRow, ProjectRow,
 };
 use atm_types::{
     AppError, AttemptState, ConfigPolicy, CreateTaskReq, Effort, Entry, EntryBody, EntryPage,
-    ErrorCode, PermissionMode, ProcessStatus, Settings, StopReason, TaskStatus, ToolStatus,
-    UpdateProjectReq, UpdateTaskReq, WorktreeState,
+    ErrorCode, MAX_ATTACHMENTS_PER_TASK, MAX_PROJECT_DESCRIPTION, PermissionMode, ProcessStatus,
+    Settings, StopReason, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq, WorktreeState,
 };
 use rusqlite::{Connection, ffi};
 
@@ -23,6 +25,7 @@ fn project(id: &str, name: &str) -> ProjectRow {
     ProjectRow {
         id: id.into(),
         name: name.into(),
+        description: String::new(),
         repo_path: format!("/repos/{id}"),
         default_target_branch: "main".into(),
         default_permission_mode: PermissionMode::AcceptEdits,
@@ -59,6 +62,9 @@ fn attempt(id: &str, task_id: &str, created_at: i64) -> AttemptRow {
         permission_mode: PermissionMode::AcceptEdits,
         model: None,
         effort: None,
+        subagent_model: None,
+        max_subagents: None,
+        subagents_used: 0,
         allow_rules: Vec::new(),
         merge_commit: None,
         created_at,
@@ -93,6 +99,16 @@ fn process(id: &str, attempt_id: &str, seq: u32, instance: &str) -> ProcessRow {
         head_after: None,
         started_at: NOW + i64::from(seq),
         finished_at: None,
+    }
+}
+
+fn attachment(id: &str, task_id: &str, created_at: i64) -> AttachmentRow {
+    AttachmentRow {
+        id: id.into(),
+        task_id: task_id.into(),
+        name: format!("{id}.txt"),
+        size: 10,
+        created_at,
     }
 }
 
@@ -263,6 +279,7 @@ fn migrates_in_memory_idempotently() {
             "processes",
             "projects",
             "settings",
+            "task_attachments",
             "tasks"
         ]
     );
@@ -276,6 +293,71 @@ fn migrates_in_memory_idempotently() {
 
     let db = Db::open_in_memory().unwrap();
     assert_eq!(db.settings().unwrap(), Settings::default());
+}
+
+/// A database of the first schema with rows in every table migrates to the second: the rows
+/// are kept, the new columns take their defaults, the new table is there and usable.
+#[test]
+fn migrates_a_v1_database_with_rows_to_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atm.sqlite3");
+    {
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch(db::PRAGMAS).unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[0]).unwrap();
+        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.commit().unwrap();
+        c.execute_batch(
+            "INSERT INTO projects (id, name, repo_path, default_target_branch, default_model,
+                created_at, updated_at)
+                VALUES ('p', 'Vecchio', '/r', 'main', 'opus', 1, 2);
+             INSERT INTO tasks (id, project_id, title, position, created_at, updated_at)
+                VALUES ('t', 'p', 'T', 1024, 0, 0);",
+        )
+        .unwrap();
+        raw_attempt(&c, "a", "active").unwrap();
+        raw_process(&c, "r", "a", 1, "running").unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let version: i64 = Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, MIGRATIONS.len() as i64);
+    let p = db.project("p").unwrap();
+    assert_eq!(
+        (
+            p.name.as_str(),
+            p.default_model.as_deref(),
+            p.description.as_str()
+        ),
+        ("Vecchio", Some("opus"), "")
+    );
+    let a = db.attempt("a").unwrap();
+    assert_eq!((a.branch.as_str(), a.task_id.as_str()), ("atm/a", "t"));
+    assert_eq!(
+        (a.subagent_model, a.max_subagents, a.subagents_used),
+        (None, None, 0)
+    );
+    assert_eq!(db.process("r").unwrap().status, ProcessStatus::Running);
+    assert!(db.task_attachments("t").unwrap().is_empty());
+    db.insert_attachments(&[attachment("x", "t", NOW)]).unwrap();
+    assert_eq!(db.attachment_count("t").unwrap(), 1);
+    assert_eq!(db.count_subagent("a", NOW).unwrap(), Some(1));
+    let req = UpdateProjectReq {
+        id: "p".into(),
+        name: "Vecchio".into(),
+        default_target_branch: "main".into(),
+        default_permission_mode: PermissionMode::AcceptEdits,
+        default_model: None,
+        description: "Ora descritto".into(),
+    };
+    assert_eq!(
+        db.update_project(&req, NOW).unwrap().description,
+        "Ora descritto"
+    );
 }
 
 #[test]
@@ -388,6 +470,14 @@ fn check_constraints_reject_invalid_rows() {
         "UPDATE attempts SET permission_mode = 'auto'",
         "UPDATE attempts SET effort = 'huge'",
         "UPDATE attempts SET allow_rules = '[\"Bash(ls)\"'",
+        "UPDATE attempts SET max_subagents = 11",
+        "UPDATE attempts SET max_subagents = -1",
+        "UPDATE attempts SET subagents_used = -1",
+        "UPDATE projects SET description = substr(hex(zeroblob(5001)), 1, 10001)",
+        "INSERT INTO task_attachments (id, task_id, name, size, created_at)
+            VALUES ('x', 't', '', 1, 0)",
+        "INSERT INTO task_attachments (id, task_id, name, size, created_at)
+            VALUES ('x', 't', 'a.txt', -1, 0)",
         "UPDATE processes SET status = 'zombie'",
         "UPDATE processes SET stop_reason = 'bored'",
         "UPDATE processes SET resumed = 2",
@@ -738,6 +828,7 @@ fn projects_are_stored_ordered_and_updated() {
         default_target_branch: "develop".into(),
         default_permission_mode: PermissionMode::Default,
         default_model: Some("opus".into()),
+        description: "Il sito di prova".into(),
     };
     let p = db.update_project(&req, NOW + 1).unwrap();
     assert_eq!(p, db.project("a").unwrap());
@@ -745,10 +836,32 @@ fn projects_are_stored_ordered_and_updated() {
         (
             p.name.as_str(),
             p.default_target_branch.as_str(),
-            p.default_permission_mode
+            p.default_permission_mode,
+            p.description.as_str()
         ),
-        ("Alfa", "develop", PermissionMode::Default)
+        (
+            "Alfa",
+            "develop",
+            PermissionMode::Default,
+            "Il sito di prova"
+        )
     );
+    assert_eq!(p.to_project(false).description, "Il sito di prova");
+    // The description's CHECK counts characters, not bytes.
+    let long = UpdateProjectReq {
+        description: "è".repeat(MAX_PROJECT_DESCRIPTION),
+        ..req.clone()
+    };
+    db.update_project(&long, NOW + 1).unwrap();
+    let too_long = UpdateProjectReq {
+        description: "d".repeat(MAX_PROJECT_DESCRIPTION + 1),
+        ..req.clone()
+    };
+    assert_eq!(
+        err(db.update_project(&too_long, NOW + 1)).code,
+        ErrorCode::Invalid
+    );
+    let p = db.update_project(&req, NOW + 1).unwrap();
     assert_eq!(
         (p.default_model.as_deref(), p.updated_at),
         (Some("opus"), NOW + 1)
@@ -800,6 +913,7 @@ fn projects_are_stored_ordered_and_updated() {
         default_target_branch: "develop".into(),
         default_permission_mode: PermissionMode::BypassPermissions,
         default_model: None,
+        description: String::new(),
     };
     db.update_project(&bypass_default, NOW + 3).unwrap();
     let p = db
@@ -1221,4 +1335,153 @@ fn cancel_open_tools_closes_only_the_open_calls_of_the_process() {
         db.cancel_open_tools("a1", "r1").unwrap().is_empty(),
         "idempotent"
     );
+}
+
+// ---- feature round 2026-09-29: attachments, sub-agents, cleanup ids ------------------------
+
+#[test]
+fn attachments_are_listed_capped_and_deleted() {
+    let db = seeded();
+    db.insert_task("t2", &new_task("p", "Altro", None), NOW)
+        .unwrap();
+    let first: Vec<AttachmentRow> = (0..MAX_ATTACHMENTS_PER_TASK - 1)
+        .map(|i| attachment(&format!("x{i:02}"), "t", NOW + i as i64))
+        .collect();
+    db.insert_attachments(&first).unwrap();
+    assert_eq!(
+        db.attachment_count("t").unwrap(),
+        MAX_ATTACHMENTS_PER_TASK - 1
+    );
+
+    // Past the limit nothing of the call is inserted (one transaction, counted again).
+    let two = [
+        attachment("y1", "t", NOW + 100),
+        attachment("y2", "t", NOW + 101),
+    ];
+    let e = err(db.insert_attachments(&two));
+    assert_eq!(e.code, ErrorCode::Invalid);
+    assert!(
+        e.message.contains(&MAX_ATTACHMENTS_PER_TASK.to_string()),
+        "{e}"
+    );
+    assert_eq!(err(db.attachment("y1")).code, ErrorCode::NotFound);
+    db.insert_attachments(&two[..1]).unwrap();
+    assert_eq!(db.attachment_count("t").unwrap(), MAX_ATTACHMENTS_PER_TASK);
+    let listed = db.task_attachments("t").unwrap();
+    assert_eq!(listed.first().map(|a| a.id.as_str()), Some("x00"));
+    assert_eq!(listed.last(), Some(&two[0]), "oldest first");
+    assert_eq!(db.attachment_count("t2").unwrap(), 0, "per task");
+
+    // Duplicate id, gone task, empty name.
+    let e = err(db.insert_attachments(&[attachment("y1", "t2", NOW)]));
+    assert_eq!(e.code, ErrorCode::Conflict);
+    let e = err(db.insert_attachments(&[attachment("z", "nope", NOW)]));
+    assert_eq!(e.code, ErrorCode::NotFound);
+    let mut unnamed = attachment("z", "t2", NOW);
+    unnamed.name = String::new();
+    assert_eq!(
+        err(db.insert_attachments(&[unnamed])).code,
+        ErrorCode::Invalid
+    );
+
+    // The copy's path follows from the ids and the name.
+    let view = attachments::view(Path::new("/data"), "p", &db.attachment("y1").unwrap());
+    assert_eq!(
+        (view.path.as_str(), view.name.as_str(), view.size),
+        ("/data/attachments/p/t/y1/y1.txt", "y1.txt", 10)
+    );
+
+    assert_eq!(db.delete_attachment("y1").unwrap(), two[0]);
+    assert_eq!(err(db.attachment("y1")).code, ErrorCode::NotFound);
+    assert_eq!(err(db.delete_attachment("y1")).code, ErrorCode::NotFound);
+
+    // Rows cascade with their task and project.
+    db.insert_attachments(&[attachment("w", "t2", NOW)])
+        .unwrap();
+    db.delete_task("t").unwrap();
+    assert_eq!(db.attachment_count("t").unwrap(), 0);
+    db.delete_project("p").unwrap();
+    assert_eq!(err(db.attachment("w")).code, ErrorCode::NotFound);
+}
+
+#[test]
+fn subagent_spawns_are_counted_up_to_the_limit() {
+    let db = seeded();
+    for id in ["t2", "t3"] {
+        db.insert_task(id, &new_task("p", id, None), NOW).unwrap();
+    }
+    let mut limited = attempt("a1", "t", NOW);
+    limited.subagent_model = Some("haiku".into());
+    limited.max_subagents = Some(2);
+    db.begin_attempt(&limited, &process("r1", "a1", 1, "i"), NOW)
+        .unwrap();
+    assert_eq!(db.attempt("a1").unwrap(), limited);
+    assert_eq!(db.count_subagent("a1", NOW + 1).unwrap(), Some(1));
+    assert_eq!(db.count_subagent("a1", NOW + 2).unwrap(), Some(2));
+    assert_eq!(db.count_subagent("a1", NOW + 3).unwrap(), None);
+    let a = db.attempt("a1").unwrap();
+    assert_eq!((a.subagents_used, a.updated_at), (2, NOW + 2));
+    let view = a.view(false, 0);
+    assert_eq!(
+        (
+            view.subagent_model.as_deref(),
+            view.max_subagents,
+            view.subagents_used
+        ),
+        (Some("haiku"), Some(2), 2)
+    );
+
+    // No limit: always counted. Zero: never.
+    db.begin_attempt(&attempt("a2", "t2", NOW), &process("r2", "a2", 1, "i"), NOW)
+        .unwrap();
+    for n in 1..=12 {
+        assert_eq!(db.count_subagent("a2", NOW).unwrap(), Some(n));
+    }
+    let mut none = attempt("a3", "t3", NOW);
+    none.max_subagents = Some(0);
+    db.begin_attempt(&none, &process("r3", "a3", 1, "i"), NOW)
+        .unwrap();
+    assert_eq!(db.count_subagent("a3", NOW).unwrap(), None);
+    assert_eq!(
+        err(db.count_subagent("nope", NOW)).code,
+        ErrorCode::NotFound
+    );
+
+    // Over the limit of the contract: refused by the CHECK, nothing written.
+    db.finish_discard("a3", NOW).unwrap();
+    let mut over = attempt("a4", "t3", NOW);
+    over.max_subagents = Some(11);
+    let e = err(db.begin_attempt(&over, &process("r4", "a4", 1, "i"), NOW));
+    assert_eq!(e.code, ErrorCode::Invalid);
+    assert_eq!(err(db.attempt("a4")).code, ErrorCode::NotFound);
+}
+
+/// Attachment folders and logs live outside the DB: their ids are read before the cascade.
+#[test]
+fn task_and_attempt_ids_for_cleanup() {
+    let db = seeded();
+    db.insert_task("t2", &new_task("p", "Altro", None), NOW + 1)
+        .unwrap();
+    db.begin_attempt(&attempt("a1", "t", NOW), &process("r1", "a1", 1, "i"), NOW)
+        .unwrap();
+    db.begin_attempt(
+        &attempt("a2", "t2", NOW + 1),
+        &process("r2", "a2", 1, "i"),
+        NOW,
+    )
+    .unwrap();
+    db.finish_discard("a1", NOW + 2).unwrap();
+    db.begin_attempt(
+        &attempt("a3", "t", NOW + 3),
+        &process("r3", "a3", 1, "i"),
+        NOW,
+    )
+    .unwrap();
+
+    assert_eq!(db.project_task_ids("p").unwrap(), ["t", "t2"]);
+    assert_eq!(db.task_attempt_ids("t").unwrap(), ["a1", "a3"]);
+    assert_eq!(db.project_attempt_ids("p").unwrap(), ["a1", "a2", "a3"]);
+    assert!(db.project_task_ids("nope").unwrap().is_empty());
+    assert!(db.project_attempt_ids("nope").unwrap().is_empty());
+    assert!(db.task_attempt_ids("nope").unwrap().is_empty());
 }

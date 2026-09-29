@@ -42,6 +42,15 @@ pub fn column(cards: &[TaskCard], status: TaskStatus) -> Vec<TaskCard> {
     col
 }
 
+/// Every card in board order: column by column (`TaskStatus::ALL`), each in position order.
+/// The list view's fixed order (spec F4); `get_board` sorts by position only.
+pub fn by_column(cards: &[TaskCard]) -> Vec<TaskCard> {
+    TaskStatus::ALL
+        .iter()
+        .flat_map(|&status| column(cards, status))
+        .collect()
+}
+
 /// Optimistic local reorder mirroring `move_task`: `id` goes into `status` before `before_id`
 /// (at the end when `None`). The `changed` refetch that follows is authoritative.
 #[allow(clippy::ptr_arg)] // frozen M1 signature
@@ -175,6 +184,18 @@ mod tests {
         assert_eq!(ids(&cards, TaskStatus::Todo), ["a", "b", "c"]);
         assert_eq!(ids(&cards, TaskStatus::Done), ["x"]);
         assert!(column(&cards, TaskStatus::Cancelled).is_empty());
+    }
+
+    #[test]
+    fn by_column_follows_the_columns_then_the_positions() {
+        let mut cards = board();
+        cards.push(card("r", TaskStatus::InReview, 1024.0));
+        cards.push(card("k", TaskStatus::Cancelled, 512.0));
+        cards.push(card("p", TaskStatus::InProgress, 4096.0));
+        cards.push(card("q", TaskStatus::InProgress, 10.0));
+        let order: Vec<String> = by_column(&cards).into_iter().map(|c| c.task.id).collect();
+        assert_eq!(order, ["a", "b", "c", "q", "p", "r", "x", "k"]);
+        assert!(by_column(&[]).is_empty());
     }
 
     #[test]

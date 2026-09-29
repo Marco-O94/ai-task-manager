@@ -3,6 +3,11 @@
 App desktop per macOS: una kanban di task affidati al Claude Code CLI installato sul Mac, un git worktree per ogni tentativo.
 Stack: Tauri 2 + Leptos 0.8 (CSR, WASM) + componenti Rust/UI. Piano completo: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+Ogni progetto ha una pagina con tre tab: **Riepilogo** (descrizione, stato e la configurazione Claude che il repository
+dà agli agenti), **Task** (kanban o lista, con il pannello del task) e **Impostazioni**. Ai task si allegano file, e per
+ogni tentativo si può limitare il numero di sub-agent e sceglierne il modello: vedi
+[La pagina del progetto](#la-pagina-del-progetto).
+
 ## Usa il Claude Code installato sul tuo Mac
 
 L'app non contiene un modello né un client dell'API: guida il `claude` già installato sul Mac, non modificato, con il
@@ -14,8 +19,8 @@ suo login. Per conto suo esegue solo `claude --version` e `claude auth status`; 
   "Ricontrolla". Il login avviene solo lì: l'app non legge mai il Portachiavi, `~/.claude/.credentials.json` o
   `~/.claude/projects`, non salva token, email od organizzazione e non fa da proxy.
 - **Nessuna chiave API di default.** `ANTHROPIC_API_KEY` e `ANTHROPIC_AUTH_TOKEN` vengono tolti dall'ambiente degli
-  agenti, che usano quindi il login dell'abbonamento. Impostazioni → Generali → «Passa agli agenti la chiave API
-  dell'ambiente» li lascia passare dopo una conferma nativa; finché è attivo e una chiave è presente, un banner nella
+  agenti, che usano quindi il login dell'abbonamento. «Passa agli agenti la chiave API dell'ambiente», nel dialog
+  Impostazioni app, li lascia passare dopo una conferma nativa; finché è attivo e una chiave è presente, un banner nella
   topbar dice che l'uso è fatturato via API. Lo stesso banner compare con un login diverso da claude.ai e con
   `CLAUDE_CODE_USE_BEDROCK/_VERTEX/_FOUNDRY` nell'ambiente. `ANTHROPIC_BASE_URL` nell'ambiente dell'app (o l'endpoint
   di un provider cloud) resta, perché è una tua scelta, ma un banner nella topbar dice che gli agenti mandano le
@@ -32,7 +37,7 @@ suo login. Per conto suo esegue solo `claude --version` e `claude auth status`; 
   subito quel programma; deve essere un percorso assoluto fuori dai progetti e dai worktree), poi `ATM_CLAUDE_PATH`, poi `~/.local/bin/claude`,
   `~/.claude/local/claude`, Homebrew e il `PATH` della login shell, importato una volta con `$SHELL -ilc` (un'app
   aperta dal Finder ha il `PATH` minimo di launchd, non quello del Terminale); git è il primo sul `PATH` importato,
-  altrimenti `/usr/bin/git`. Impostazioni → Generali dice quali sta usando, per esempio "In uso: Claude Code 2.1.284
+  altrimenti `/usr/bin/git`. Il dialog Impostazioni app dice quali sta usando, per esempio "In uso: Claude Code 2.1.284
   (/Users/…/.local/bin/claude); git 2.54.0.", e lo stderr dell'app (anche in release, `open --stderr <file>`) ha una
   riga per ogni `get_env`, senza email né organizzazione:
   `get_env: claude /Users/…/.local/bin/claude version 2.1.284 supported=true auth loggedIn (authMethod claude.ai, subscription max) git /opt/homebrew/bin/git version 2.54.0`.
@@ -54,13 +59,13 @@ suo login. Per conto suo esegue solo `claude --version` e `claude auth status`; 
 
 ### Modalità di permesso
 
-Si scelgono nel dialog Avvia (default per progetto nelle Impostazioni). Dati di M5, CLI 2.1.283:
+Si scelgono nel dialog Avvia (il default del progetto sta nel suo tab Impostazioni). Dati di M5, CLI 2.1.283:
 
 | Modalità | CLI | Cosa chiede |
 |---|---|---|
 | Supervisionato | `--permission-mode=default` | Chiede per ogni modifica e comando; passano da sole solo le letture, per esempio `ls` |
 | **Auto-edit** (default) | `acceptEdits` | Approva da solo le modifiche ai file e i comandi shell che leggono o scrivono file nel worktree (per esempio `printf … >> README.md`) e chiede per il resto |
-| Autonomo | `bypassPermissions` + `--allow-dangerously-skip-permissions` | Non chiede mai. Si abilita per progetto (Impostazioni → Progetto) con una conferma nativa; toglierlo riporta a Auto-edit la modalità predefinita |
+| Autonomo | `bypassPermissions` + `--allow-dangerously-skip-permissions` | Non chiede mai. Si abilita per progetto (tab Impostazioni del progetto, Sicurezza) con una conferma nativa; toglierlo riporta a Auto-edit la modalità predefinita |
 
 Le richieste compaiono come card nel transcript: "Consenti", "Consenti sempre (attempt)" quando il CLI propone una
 regola, "Nega", "Nega e ferma". In ogni modalità l'app passa via `--settings` regole deny per `git push`, `~/.ssh`,
@@ -70,10 +75,10 @@ regola, "Nega", "Nega e ferma". In ogni modalità l'app passa via `--settings` r
 
 Isolata (default) passa `--setting-sources=user --strict-mcp-config`, quindi `.claude/`, `.mcp.json`, hook, `env`,
 `apiKeyHelper`, server MCP e regole di permesso del repo non vengono caricati (le impostazioni e gli hook
-dell'**utente** sì; `CLAUDE.md` l'agente lo legge perché il prompt dell'app glielo chiede). Attendibile si attiva da
-Impostazioni → Progetto → Applica, dopo una conferma nativa che nomina il repository per percorso, il branch e il
-commit approvati, e avvisa se le sue regole `permissions.allow` consentono un tool intero (per esempio `Bash(*)`:
-comandi senza chiedere in ogni modalità, di fatto un Autonomo per Bash senza l'opt-in).
+dell'**utente** sì; `CLAUDE.md` l'agente lo legge perché il prompt dell'app glielo chiede). Attendibile si attiva dal
+tab Impostazioni del progetto → Sicurezza → Applica, dopo una conferma nativa che nomina il repository per percorso,
+il branch e il commit approvati, e avvisa se le sue regole `permissions.allow` consentono un tool intero (per esempio
+`Bash(*)`: comandi senza chiedere in ogni modalità, di fatto un Autonomo per Bash senza l'opt-in).
 
 **Cosa si approva: il commit, non la cartella.** L'approvazione è lo SHA-256 di `.claude/**`, `.mcp.json` e dei file
 del repository che i loro comandi eseguono (lo script di un hook, il `tools/mcp.js` di un server MCP) **com'erano
@@ -87,7 +92,7 @@ contano e non bloccano più i worktree. Un repository senza configurazione si pu
 quelli approvati il turno gira Isolato (o viene fermato) con una Notice che dice perché. Se è il worktree a essere
 cambiato, nomina i file diversi; se è il commit da cui l'attempt è partito a non avere la configurazione approvata
 (il branch target è andato avanti con una configurazione nuova dopo l'approvazione), chiede di riapprovare: finché
-non lo fai il progetto non risulta più Attendibile nelle Impostazioni e gli attempt nuovi girano Isolati. Un commit
+non lo fai il progetto non risulta più Attendibile nelle sue Impostazioni e gli attempt nuovi girano Isolati. Un commit
 che non tocca la configurazione non cambia nulla.
 
 **Mai fatturazione via API.** Una configurazione committata che farebbe fatturare gli agenti via API o da un altro
@@ -127,6 +132,71 @@ difesa in profondità: `sh -c 'git push'` le aggira. Il worktree separa il lavor
 principale, non protegge il Mac: per questo il default è Auto-edit, Autonomo è un opt-in per progetto e la
 configurazione del repo è Isolata finché non la approvi.
 
+## La pagina del progetto
+
+**Sidebar.** Un clic sul nome apre il progetto sul Riepilogo. Il bottone "⋯" accanto al nome (compare al passaggio del
+mouse o col focus) e il clic destro sul nome aprono lo stesso menu: **Impostazioni progetto** e **Rimuovi dalla
+lista…**. La rimozione chiede conferma: i file del repository e i branch `atm/…` restano; i worktree dell'app vengono
+salvati con un commit sul loro branch e rimossi; task, cronologia (anche i log grezzi) e allegati vengono eliminati
+dall'app. Con un agente in esecuzione nel progetto la rimozione è rifiutata ("Ferma gli agenti del progetto prima di
+rimuoverlo") e il dialog resta aperto. Il bottone in fondo alla sidebar apre **Impostazioni app**: solo le
+impostazioni generali (percorso di claude, agenti in parallelo, modello predefinito, chiave API, worktree, editor).
+
+**Riepilogo** (la pagina su cui si atterra):
+- **Descrizione** del progetto (si scrive nel tab Impostazioni, al massimo 10 000 caratteri) e **Stato**: task per
+  colonna, agenti attivi, branch target e commit, modello predefinito, configurazione Isolata o Attendibile.
+- **Istruzioni agenti** (`CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`), **Server MCP** (`.mcp.json`), **`.claude/`**
+  (impostazioni, agenti, comandi, skill) e **README**, ciascuno con una nota su come arriva agli agenti: per esempio
+  `CLAUDE.md` è "caricato all'avvio" solo in Attendibile, altrimenti "letto dall'agente su istruzione del prompt";
+  `AGENTS.md` è sempre letto su istruzione del prompt, il README è "solo contesto per te".
+- Tutto viene letto dall'**ultimo commit del branch target predefinito** (da lì partono i worktree ed è quello che
+  Attendibile approva), mai dai file del checkout principale: una modifica non committata non compare. Un repository
+  che è la tua home non si legge.
+- **Segreti mascherati:** in `.claude/settings.json`, a ogni profondità, i valori di `env` e `headers` e degli helper
+  di credenziali (ogni chiave che finisce in `Helper`, più `awsAuthRefresh` e `awsCredentialExport`) diventano `•••`,
+  e da ogni valore di una chiave `url` si tolgono userinfo, query e fragment; dei server MCP si vedono nome, trasporto,
+  comando o URL (senza userinfo, query e fragment) e solo i **nomi** delle variabili e degli header, e il testo di
+  `.mcp.json` non compare mai. Un JSON non valido non si mostra. Il mascheramento è euristico: un segreto scritto dentro
+  un comando, i suoi argomenti, il path di un URL o un URL sotto una chiave diversa da `url` (o dentro un altro testo)
+  si vede.
+- Testo semplice, senza markdown; i caratteri invisibili o bidirezionali (quelli che possono nascondere istruzioni)
+  compaiono come `⟨U+202E⟩` con un badge. I file oltre 64 KiB, i binari e i symlink (mostrati come "→ target", mai
+  seguiti) non si leggono. I server aggiunti con `claude mcp add` stanno in `~/.claude.json`, che l'app non legge mai:
+  qui non compaiono.
+- "Aggiorna" rilegge (non c'è cache); **Apri task (N)** passa al tab Task.
+
+**Task: Kanban o Lista.** La toolbar del tab Task passa dalla kanban (trascinamento, creazione rapida in fondo alle
+colonne) a una **lista**: una tabella con Titolo, Stato, Agente (gli stessi badge delle card), Branch e Aggiornato, in
+ordine di colonna e posizione; il titolo apre il task, la matita lo modifica, "Nuovo task" lo crea in Da fare. Con il
+pannello aperto Branch e Aggiornato si nascondono. Niente ricerca, filtri né ordinamento, e la scelta non viene
+ricordata (a ogni visita si riparte dalla kanban).
+
+**Allegati.** Nel dialog del task, "Aggiungi file…" apre il selettore nativo del Mac: file qualsiasi (immagini
+comprese), al massimo 20 per task e 25 MB l'uno. L'app ne fa una **copia** in
+`~/Library/Application Support/dev.aitaskmanager.desktop/attachments/<progetto>/<task>/…`, fuori dal repository e mai
+committata; gli originali non vengono toccati. In creazione i file restano in attesa e si aggiungono subito dopo il
+task (se l'aggiunta fallisce il task resta, con l'avviso "Task creato, allegati non aggiunti"); in modifica si
+aggiungono e si tolgono subito. Il primo prompt (e quello di una "Nuova sessione") elenca i path delle copie in una
+sezione `## Attachments` e chiede di trattarle in sola lettura, e a ogni turno l'agente riceve la cartella del task con
+`--add-dir`: le immagini le legge con il suo tool Read. Un file aggiunto a tentativo avviato va citato nel messaggio
+successivo. Il pannello del task mostra gli allegati come chip (col path nel tooltip). Per sicurezza la webview non
+passa mai un percorso: il selettore consegna i file al backend, che dà alla pagina solo gettoni monouso validi 10
+minuti, e rifiuta i file dentro `~/.claude*`, `$CLAUDE_CONFIG_DIR`, `~/.ssh`, `~/.aws`, il Portachiavi e le cartelle
+dell'app, i link che portano lì e tutto ciò che non è un file normale; alla copia ricontrolla che il file sia ancora
+quello scelto (sostituito o spostato nel frattempo, va scelto di nuovo). "Sola lettura" è solo un'istruzione: l'agente
+con Bash può modificare o cancellare le copie. Niente trascinamento di file nella finestra.
+
+**Sub-agent** (dialog Avvia). **Sub-agent (max)**: "Predefinito del CLI" (nessun limite, l'argv resta quello di sempre),
+"Nessun sub-agent" (0) o da 1 a 10, per tutto il tentativo. Con un limite l'app vieta il tool `Workflow` (che avvia
+agenti senza passare da Agent) e fa arrivare a sé ogni avvio di un sub-agent: lo concede e lo conta finché resta
+spazio, poi risponde al modello "Sub-agent limit for this task reached (N). Complete the work directly without
+starting sub-agents."; a limite esaurito (o con 0) anche `Agent` e `Task` sono vietati. Queste richieste non compaiono
+mai come approvazioni da dare. **Modello dei sub-agent**: "Predefinito del CLI" o un alias (`opus`, `sonnet`, `haiku`,
+`fable`), passato come `CLAUDE_CODE_SUBAGENT_MODEL`; vale solo per i sub-agent che non chiedono un modello proprio
+(Explore, o una chiamata con un modello esplicito, possono usarne un altro). Il pannello del task riassume: "Modello:
+opus · Sub-agent: sonnet, max 3 (usati 1)". Il modello del tentativo "Predefinito (x)" è quello del progetto, poi
+quello delle Impostazioni app, altrimenti quello del CLI.
+
 ## Installazione
 
 Servono macOS su Apple Silicon, Claude Code installato (`claude`, per esempio in `~/.local/bin`) con un login
@@ -148,7 +218,8 @@ scripts/release.sh     # cargo tauri build + controlli; stampa i percorsi di .ap
   fino a macOS 14 clic destro (o Ctrl-clic) sull'app → Apri → Apri; da macOS 15 il clic destro non basta più: dopo il
   primo tentativo, Impostazioni di Sistema → Privacy e sicurezza → «Apri comunque». In alternativa, per un'app di cui
   ti fidi: `xattr -dr com.apple.quarantine "/Applications/AI Task Manager.app"`.
-- **Dati**: DB e log in `~/Library/Application Support/dev.aitaskmanager.desktop` (`atm.sqlite3`, `logs/`), cache
+- **Dati**: DB, log e copie degli allegati in `~/Library/Application Support/dev.aitaskmanager.desktop` (`atm.sqlite3`,
+  `logs/`, `attachments/`; log e allegati di un task se ne vanno con il task o con il progetto), cache
   (script di login) in `~/Library/Caches/dev.aitaskmanager.desktop`, worktree in `~/.ai-task-manager/worktrees`
   (configurabile). Niente sta dentro il bundle: reinstallare (un .app nuovo copiato sopra il vecchio) li lascia
   intatti. Per disinstallare si tolgono l'app e queste tre cartelle (i branch `atm/…` restano nei repository).
@@ -184,9 +255,12 @@ scripts/check.sh         # fmt, clippy host + wasm32 (release, --features testki
 (cd ui && trunk serve --features mock)   # solo UI nel browser (porta 1420), backend finto in ui/src/ipc/mock
 ```
 
-Nel mock, `http://localhost:1420/?task=<id>` apre subito il pannello di quel task. Con la baseline di M1 in
+Nel mock, `http://localhost:1420/?task=<id>` apre subito il pannello di quel task (nel tab Task). Con la baseline di M1 in
 `ui/src/ipc/mock/board.rs` (loggato, un progetto, un task per colonna) gli id sono `task-todo`, `task-inprogress`,
-`task-inreview` e `task-done`. Le task di Zed (`.zed/tasks.json`) lanciano l'app, l'app con fake-claude e il mock.
+`task-inreview` (che ha già due allegati) e `task-done`. Il progetto `demo` ha un Riepilogo completo (CLAUDE.md,
+AGENTS.md con un carattere bidi, README troppo grande, impostazioni e server MCP mascherati), `?overview_error` lo fa
+fallire; "Aggiungi file…" risponde a turno con un file, due file, nessuno (selettore annullato) e un file troppo grande.
+Le task di Zed (`.zed/tasks.json`) lanciano l'app, l'app con fake-claude e il mock.
 
 ## Avvio dell'app in sviluppo
 
@@ -213,9 +287,10 @@ ATM_CLAUDE_PATH=$PWD/target/debug/fake-claude cargo tauri dev
 ```
 
 Nel prompt `[fake:NOME]` sceglie lo scenario (`simple`, `append`, `approval`, `slow`, `hang`, `hang_ignore`, `crash`,
-`noinit`, `big`, `flood`, `control`, `usage_limit`, `auth_fail`, `resolve_merge`, `resume_fail`, `background`; `append`
-aggiunge a `hello.txt` la prima riga del messaggio, così due task sullo stesso file vanno in conflitto; `background`
-lascia un `sleep 300` in un process group suo, che l'app chiude a fine turno); il follow-up di "Risolvi
+`noinit`, `big`, `flood`, `control`, `usage_limit`, `auth_fail`, `resolve_merge`, `resume_fail`, `background`,
+`subagents`; `append` aggiunge a `hello.txt` la prima riga del messaggio, così due task sullo stesso file vanno in
+conflitto; `background` lascia un `sleep 300` in un process group suo, che l'app chiude a fine turno; `subagents` avvia
+`FAKE_CLAUDE_SUBAGENTS` sub-agent, default 3, e registra per ciascuno se l'app l'ha concesso o negato); il follow-up di "Risolvi
 con l'agente" gioca da solo `resolve_merge`, sul target che il prompt dell'app nomina. Variabili:
 `FAKE_CLAUDE_AUTH=in|out` (stato di `auth status`), `FAKE_CLAUDE_AUTH_FILE` (file con `in`/`out` che la vince sulla
 variabile e che `auth_fail` porta a `out` con una scrittura atomica, come il CLI vero dopo un login scaduto),
@@ -223,8 +298,8 @@ variabile e che `auth_fail` porta a `out` con una scrittura atomica, come il CLI
 `FAKE_CLAUDE_TARGET` (branch di `resolve_merge`, altrimenti quello del prompt), `FAKE_CLAUDE_DELTA_MS` (pausa tra i
 delta di un testo in streaming, default 0), `FAKE_CLAUDE_FLOOD_EVENTS` (testi di `flood`, default 10000),
 `FAKE_CLAUDE_FLOOD_PAUSE_MS` (pausa ogni 100 testi di `flood`, default 0), `FAKE_CLAUDE_RECORD` (una riga JSON per
-chiamata: argv, cwd, pid, variabili presenti; poi una per ogni messaggio utente con lo scenario giocato, e le risposte
-dell'host). Con `FAKE_CLAUDE_PROJECT_CONFIG=1` fake-claude esegue la configurazione del repo come il CLI reale (hook
+chiamata: argv, cwd, pid, variabili presenti; poi una per ogni messaggio utente con lo scenario giocato e il testo
+intero del messaggio, e le risposte dell'host, comprese quelle agli avvii di sub-agent). Con `FAKE_CLAUDE_PROJECT_CONFIG=1` fake-claude esegue la configurazione del repo come il CLI reale (hook
 `SessionStart`, `apiKeyHelper`, server di `.mcp.json`) salvo `--setting-sources=user` o `--strict-mcp-config`. Lo usa
 il test di accettazione M6 `tests/flow.rs::malicious_repo_config_runs_only_when_trusted_and_unchanged`. Il suo
 `system/init` dice `apiKeySource: "ANTHROPIC_API_KEY"` quando quella variabile gli arriva, `"apiKeyHelper"` dopo un
@@ -293,10 +368,13 @@ Con `ATM_E2E=1` la UI guida il DOM reale del WKWebView (click, `input`/`change`,
 `target/debug/bundle/macos/AI Task Manager.app` (con `--config src-tauri/tauri.testkit.conf.json`), ne installa una
 copia nella cartella temporanea del giro (`Applications/`, come in `/Applications`) e lancia quella, con una copia di
 fake-claude tutta sua (`bin/fake-claude`), così `pgrep -f` vede solo gli agenti del giro. Tutto sta nella cartella
-temporanea (`ATM_E2E_DIR`): DB, cache, `HOME` (quindi i worktree), i repository di prova creati dal backend (uno con un
-commit, una cartella non git, un repo bare, uno vuoto, uno con `.mcp.json`), il record e lo stato di login di
-fake-claude. Il selettore nativo di cartelle non è automatizzabile: il backend restituisce il percorso messo in coda
-dalla prova (`debug_e2e_queue_pick`), mentre il click su "Aggiungi repository", i toast e la sidebar sono quelli veri.
+temporanea (`ATM_E2E_DIR`): DB, cache, `HOME` (quindi i worktree), i repository di prova creati dal backend (`main`
+con un commit, una cartella non git, un repo bare, uno vuoto, `mcp` con un CLAUDE.md e un server in `.mcp.json`
+committati, `da-rimuovere` per allegati, sub-agent e rimozione), il file da allegare `attach/specifiche-e2e.txt`, il
+record e lo stato di login di fake-claude. I selettori nativi di cartelle e di file non sono automatizzabili: il
+backend restituisce il percorso messo in coda dalla prova (`debug_e2e_queue_pick`, un posto solo: lo prende il primo
+selettore che si apre), mentre i click su "Aggiungi repository" e "Aggiungi file…", i toast e la sidebar sono quelli
+veri.
 Allo stesso modo le conferme native ricevono la risposta che il giro mette in coda con `debug_e2e_queue_confirm`, e il
 giro legge i testi chiesti con `debug_e2e_confirms` (solo build di debug con `ATM_E2E=1`). "Accedi" scrive davvero
 `claude-login.command`, ma nel giro normale l'`open -a Terminal` viene solo registrato (`CoreConfig::open_log`,
@@ -336,7 +414,7 @@ ignorato nelle build di release) e la prova esegue lo script con `/bin/sh`: il T
   il banner nella topbar e disattivarlo non chiede nulla. Infine un altro turno `[fake:hang_ignore]` e l'uscita del
   report con `app.exit` (l'altro ramo: `ExitRequested` → `Core::shutdown`); lo script ricontrolla ramo di uscita,
   processi e DB.
-- **Fase 3 (prestazioni, M6):** di nuovo sugli stessi dati, Agenti in parallelo = 3 dalle Impostazioni e tre task
+- **Fase 3 (prestazioni, M6):** di nuovo sugli stessi dati, Agenti in parallelo = 3 dalle Impostazioni app e tre task
   `[fake:flood]` avviati dalla UI (10 000 testi dell'assistente per turno, una pausa di 100 ms ogni 100: i tre turni
   corrono insieme per una decina di secondi), l'ultimo aperto nel pannello. Mentre scorrono, un timer da 20 ms non
   deve mai arrivare più di 1 s in ritardo (il main thread della pagina resta libero), passare a Modifiche e tornare ad
@@ -351,6 +429,21 @@ ignorato nelle build di release) e la prova esegue lo script con `/bin/sh`: il T
   (`src-tauri/tauri.testkit.conf.json`, che ripete la finestra di `tauri.conf.json`: `scripts/check.sh` controlla che
   non divergano), così una pagina nascosta non viene sospesa e il giro non si blocca.
 
+**Pagina del progetto, allegati, lista e sub-agent** (round feature del 2026-09-29, spec §12.2 punto 15). Selezionare
+un progetto porta sul Riepilogo, quindi il giro passa esplicitamente al tab Task prima di usare la kanban, e apre le
+impostazioni generali dal dialog Impostazioni app e quelle del progetto dal suo tab. Al passo 3 (fase 1) si aggiunge
+prima `mcp`, il cui repository committa un `CLAUDE.md` e il server `e2e-tools` in `.mcp.json` con una variabile `TOKEN`:
+il suo Riepilogo deve mostrare il file e il nome `TOKEN`, mai il suo valore (né nella pagina né nella risposta di
+`get_project_overview`), la pagina deve essere un `tabpanel` dentro il `main` e i blocchi dei file devono dire se sono
+aperti (`aria-expanded`, testo chiuso `inert`). Nella fase 2, dopo le conferme di sicurezza: `task_list_view`, il
+passaggio alla Lista su `main` (righe nell'ordine della kanban) e il ritorno alla kanban; `attachment_to_the_agent`,
+sul progetto `da-rimuovere`, un allegato scelto con il selettore in coda che arriva all'agente (fake-claude registra
+la sezione `## Attachments` del prompt e `--add-dir=` nell'argv) in un tentativo con "Nessun sub-agent", che dà
+`--disallowedTools` con `Agent`, `Task` e `Workflow`; `subagent_limit`, sullo stesso progetto con max 2 e modello
+haiku, dove tre avvii di sub-agent ricevono allow, allow, deny e DB e pannello dicono «usati 2»; `project_removal`, il
+menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic fuori, e la sua rimozione dalla lista,
+mentre `main` resta selezionato.
+
 L'app gira con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, `GIT_DIR`, le variabili di cmux e il suo
 `NODE_OPTIONS=--require=…` con `CMUX_ORIGINAL_NODE_OPTIONS_PRESENT=0` impostati (valori finti):
@@ -363,11 +456,14 @@ ricontrollati con `ps`, più qualunque processo della macchina, registrato o no,
 alla fine lo script conta qualunque programma, più `pgrep -f` della copia di fake-claude del giro (e riporta, senza
 farli contare, gli altri fake-claude della macchina). Processi fake-claude di altri test o di un'altra istanza non
 contano e non vengono mai uccisi; con Ctrl-C lo script chiude app e processi del giro. Il backend conta i comandi IPC
-falliti: sono ammessi solo i tre `add_project` rifiutati del passo 3 e il `set_project_security` annullato della fase
-2 (per esempio nessun `get_diff` su un tentativo appena mergiato).
+falliti e il giro li confronta, nell'ordine, con quelli che provoca: nella fase 1 i tre `add_project` rifiutati del
+passo 3; nella fase 2, tutti dopo i merge del passo 10 (che non devono farne fallire nessuno, per esempio nessun
+`get_diff` su un tentativo appena mergiato), il `set_project_security` annullato (Attendibile + Annulla) e poi il
+`get_task_detail` (NotFound) sul task del progetto `da-rimuovere` appena rimosso; nella fase 3 nessuno.
 
 I report JSON delle fasi 2 e 3 (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
-`security_confirmations`, `command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
+`security_confirmations`, `task_list_view`, `attachment_to_the_agent`, `subagent_limit`, `project_removal`,
+`command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
 `perf_flood`, `csp_violations` sommate su tutti i caricamenti di pagina, `details` con cosa è stato verificato, con le
 misure della fase 3, o perché è fallito) sono l'unica cosa su stdout (i log di build vanno su stderr); lo script esce
 con 0 solo se tutto è vero, `csp_violations` è 0 e i controlli su processi e DB passano. Se fallisce, la cartella
@@ -378,7 +474,7 @@ altrimenti si ferma subito. `debug_e2e_git` accetta solo i controlli di sola let
 `branch --list`, `worktree list`, nessuna opzione prima del sottocomando) e i comandi sui file rifiutano i symlink
 pendenti. `ATM_E2E=1` è ignorato insieme a `ATM_SELFTEST=1`.
 
-Restano fuori dall'automazione: il selettore nativo di cartelle (sopra), il drag nativo col mouse (il DnD usa
+Restano fuori dall'automazione: i selettori nativi di cartelle e di file (sopra), il drag nativo col mouse (il DnD usa
 `DragEvent` sintetici con `DataTransfer` sul DOM vero: una sessione di drag nativa segue il cursore reale e
 spostarlo disturberebbe chi usa il Mac; `effectAllowed` non si può verificare perché WebKit lo ignora su un
 `DataTransfer` costruito), il Cmd+R (non esiste) e, nel giro normale, l'apertura del Terminale (coperta da
@@ -424,6 +520,15 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   `CLAUDE.md`); qualunque altra richiesta riceve "Nega e ferma" e fa fallire il run.
 - **Quota.** `sonnet`, effort `low`, prompt minimi, nessun retry: 8 turni reali (probe 1, checklist 5, push 1,
   isolamento 1), circa 0,15–0,25 USD l'uno nella stima del CLI.
+- **Sub-agent e allegati (round feature del 2026-09-29), non ancora eseguiti.** Quattro test verificano ciò che il
+  round ha preso dalla documentazione e dal bundle del CLI: la regola `ask` su `Agent` arriva all'app in Supervisionato,
+  Auto-edit e Autonomo (3 turni); il rifiuto oltre il limite viene rispettato (2); `CLAUDE_CODE_SUBAGENT_MODEL` vale per
+  un sub-agent senza modello proprio (1); `--add-dir` con uno spazio nel percorso (`Application Support`) è leggibile
+  (1). Sono 7 turni reali: si lanciano a parte, quando vuoi.
+
+  ```bash
+  ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-threads=1 subagent add_dir
+  ```
 - **Repo.** Ogni test lavora in una cartella temporanea, cancellata alla fine: un clone locale del repo giocattolo
   (`ATM_REAL_CLAUDE_REPO`, default `~/Desktop/Repositories/test-rust`, mai modificato: anche i suoi `git status`
   girano con `--no-optional-locks`, che non riscrive l'indice; l'`origin` del clone diventa un repo bare usa e getta)
@@ -453,9 +558,21 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
 - Il modello può rifiutare un follow-up che ritiene estraneo a un task già finito (M5); il prompt dell'app lo mitiga
   per gli attempt nuovi.
 - Solo macOS su Apple Silicon; app non firmata né notarizzata (Gatekeeper sopra); nessun aggiornamento automatico.
-- Niente push, fetch, PR, plan mode, immagini nei prompt, rewind (spec §13.2).
-- L'E2E non automatizza il selettore di cartelle nativo né il drag nativo col mouse; i tempi della sua fase 3 si
-  misurano solo con lo schermo sbloccato e la finestra visibile (altrimenti il report li dà come non misurati).
+- Niente push, fetch, PR, plan mode, rewind (spec §13.2). Le immagini si passano solo come allegati (niente incolla nel
+  composer né trascinamento di file).
+- Il modello dei sub-agent scelto nel dialog Avvia è la fonte con la priorità più bassa per Claude Code: il modello
+  che una chiamata Agent chiede, o quello della definizione dell'agente (Explore), vince. Il limite conta i sub-agent
+  concessi, non quelli finiti, e non copre modi di avviarli diversi da `Agent`, `Task` e `Workflow`. Il suo
+  funzionamento con il CLI reale (regola `ask` in ogni modalità) e `--add-dir` con uno spazio non sono ancora stati
+  verificati (sopra).
+- Gli allegati sono copie che l'agente può modificare o cancellare con Bash; gli originali non vengono mai toccati. Un
+  gettone del selettore scade dopo 10 minuti: un dialog di creazione lasciato aperto più a lungo crea il task senza
+  allegati (con l'avviso).
+- Il Riepilogo non mostra i server MCP di `~/.claude.json` (`claude mcp add`), `.claude/settings.local.json` né i file
+  dietro un symlink; non ha cache (ogni visita rilegge il commit) e non rende il markdown.
+- La Lista non ha ricerca, filtri né ordinamento; pagina e vista non vengono ricordate.
+- L'E2E non automatizza i selettori nativi di cartelle e di file né il drag nativo col mouse; i tempi della sua fase 3
+  si misurano solo con lo schermo sbloccato e la finestra visibile (altrimenti il report li dà come non misurati).
 
 ## Fallback di wasm-opt
 
@@ -526,3 +643,7 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | Uscita con 2 agenti fake attivi (accettazione #2) | confermato dall'E2E: Cmd+Q con `[fake:hang]` e `[fake:hang_ignore]` in corso, poi `pgrep -f` di fake-claude vuoto | M6 |
 | Reinstallazione (accettazione #5) | confermato dall'E2E: copia nuova del bundle sopra quella installata (inode nuovo), la fase 2 la esegue sui dati della fase 1 e dopo ogni riga `processes` e ogni log della fase 1 sono ancora lì, invariati; e con il `.app` di release (dati di un giro `--perf`, `HOME` temporanea): stessi 3 task, 30 009 entry, 9 log e 3 worktree prima e dopo, board uguale | M6 |
 | Prestazioni con `flood` e 3 agenti | confermato dall'E2E (fase 3, schermo sbloccato): 3 × 10 000 testi in ~11 s con 10 s di sovrapposizione, timer da 20 ms mai più di 27–29 ms in ritardo, cambio tab visibile al primo controllo (51–54 ms, il polling è ogni 50 ms), al massimo 300 righe nel DOM | M6 |
+| Limite di sub-agent (round feature del 2026-09-29) | confermato con fake-claude (`[fake:subagents]`): con max 2 e 3 avvii, due concessi e contati (`subagents_used` salvato), il terzo negato con il testo per il modello, nessuna approvazione pendente (`tests/flow.rs::subagent_limit_allows_up_to_the_max_then_denies`); con 0 `Agent`, `Task` e `Workflow` vietati dal primo turno (`a_zero_limit_disallows_subagents_from_the_first_turn`); senza limite uno spawn è un'approvazione normale (`without_a_limit_a_subagent_spawn_is_an_ordinary_approval`); limite e modello controllati prima di creare il worktree (`subagent_options_are_checked_before_the_worktree`); argv senza opzioni identico (snapshot `claude__*`) | round 2026-09-29 |
+| Allegati (round feature del 2026-09-29) | confermato con fake-claude: sezione `## Attachments` nel primo prompt e `--add-dir` a ogni turno, file e log cancellati con il task e con il progetto (`tests/flow.rs::attachments_reach_the_agent_and_go_with_the_task`, `removing_the_project_removes_its_attachments_and_logs`); percorsi rifiutati, gettoni monouso e scaduti, limite di 20 senza copie orfane (`picks_outside_the_rules_are_refused`, `tokens_are_single_use_and_the_copy_checks_again`, `the_attachment_limit_removes_the_copies_it_refuses`, `staged_picks_expire_and_the_oldest_go_first`) | round 2026-09-29 |
+| Riepilogo del progetto (round feature del 2026-09-29) | confermato: file nell'ordine atteso dal tip del branch target, mai dal checkout né dalla home, segreti mascherati (nessun "secret" nel riepilogo serializzato), note per file grandi, binari, link e JSON non valido (`tests/git.rs::overview_shows_the_committed_context_in_order`, `overview_notes_what_it_does_not_show`, `overview_masks_every_secret`, `core_overview_reads_the_target_tip_and_never_home`) | round 2026-09-29 |
+| Regola `ask` su `Agent` con il CLI reale in ogni modalità, deny del limite, `CLAUDE_CODE_SUBAGENT_MODEL`, `--add-dir` con spazi | **da verificare**: test `#[ignore]` in `tests/real_cli.rs` scritti, non ancora eseguiti (sopra) | round 2026-09-29 |

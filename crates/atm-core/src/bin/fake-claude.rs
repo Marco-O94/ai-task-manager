@@ -9,7 +9,9 @@
 //!   `$FAKE_CLAUDE_RECORD`: `{"kind":"call","argv":[…without argv0],"cwd":…,"pwd":…,
 //!   "pid":…,"env":{"<VAR>":present,…}}`, then `{"kind":"control_response","response":…}` for
 //!   every answer the host gives to a request of the fake (`can_use_tool`, `hook_callback`),
-//!   `{"kind":"turn","pid":…,"scenario":…}` for every user message it plays, and
+//!   `{"kind":"turn","pid":…,"scenario":…,"prompt":…}` for every user message it plays (its
+//!   whole text), `{"kind":"subagent","n":…,"behavior":…,"message":…}` for every answer to a
+//!   sub-agent spawn of `subagents`, and
 //!   `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`, `{"kind":"background",
 //!   "pid":…}` for the `sleep` of `background`.
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
@@ -31,7 +33,10 @@
 //! append (like simple, but appends the message's first line, without the tag and the leading
 //! `#`, to `hello.txt`: two tasks appending to the same file conflict), background (leaves a
 //! `sleep 300` running in a process group of its own, like a `run_in_background` command of the
-//! real Bash tool, then succeeds and exits at EOF as usual).
+//! real Bash tool, then succeeds and exits at EOF as usual), subagents (spawns
+//! `FAKE_CLAUDE_SUBAGENTS` sub-agents one after the other, default 3: for each an `Agent`
+//! `tool_use` and its `can_use_tool`, as the real CLI asks under an `ask` rule; an allowed one
+//! returns a result, a denied one the host's message; then succeeds).
 //! Counts: `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
 //! `FAKE_CLAUDE_FLOOD_PAUSE_MS` (default 0): pause after every 100 texts of `flood`, so that
 //! several floods started one after the other overlap (the E2E's perf phase, M6).
@@ -339,6 +344,7 @@ impl Session {
                         "kind": "turn",
                         "pid": std::process::id(),
                         "scenario": scenario,
+                        "prompt": self.prompt,
                     }));
                     self.rate_limit_sent = false;
                     match self.play(&scenario) {
@@ -501,6 +507,7 @@ impl Session {
                 self.result("success", true, Some("Not logged in · Please run /login"));
             }
             "resolve_merge" => self.resolve_merge(),
+            "subagents" => self.subagents()?,
             other => self.result(
                 "error_during_execution",
                 true,
@@ -550,34 +557,23 @@ impl Session {
     fn approval(&mut self) -> Step {
         let input = json!({"command": "echo hello", "description": "Print hello"});
         let tool_use_id = self.tool_use("Bash", input.clone());
-        let request_id = self.next_id("fake_req");
-        self.send(
-            json!({"type": "control_request", "request_id": request_id, "request": {
-                "subtype": "can_use_tool",
-                "tool_name": "Bash",
-                "display_name": "Bash",
-                "input": input,
-                "description": "echo hello",
-                "permission_suggestions": [
-                    {"type": "addRules",
-                     "rules": [{"toolName": "Bash", "ruleContent": "echo hello"}],
-                     "behavior": "allow", "destination": "localSettings"},
-                    {"type": "addDirectories", "directories": [self.cwd],
-                     "destination": "session"},
-                    {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
-                ],
-                "decision_reason": "This command requires approval",
-                "decision_reason_type": "other",
-                "tool_use_id": tool_use_id,
-            }}),
-        );
-        let response = match self.await_response(&request_id) {
-            Err(Stop::Interrupted(id)) => {
-                self.send(json!({"type": "control_cancel_request", "request_id": request_id}));
-                return Err(Stop::Interrupted(id));
-            }
-            other => other?,
-        };
+        let response = self.can_use_tool(json!({
+            "tool_name": "Bash",
+            "display_name": "Bash",
+            "input": input,
+            "description": "echo hello",
+            "permission_suggestions": [
+                {"type": "addRules",
+                 "rules": [{"toolName": "Bash", "ruleContent": "echo hello"}],
+                 "behavior": "allow", "destination": "localSettings"},
+                {"type": "addDirectories", "directories": [self.cwd],
+                 "destination": "session"},
+                {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+            ],
+            "decision_reason": "This command requires approval",
+            "decision_reason_type": "other",
+            "tool_use_id": tool_use_id,
+        }))?;
         let decision = &response["response"];
         if response["subtype"] == "success" && decision["behavior"] == "allow" {
             self.tool_result(&tool_use_id, "hello\n", false);
@@ -591,6 +587,65 @@ impl Session {
         }
         self.simple();
         Ok(())
+    }
+
+    /// `FAKE_CLAUDE_SUBAGENTS` sub-agent spawns (default 3), one after the other, each asking
+    /// the host like the real CLI under an `ask` rule on `Agent`; every answer is recorded
+    /// (`kind: "subagent"`).
+    fn subagents(&mut self) -> Step {
+        let n = count_env("FAKE_CLAUDE_SUBAGENTS", 3);
+        let mut allowed = 0;
+        for i in 1..=n {
+            let input = json!({"description": format!("Sub-agent {i}"),
+                               "prompt": "Summarize README.md", "subagent_type": "general-purpose"});
+            let tool_use_id = self.tool_use("Agent", input.clone());
+            let response = self.can_use_tool(json!({
+                "tool_name": "Agent",
+                "display_name": "Agent",
+                "input": input,
+                "description": format!("Sub-agent {i}"),
+                "permission_suggestions": [],
+                "decision_reason": "Permission rule 'Agent' requires confirmation",
+                "decision_reason_type": "rule",
+                "tool_use_id": tool_use_id,
+            }))?;
+            let decision = &response["response"];
+            let behavior = decision["behavior"].as_str().unwrap_or("error");
+            self.record(json!({"kind": "subagent", "n": i, "behavior": behavior,
+                               "message": decision["message"]}));
+            if behavior == "allow" {
+                allowed += 1;
+                self.tool_result(
+                    &tool_use_id,
+                    &format!("Sub-agent {i}: README riassunto."),
+                    false,
+                );
+            } else {
+                let message = decision["message"].as_str().unwrap_or("denied");
+                self.tool_result(&tool_use_id, message, true);
+            }
+        }
+        self.result(
+            "success",
+            false,
+            Some(&format!("Sub-agent avviati: {allowed} su {n}.")),
+        );
+        Ok(())
+    }
+
+    /// Sends a `can_use_tool` with the fields of `request` and waits for the host's answer; an
+    /// interrupt meanwhile cancels the request first (`control_cancel_request`).
+    fn can_use_tool(&mut self, mut request: Value) -> Result<Value, Stop> {
+        request["subtype"] = "can_use_tool".into();
+        let request_id = self.next_id("fake_req");
+        self.send(json!({"type": "control_request", "request_id": request_id, "request": request}));
+        match self.await_response(&request_id) {
+            Err(Stop::Interrupted(id)) => {
+                self.send(json!({"type": "control_cancel_request", "request_id": request_id}));
+                Err(Stop::Interrupted(id))
+            }
+            other => other,
+        }
     }
 
     /// Ignores interrupts and EOF (SIGTERM is already ignored): only SIGKILL ends it.

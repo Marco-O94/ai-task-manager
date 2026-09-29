@@ -119,10 +119,27 @@ fn serve<C: Command>(
     Ok(serde_json::to_value(res)?)
 }
 
-/// For `attempt.rs`: the mock task with this id.
+/// For `attempt.rs` and `attachments.rs`: the mock task with this id.
 #[allow(dead_code)] // hook for attempt.rs
 pub fn task(id: &str) -> Option<Task> {
     with(|m| m.tasks.iter().find(|t| t.id == id).cloned())
+}
+
+/// For `overview.rs`: the mock project with this id.
+pub fn find_project(id: &str) -> Option<Project> {
+    with(|m| m.projects.iter().find(|p| p.id == id).cloned())
+}
+
+/// For `attempt.rs`: the model an attempt of this project gets when the request names none,
+/// as the core resolves it: the project's default, then the settings' default.
+pub fn default_model(project_id: &str) -> Option<String> {
+    with(|m| {
+        m.projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .and_then(|p| p.default_model.clone())
+            .or_else(|| m.settings.default_model.clone())
+    })
 }
 
 /// For `attempt.rs`: lifecycle transition of a task (start → inprogress, turn end →
@@ -254,6 +271,12 @@ fn update_project(req: UpdateProjectReq) -> Result<Project, AppError> {
     if name.is_empty() || name.chars().count() > 200 {
         return Err(AppError::invalid("Il nome va da 1 a 200 caratteri"));
     }
+    let description = req.description.trim().to_owned();
+    if description.chars().count() > MAX_PROJECT_DESCRIPTION {
+        return Err(AppError::invalid(format!(
+            "La descrizione può avere al massimo {MAX_PROJECT_DESCRIPTION} caratteri"
+        )));
+    }
     if !BRANCHES.contains(&req.default_target_branch.as_str()) {
         return Err(AppError::invalid(format!(
             "Il branch {} non esiste",
@@ -268,6 +291,7 @@ fn update_project(req: UpdateProjectReq) -> Result<Project, AppError> {
             ));
         }
         p.name = name;
+        p.description = description;
         p.default_target_branch = req.default_target_branch;
         p.default_permission_mode = req.default_permission_mode;
         p.default_model = req.default_model;
@@ -314,6 +338,7 @@ fn remove_project(req: IdReq) -> Result<(), AppError> {
     });
     for id in &removed {
         super::attempt::forget_task(id);
+        super::attachments::forget_task(id);
     }
     changed(None, None);
     Ok(())
@@ -405,6 +430,7 @@ fn delete_task(req: IdReq) -> Result<(), AppError> {
     }
     with(|m| m.tasks.retain(|t| t.id != req.id));
     super::attempt::forget_task(&req.id);
+    super::attachments::forget_task(&req.id);
     changed(Some(task.project_id), Some(req.id));
     Ok(())
 }
@@ -580,6 +606,7 @@ fn project(id: &str, name: &str, repo_path: &str) -> Project {
     Project {
         id: id.into(),
         name: name.into(),
+        description: String::new(),
         repo_path: repo_path.into(),
         default_target_branch: "main".into(),
         default_permission_mode: PermissionMode::AcceptEdits,
@@ -594,7 +621,8 @@ fn project(id: &str, name: &str, repo_path: &str) -> Project {
 }
 
 /// Two projects; the M1 ids (`task-todo`, `task-inprogress`, `task-inreview`, `task-done`)
-/// are kept for `attempt.rs` and `/?task=<id>`.
+/// are kept for `attempt.rs` and `/?task=<id>`. Tasks were created over the last days, the
+/// first listed the oldest, and updated some hours later.
 fn seed_board() -> (Vec<Project>, Vec<Task>) {
     use TaskStatus::*;
     let demo: &[(&str, &str, TaskStatus)] = &[
@@ -623,12 +651,19 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
         ("task-images", "Ottimizza le immagini", InReview),
     ];
     let projects = vec![
-        project(PROJECT_ID, "demo", "/Users/demo/demo"),
+        Project {
+            description: "Servizio di esempio del mock: API REST con parser e lista utenti.".into(),
+            ..project(PROJECT_ID, "demo", "/Users/demo/demo")
+        },
         project("project-web", "sito-web", "/Users/demo/Progetti/sito-web"),
     ];
+    const HOUR: Millis = 3_600_000;
+    let now = super::now_ms();
+    let total = (demo.len() + web.len()) as Millis;
     let mut tasks = Vec::new();
     for (project_id, rows) in [(PROJECT_ID, demo), ("project-web", web)] {
         for &(id, title, status) in rows {
+            let created_at = now - (total - tasks.len() as Millis) * 9 * HOUR;
             tasks.push(Task {
                 id: id.into(),
                 project_id: project_id.into(),
@@ -636,8 +671,8 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
                 description: "Task di esempio del mock.".into(),
                 status,
                 position: 0.0,
-                created_at: 0,
-                updated_at: 0,
+                created_at,
+                updated_at: created_at + (tasks.len() as Millis % 4 + 1) * HOUR,
             });
             move_to(&mut tasks, id, status, None);
         }

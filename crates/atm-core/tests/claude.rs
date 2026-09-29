@@ -48,6 +48,9 @@ fn turn_args() -> TurnArgs {
         allow_rules: Vec::new(),
         model: None,
         effort: None,
+        subagents_left: None,
+        subagent_model: None,
+        attachments_dir: None,
         append_prompt: claude::append_prompt(Path::new(WORKTREE), "atm/1-hello", "main"),
     }
 }
@@ -78,8 +81,17 @@ fn argv_snapshot(args: &TurnArgs) -> Vec<String> {
             "{forbidden} in {argv:?}"
         );
     }
-    let settings = format!("--settings={}", claude::settings_json(&args.allow_rules));
-    assert!(argv.contains(&settings));
+    let settings: Vec<Value> = argv
+        .iter()
+        .filter_map(|a| a.strip_prefix("--settings="))
+        .map(|json| serde_json::from_str(json).unwrap())
+        .collect();
+    assert_eq!(settings.len(), 1, "{argv:?}");
+    assert_eq!(
+        settings[0]["permissions"]["deny"],
+        json!(claude::DENY_RULES)
+    );
+    assert_eq!(settings[0]["permissions"]["allow"], json!(args.allow_rules));
     let deny = serde_json::to_string(claude::DENY_RULES).unwrap();
     argv.into_iter()
         .map(|a| a.replace(&deny, "\"<DENY_RULES>\""))
@@ -150,15 +162,106 @@ fn argv_model_and_effort() {
     insta::assert_json_snapshot!(argv_snapshot(&args));
 }
 
+/// Spec F6: a sub-agent limit with none left disallows every way to spawn one (`Workflow`
+/// runs agents without an `Agent` call); `ask` and `env` stay out of `--settings`.
+#[test]
+fn argv_no_subagent_left() {
+    let args = TurnArgs {
+        subagents_left: Some(0),
+        ..turn_args()
+    };
+    let argv = argv_snapshot(&args);
+    assert!(argv.contains(&"--disallowedTools=AskUserQuestion,Agent,Task,Workflow".to_owned()));
+    insta::assert_json_snapshot!(argv);
+}
+
+/// Spec F6: with sub-agents left, every spawn is an `ask` rule (it reaches the host, which
+/// counts it, in every mode); `Workflow` stays disallowed. The sub-agents' model goes in the
+/// `env` of `--settings`, never in the child environment.
+#[test]
+fn argv_subagent_limit_and_model() {
+    let args = TurnArgs {
+        subagents_left: Some(3),
+        subagent_model: Some("haiku".into()),
+        ..turn_args()
+    };
+    let argv = argv_snapshot(&args);
+    assert!(argv.contains(&"--disallowedTools=AskUserQuestion,Workflow".to_owned()));
+    insta::assert_json_snapshot!(argv);
+}
+
+/// Spec F6: a sub-agent model without a limit changes only the `env` of `--settings`.
+#[test]
+fn argv_subagent_model_without_limit() {
+    let args = TurnArgs {
+        subagent_model: Some("sonnet".into()),
+        ..turn_args()
+    };
+    let (with, without) = (claude::build_argv(&args), claude::build_argv(&turn_args()));
+    assert_eq!(with.len(), without.len());
+    let differ: Vec<_> = with.iter().zip(&without).filter(|(a, b)| a != b).collect();
+    assert!(
+        differ.len() == 1 && differ[0].0.starts_with("--settings="),
+        "{differ:?}"
+    );
+    insta::assert_json_snapshot!(argv_snapshot(&args));
+}
+
+/// Spec F5: the task's attachments folder, one argv element even with spaces, before the
+/// appended system prompt; no deny rule for it.
+#[test]
+fn argv_attachments_dir() {
+    let args = TurnArgs {
+        attachments_dir: Some(PathBuf::from(
+            "/Users/me/Library/Application Support/dev.aitaskmanager.desktop/attachments/p/t",
+        )),
+        ..turn_args()
+    };
+    let argv = argv_snapshot(&args);
+    let n = argv.len();
+    assert_eq!(
+        argv[n - 2],
+        "--add-dir=/Users/me/Library/Application Support/dev.aitaskmanager.desktop/\
+         attachments/p/t"
+    );
+    assert!(argv[n - 1].starts_with("--append-system-prompt="));
+    insta::assert_json_snapshot!(argv);
+}
+
 #[test]
 fn settings_json_has_deny_rules_then_allow_rules() {
     let rules = vec!["Bash(npm test)".to_owned()];
-    let text = claude::settings_json(&rules);
+    let parts = claude::SettingsParts {
+        allow: &rules,
+        ..Default::default()
+    };
+    let text = claude::settings_json(&parts);
     assert!(text.starts_with(r#"{"permissions":{"deny":["#), "{text}");
     let v: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(v["permissions"]["deny"], json!(claude::DENY_RULES));
     assert_eq!(v["permissions"]["allow"], json!(rules));
-    assert!(claude::settings_json(&[]).ends_with(r#""allow":[]}}"#));
+    let plain = claude::settings_json(&claude::SettingsParts::default());
+    assert!(plain.ends_with(r#""allow":[]}}"#), "{plain}");
+}
+
+/// `ask` after `allow`, `env` after `permissions`, both only when not empty: the deny rules
+/// still lead (the snapshots fold them, and `check.sh` confines them to `DENY_RULES`).
+#[test]
+fn settings_json_with_ask_and_env() {
+    let rules = vec!["Bash(npm test)".to_owned()];
+    let parts = claude::SettingsParts {
+        allow: &rules,
+        ask: claude::SUBAGENT_TOOLS,
+        env: &[(claude::SUBAGENT_MODEL_ENV, "haiku")],
+    };
+    let text = claude::settings_json(&parts);
+    let deny = serde_json::to_string(claude::DENY_RULES).unwrap();
+    assert_eq!(
+        text,
+        format!(
+            r#"{{"permissions":{{"deny":{deny},"allow":["Bash(npm test)"],"ask":["Agent","Task"]}},"env":{{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku"}}}}"#
+        )
+    );
 }
 
 #[test]

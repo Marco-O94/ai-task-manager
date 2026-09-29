@@ -39,6 +39,7 @@ fn project() -> Project {
     Project {
         id: id(2),
         name: "demo".into(),
+        description: "Il sito\ndi prova".into(),
         repo_path: "/Users/me/demo".into(),
         default_target_branch: "main".into(),
         default_permission_mode: PermissionMode::AcceptEdits,
@@ -65,6 +66,9 @@ fn attempt() -> AttemptView {
         permission_mode: PermissionMode::Default,
         model: None,
         effort: Some(Effort::XHigh),
+        subagent_model: Some("haiku".into()),
+        max_subagents: Some(3),
+        subagents_used: 1,
         session_started: true,
         merge_commit: None,
         running: true,
@@ -89,6 +93,63 @@ fn process() -> ProcessInfo {
         head_after: Some("def456".into()),
         started_at: 10,
         finished_at: Some(20),
+    }
+}
+
+fn attachment() -> Attachment {
+    Attachment {
+        id: id(10),
+        task_id: id(1),
+        name: "schema db.png".into(),
+        size: 48_213,
+        path: format!(
+            "/Users/me/Library/Application Support/atm/attachments/{}/{}/{}/schema db.png",
+            id(2),
+            id(1),
+            id(10)
+        ),
+        created_at: 1_790_000_000_900,
+    }
+}
+
+fn project_overview() -> ProjectOverview {
+    ProjectOverview {
+        project_id: id(2),
+        branch: "main".into(),
+        commit: "0123456789abcdef0123456789abcdef01234567".into(),
+        agents_load_config: false,
+        files: vec![
+            ContextFile {
+                path: "CLAUDE.md".into(),
+                kind: ContextFileKind::Memory,
+                size: 12,
+                content: Some("# Regole\n⟨U+202E⟩".into()),
+                note: None,
+                hidden_chars: true,
+                used_by_agents: false,
+                usage_note: "letto dall'agente su istruzione del prompt".into(),
+            },
+            ContextFile {
+                path: "README.md".into(),
+                kind: ContextFileKind::Readme,
+                size: 81_920,
+                content: None,
+                note: Some("troppo grande (80 KiB)".into()),
+                hidden_chars: false,
+                used_by_agents: false,
+                usage_note: String::new(),
+            },
+        ],
+        mcp_servers: vec![McpServer {
+            name: "db".into(),
+            transport: "stdio".into(),
+            target: "node tools/mcp.js".into(),
+            env_keys: vec!["TOKEN".into()],
+            header_keys: Vec::new(),
+        }],
+        claude_agents: vec!["reviewer".into()],
+        claude_commands: Vec::new(),
+        claude_skills: vec!["release".into()],
     }
 }
 
@@ -356,6 +417,13 @@ const LINE_KINDS: [LineKind; 5] = [
 ];
 const MERGE_STRATEGIES: [MergeStrategy; 2] =
     [MergeStrategy::UpdateRef, MergeStrategy::FfCheckedOut];
+const CONTEXT_FILE_KINDS: [ContextFileKind; 5] = [
+    ContextFileKind::Memory,
+    ContextFileKind::Agents,
+    ContextFileKind::Readme,
+    ContextFileKind::Settings,
+    ContextFileKind::Mcp,
+];
 
 /// The serde string, `as_str`, `Display` and `FromStr` of a DB enum all agree.
 fn check_db_enum<T>(all: &[T])
@@ -407,6 +475,7 @@ fn enum_snapshots() {
     insta::assert_json_snapshot!("file_status", FILE_STATUSES);
     insta::assert_json_snapshot!("line_kind", LINE_KINDS);
     insta::assert_json_snapshot!("merge_strategy", MERGE_STRATEGIES);
+    insta::assert_json_snapshot!("context_file_kind", CONTEXT_FILE_KINDS);
 }
 
 #[test]
@@ -430,6 +499,7 @@ fn enums_round_trip() {
     round_trip_all(&FILE_STATUSES);
     round_trip_all(&LINE_KINDS);
     round_trip_all(&MERGE_STRATEGIES);
+    round_trip_all(&CONTEXT_FILE_KINDS);
     round_trip_all(&auth_states());
     round_trip_all(&entry_bodies());
     round_trip_all(&tool_statuses());
@@ -472,7 +542,15 @@ fn model_types_round_trip() {
             closed_at: Some(99),
             ..attempt()
         }],
+        attachments: vec![attachment()],
     });
+    round_trip(&attachment());
+    round_trip(&PickedFile {
+        token: id(11),
+        name: "log.txt".into(),
+        size: 0,
+    });
+    round_trip(&project_overview());
     round_trip(&BranchList {
         current: Some("main".into()),
         branches: vec!["main".into(), "dev".into()],
@@ -546,6 +624,7 @@ fn api_types_round_trip() {
         default_target_branch: "main".into(),
         default_permission_mode: PermissionMode::BypassPermissions,
         default_model: None,
+        description: "d".into(),
     });
     round_trip(&SetProjectSecurityReq {
         id: id(2),
@@ -574,6 +653,12 @@ fn api_types_round_trip() {
         permission_mode: PermissionMode::AcceptEdits,
         model: Some("sonnet".into()),
         effort: Some(Effort::Low),
+        subagent_model: None,
+        max_subagents: Some(0),
+    });
+    round_trip(&AddTaskAttachmentsReq {
+        task_id: id(1),
+        tokens: vec![id(11), id(12)],
     });
     round_trip(&SendFollowUpReq {
         attempt_id: id(3),
@@ -634,7 +719,7 @@ fn wire_shapes() {
 #[test]
 fn command_names_are_unique_snake_case() {
     let mut names = COMMAND_NAMES.to_vec();
-    assert_eq!(names.len(), 32);
+    assert_eq!(names.len(), 36);
     assert!(
         names
             .iter()
@@ -686,4 +771,24 @@ fn turn_end_stopped_is_optional() {
         "app_shutdown"
     );
     round_trip(&stopped);
+}
+
+/// `UpdateProjectReq.description` is optional on the wire (a client that predates it sends
+/// none): it reads back as empty.
+#[test]
+fn update_project_description_defaults_to_empty() {
+    let req: UpdateProjectReq = serde_json::from_value(serde_json::json!({
+        "id": "p", "name": "demo", "default_target_branch": "main",
+        "default_permission_mode": "acceptEdits", "default_model": null}))
+    .unwrap();
+    assert_eq!(req.description, "");
+}
+
+#[test]
+fn feature_limits() {
+    assert_eq!(MODEL_ALIASES, ["opus", "sonnet", "haiku", "fable"]);
+    assert_eq!(MAX_SUBAGENTS, 10);
+    assert_eq!(MAX_ATTACHMENTS_PER_TASK, 20);
+    assert_eq!(MAX_ATTACHMENT_BYTES, 25 * 1024 * 1024);
+    assert_eq!(MAX_PROJECT_DESCRIPTION, 10_000);
 }

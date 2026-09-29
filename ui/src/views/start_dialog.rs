@@ -1,9 +1,10 @@
-//! "Avvia" dialog (spec §9.2): target branch, model, effort, permission mode (Autonomo only
-//! with `allow_bypass`, with the bypass callout) → `start_attempt`. Owner: M2-UI-TASK.
+//! "Avvia" dialog (spec §9.2): target branch, model, effort, sub-agent limit and model (spec
+//! F6), permission mode (Autonomo only with `allow_bypass`, with the bypass callout) →
+//! `start_attempt`. Owner: M2-UI-TASK, sub-agents UI-TASKS.
 
 use atm_types::{
-    AppError, Effort, GetTaskDetail, Id, IdReq, ListBranches, PermissionMode, ProjectIdReq,
-    StartAttempt, StartAttemptReq,
+    AppError, Effort, Empty, GetSettings, GetTaskDetail, Id, IdReq, ListBranches, MAX_SUBAGENTS,
+    MODEL_ALIASES, PermissionMode, ProjectIdReq, StartAttempt, StartAttemptReq,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -22,13 +23,34 @@ use crate::ui::select_native::SelectNative;
 use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
 
-/// `--model` aliases (spec §0.1); "" = the CLI default.
-const MODELS: &[(&str, &str)] = &[
-    ("", "Predefinito"),
-    ("opus", "opus"),
-    ("sonnet", "sonnet"),
-    ("fable", "fable"),
-];
+/// Label of the `""` choice of the model select: the model `start_attempt` resolves without
+/// one (the project's default, then the app's, spec §7.4), else the CLI's own default.
+fn default_model_label(project: Option<&str>, app: Option<&str>) -> String {
+    let resolved = [project, app]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|m| !m.is_empty());
+    format!("Predefinito ({})", resolved.unwrap_or("CLI"))
+}
+
+/// `max_subagents` choices `(value, label)`: `""` = no limit, then 0..=[`MAX_SUBAGENTS`].
+fn subagent_limits() -> impl Iterator<Item = (String, String)> {
+    let named = [("", "Predefinito del CLI"), ("0", "Nessun sub-agent")];
+    named
+        .into_iter()
+        .map(|(v, l)| (v.to_owned(), l.to_owned()))
+        .chain((1..=MAX_SUBAGENTS).map(|n| (n.to_string(), n.to_string())))
+}
+
+/// `(max_subagents, subagent_model)` of the request from the two selects: `""` is `None`, and
+/// with no sub-agents allowed their model is `None` too.
+fn subagent_fields(max: &str, model: &str) -> (Option<u8>, Option<String>) {
+    let max = max.parse::<u8>().ok();
+    let model = Some(model.to_owned()).filter(|m| !m.is_empty() && max != Some(0));
+    (max, model)
+}
+
 const EFFORTS: &[(&str, &str)] = &[
     ("", "Predefinito"),
     ("low", "Basso"),
@@ -76,8 +98,8 @@ pub fn mode_help(mode: PermissionMode) -> &'static str {
 struct Options {
     branches: Vec<String>,
     allow_bypass: bool,
-    /// The project's default model when it is not one of [`MODELS`] (e.g. a full model id).
-    other_model: Option<String>,
+    /// [`default_model_label`]: the default can be a full model id, not in [`MODEL_ALIASES`].
+    default_model: String,
 }
 
 /// Open while `task_id` is `Some`; closing or starting sets it to `None`. Used by the board
@@ -90,6 +112,8 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
     let target = RwSignal::new(String::new());
     let model = RwSignal::new(String::new());
     let effort = RwSignal::new(String::new());
+    let max_subagents = RwSignal::new(String::new());
+    let subagent_model = RwSignal::new(String::new());
     let mode = RwSignal::new(PermissionMode::AcceptEdits.as_str().to_owned());
     let starting = RwSignal::new(false);
     let error = RwSignal::new(None::<AppError>);
@@ -121,9 +145,10 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
             }
             let loaded = loaded.map(|(opts, defaults)| {
                 target.try_set(defaults.target);
-                model.try_set(defaults.model);
                 mode.try_set(defaults.mode.as_str().to_owned());
-                effort.try_set(String::new());
+                for choice in [model, effort, max_subagents, subagent_model] {
+                    choice.try_set(String::new());
+                }
                 opts
             });
             options.try_set(Some(loaded));
@@ -132,6 +157,7 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
 
     let allow_bypass = move || options.with(|o| matches!(o, Some(Ok(o)) if o.allow_bypass));
     let bypass_selected = move || mode.with(|m| m == PermissionMode::BypassPermissions.as_str());
+    let no_subagents = move || max_subagents.with(|m| m == "0");
 
     let start = move |_| {
         let Some(id) = task_id.get_untracked() else {
@@ -140,12 +166,18 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
         let Ok(permission_mode) = mode.get_untracked().parse::<PermissionMode>() else {
             return;
         };
+        let (max_subagents, subagent_model) = subagent_fields(
+            &max_subagents.get_untracked(),
+            &subagent_model.get_untracked(),
+        );
         let req = StartAttemptReq {
             task_id: id.clone(),
             target_branch: target.get_untracked(),
             permission_mode,
             model: Some(model.get_untracked()).filter(|m| !m.is_empty()),
             effort: effort.get_untracked().parse::<Effort>().ok(),
+            subagent_model,
+            max_subagents,
         };
         starting.set(true);
         error.set(None);
@@ -174,7 +206,7 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
 
     view! {
         <Dialog open>
-            <DialogContent class="sm:max-w-lg" data_name_prefix="StartDialog">
+            <DialogContent class="overflow-y-auto sm:max-w-lg" data_name_prefix="StartDialog">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>"Avvia l'agente"</DialogTitle>
@@ -221,13 +253,11 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
                                             value=model.read_only()
                                             on_change=select(model)
                                         >
-                                            {MODELS
+                                            {option(String::new(), opts.default_model, model)}
+                                            {MODEL_ALIASES
                                                 .iter()
-                                                .map(|(v, l)| option((*v).into(), (*l).into(), model))
+                                                .map(|m| option((*m).into(), (*m).into(), model))
                                                 .collect_view()}
-                                            {opts
-                                                .other_model
-                                                .map(|m| option(m.clone(), format!("Progetto: {m}"), model))}
                                         </SelectNative>
                                     </div>
                                     <div class="grid gap-2">
@@ -243,6 +273,47 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
                                                 .collect_view()}
                                         </SelectNative>
                                     </div>
+                                </div>
+                                <div class="grid gap-2">
+                                    <div class="grid grid-cols-2 gap-4">
+                                        <div class="grid gap-2">
+                                            <Label html_for="start-max-subagents">"Sub-agent (max)"</Label>
+                                            <SelectNative
+                                                id="start-max-subagents"
+                                                value=max_subagents.read_only()
+                                                on_change=select(max_subagents)
+                                            >
+                                                {subagent_limits()
+                                                    .map(|(v, l)| option(v, l, max_subagents))
+                                                    .collect_view()}
+                                            </SelectNative>
+                                        </div>
+                                        <Show when=move || !no_subagents()>
+                                            <div class="grid gap-2">
+                                                <Label html_for="start-subagent-model">"Modello dei sub-agent"</Label>
+                                                <SelectNative
+                                                    id="start-subagent-model"
+                                                    value=subagent_model.read_only()
+                                                    on_change=select(subagent_model)
+                                                >
+                                                    {option(String::new(), "Predefinito del CLI".into(), subagent_model)}
+                                                    {MODEL_ALIASES
+                                                        .iter()
+                                                        .map(|m| option((*m).into(), (*m).into(), subagent_model))
+                                                        .collect_view()}
+                                                </SelectNative>
+                                            </div>
+                                        </Show>
+                                    </div>
+                                    <p class="text-muted-foreground text-xs" data-testid="subagent-help">
+                                        {move || {
+                                            if no_subagents() {
+                                                "L'agente lavora da solo: non può avviare sub-agent."
+                                            } else {
+                                                "Il massimo vale per tutto il tentativo. Il modello vale per i sub-agent che non ne chiedono uno proprio: Explore o una chiamata con un modello esplicito possono usarne un altro."
+                                            }
+                                        }}
+                                    </p>
                                 </div>
                                 <div class="grid gap-2">
                                     <Label html_for="start-mode">"Permessi"</Label>
@@ -332,11 +403,11 @@ fn option(value: String, label: String, current: RwSignal<String>) -> impl IntoV
 
 struct Defaults {
     target: String,
-    model: String,
     mode: PermissionMode,
 }
 
-/// The task's project (for its defaults and `allow_bypass`) and its local branches.
+/// The task's project (for its defaults and `allow_bypass`), its local branches and, when the
+/// project has no default model, the app's.
 async fn load_options(
     projects: RwSignal<Vec<atm_types::Project>>,
     task_id: Id,
@@ -361,16 +432,51 @@ async fn load_options(
         .map(|p| p.default_permission_mode)
         .filter(|m| *m != PermissionMode::BypassPermissions || allow_bypass)
         .unwrap_or(PermissionMode::AcceptEdits);
-    let model = project.and_then(|p| p.default_model).unwrap_or_default();
+    let project_model = project.and_then(|p| p.default_model);
+    let app_model = match project_model {
+        Some(_) => None,
+        None => ipc::call::<GetSettings>(&Empty {}).await?.default_model,
+    };
     let options = Options {
         branches: list.branches,
         allow_bypass,
-        other_model: Some(model.clone()).filter(|m| MODELS.iter().all(|(v, _)| v != m)),
+        default_model: default_model_label(project_model.as_deref(), app_model.as_deref()),
     };
-    let defaults = Defaults {
-        target,
-        model,
-        mode,
-    };
-    Ok((options, defaults))
+    Ok((options, Defaults { target, mode }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{default_model_label, subagent_fields, subagent_limits};
+
+    #[test]
+    fn the_default_model_is_the_one_start_attempt_resolves() {
+        assert_eq!(
+            default_model_label(Some("opus"), Some("sonnet")),
+            "Predefinito (opus)"
+        );
+        assert_eq!(
+            default_model_label(None, Some("claude-sonnet-4-5")),
+            "Predefinito (claude-sonnet-4-5)"
+        );
+        assert_eq!(default_model_label(Some(" "), None), "Predefinito (CLI)");
+        assert_eq!(default_model_label(None, None), "Predefinito (CLI)");
+    }
+
+    #[test]
+    fn subagent_choices_map_to_the_request() {
+        let limits: Vec<String> = subagent_limits().map(|(v, _)| v).collect();
+        assert_eq!(limits.first().map(String::as_str), Some(""));
+        assert_eq!(limits.len(), 12); // "", 0, 1..=10
+        assert_eq!(limits.last().map(String::as_str), Some("10"));
+
+        assert_eq!(subagent_fields("", ""), (None, None));
+        assert_eq!(subagent_fields("", "haiku"), (None, Some("haiku".into())));
+        assert_eq!(
+            subagent_fields("3", "sonnet"),
+            (Some(3), Some("sonnet".into()))
+        );
+        // No sub-agents: their model is not sent.
+        assert_eq!(subagent_fields("0", "sonnet"), (Some(0), None));
+    }
 }

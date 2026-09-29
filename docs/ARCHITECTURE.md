@@ -260,7 +260,7 @@ I plugin (dialog, single-instance) si chiamano solo da Rust, che non è vincolat
 ```
 ┌───────────────────────────── AI Task Manager.app (1 processo, macOS) ──────────────────────────────┐
 │ WKWebView ─ ui (Leptos CSR → WASM)                                                                  │
-│   Onboarding │ Sidebar progetti │ Board kanban │ TaskPanel [Agente | Modifiche]                     │
+│   Onboarding │ Sidebar │ Riepilogo │ Kanban/Lista │ TaskPanel [Agente | Modifiche] │ Impostazioni   │
 │      │ invoke(cmd, {req})              ▲ event "changed" / "env_changed"   ▲ Channel<TranscriptMsg> │
 │      ▼  (JSON)                         │ (refetch)                         │ (snapshot + upsert)    │
 │ src-tauri (sottile): #[tauri::command] → Core · emit · Channel sink · dialog nativi · nav-guard ·   │
@@ -276,6 +276,7 @@ I plugin (dialog, single-instance) si chiamano solo da Rust, che non è vincolat
   claude -p (CLI dell'utente,        git CLI                          app_data_dir/
   1 processo per turno,              repo principale +                  atm.sqlite3
   cwd = worktree)                    ~/.ai-task-manager/worktrees/<id>  logs/<attempt>/<process>/*
+                                                                        attachments/<project>/<task>/…
   └ auth: login proprio del CLI (Keychain gestito SOLO dal CLI; l'app legge solo `claude auth status`)
 ```
 
@@ -298,10 +299,12 @@ ai-task-manager/
 │  │              # solo serde + serde_json; compila per wasm32 e host
 │  └─ atm-core/
 │     ├─ Cargo.toml                       # [lib] + [[bin]] fake-claude
-│     ├─ migrations/0001_init.sql
+│     ├─ migrations/{0001_init.sql, 0002_overview_attachments_subagents.sql}
 │     ├─ src/lib.rs                       # Core, CoreConfig, startup/recovery/shutdown, 1 metodo per comando
+│     ├─ src/attachments.rs               # allegati dei task: layout su disco, staging, copia (round 2026-09-29)
 │     ├─ src/db.rs                        # rusqlite: open, migrate, 1 fn per query, posizioni
 │     ├─ src/git.rs                       # runner irrobustito + worktree/commit/diff/status/merge/fingerprint
+│     │                                   # + git/overview.rs: riepilogo del progetto dal tip del target
 │     ├─ src/claude.rs                    # discovery, versione, PATH login-shell, ChildEnv, argv, auth, login .command, spawn/killpg
 │     ├─ src/wire.rs                      # reader di righe con cap, parse Inbound, frame outbound, approval_response()
 │     ├─ src/normalize.rs                 # Normalizer puro (Value → EntryOp)
@@ -317,11 +320,13 @@ ai-task-manager/
    └─ src/
       ├─ main.rs                          # mod ui; mod hooks; mod ipc; mod state; mod views; mod widgets; mount
       ├─ app.rs                           # AppCtx, gate onboarding, layout
-      ├─ ipc/{mod.rs, tauri.rs, mock/{mod.rs, board.rs, attempt.rs, fixtures/*.json}}
+      ├─ ipc/{mod.rs, tauri.rs, mock/{mod.rs, board.rs, attempt.rs, overview.rs, attachments.rs,
+      │       fixtures/*.json}}
       ├─ state/{board.rs, transcript.rs}
       ├─ views/{onboarding, sidebar, board, task_dialog, settings, task_panel, start_dialog,
-      │         transcript, approval, composer, diff, merge_dialog}.rs
-      ├─ widgets/{toast.rs, dnd.rs}
+      │         transcript, approval, composer, diff, merge_dialog, overview}.rs
+      │         + views/board/list.rs (vista Lista), views/settings/project.rs (pagina Impostazioni)
+      ├─ widgets/{toast.rs, dnd.rs, context_menu.rs}
       ├─ ui/*.rs      + VENDORED.toml     # Rust/UI copiati (path imposto da crate::ui::…)
       └─ hooks/*.rs                       # use_random, use_scroll_lock
 ```
@@ -337,9 +342,12 @@ ai-task-manager/
 | Cosa | Percorso | Permessi |
 |---|---|---|
 | DB | `app_data_dir()/atm.sqlite3` | file 0600, dir 0700 |
-| Log | `app_data_dir()/logs/<attempt>/<process>/{stdout.jsonl, stderr.log, stdin.jsonl}` | 0600 |
+| Log | `app_data_dir()/logs/<attempt>/<process>/{stdout.jsonl, stderr.log, stdin.jsonl}` | 0600; cancellati con il task o il progetto |
+| Allegati dei task | `app_data_dir()/attachments/<project_id>/<task_id>/<attachment_id>/<nome>` (`atm_core::attachments`) | file 0600 (`create_new`), dir 0700; fuori da ogni worktree e da git; cancellati con il task o il progetto |
 | Worktree | `~/.ai-task-manager/worktrees/<attempt_uuid>` | 0700; path senza spazi |
 | Script di login | `app_cache_dir()/claude-login.command` | 0700, cancellato a fine polling |
+
+**Pulizia di allegati e log** (round feature del 2026-09-29): nessuna cascade del DB arriva ai file. `delete_task` e `remove_project` leggono gli id degli attempt (`task_attempt_ids`, `project_attempt_ids`, chiusi compresi) prima di cancellare le righe; dopo il commit rimuovono la cartella degli allegati (`attachments/<project_id>/<task_id>`, o `attachments/<project_id>` per il progetto) e `logs/<attempt_id>` di ogni attempt. È best effort, in `spawn_blocking`: un errore finisce sullo stderr dell'app (`eprintln!`) e non fa fallire il comando. Prima di questo round i log grezzi sopravvivevano, benché il dialog di rimozione prometta di cancellare la cronologia.
 
 ---
 
@@ -348,7 +356,7 @@ ai-task-manager/
 ### 5.1 Connessione e migrazioni
 
 - A ogni apertura: `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;`.
-- Le migrazioni sono `&[include_str!(...)]`. Si applicano quelle con indice ≥ `PRAGMA user_version`, dentro una transazione.
+- Le migrazioni sono `&[include_str!(...)]`: `0001_init.sql` e `0002_overview_attachments_subagents.sql` (round feature del 2026-09-29). Si applicano quelle con indice ≥ `PRAGMA user_version`, ciascuna dentro una transazione; un DB con uno `user_version` più alto di quelle note (app più vecchia) viene rifiutato.
 - Gli ID sono UUID v4 minuscoli (`TEXT`); i timestamp sono `INTEGER` in ms Unix.
 - `Mutex<Connection>`: tutte le chiamate sono brevi e sincrone, nessuna query dura più di pochi ms.
 
@@ -456,6 +464,33 @@ CREATE TABLE entries (                                   -- transcript normalizz
 ) STRICT, WITHOUT ROWID;
 ```
 
+**Migrazione 0002** (`crates/atm-core/migrations/0002_overview_attachments_subagents.sql`, round feature del 2026-09-29): descrizione del progetto, modello e limite dei sub-agent, allegati dei task. `ADD COLUMN` controlla i CHECK sulle righe esistenti, e i default li soddisfano; il test `migrates_a_v1_database_with_rows_to_v2` parte da un DB con la sola 0001 e le righe dentro.
+
+```sql
+ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''
+  CHECK (length(description) <= 10000);
+
+ALTER TABLE attempts ADD COLUMN subagent_model TEXT;       -- alias di MODEL_ALIASES; NULL = default del CLI
+ALTER TABLE attempts ADD COLUMN max_subagents INTEGER
+  CHECK (max_subagents IS NULL OR max_subagents BETWEEN 0 AND 10);   -- NULL = nessun limite
+ALTER TABLE attempts ADD COLUMN subagents_used INTEGER NOT NULL DEFAULT 0
+  CHECK (subagents_used >= 0);
+
+CREATE TABLE task_attachments (                          -- file in data_dir/attachments/, mai nel worktree
+  id         TEXT PRIMARY KEY,
+  task_id    TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  name       TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 255),
+  size       INTEGER NOT NULL CHECK (size >= 0),
+  created_at INTEGER NOT NULL
+) STRICT;
+CREATE INDEX task_attachments_task ON task_attachments(task_id, created_at);
+```
+
+- Il path della copia non si salva: lo calcola il Core dagli id e dal nome (`atm_core::attachments::attachment_path`).
+- Al massimo `MAX_ATTACHMENTS_PER_TASK` (20) allegati per task: `Db::insert_attachments` inserisce e riconta nella stessa transazione, `Invalid` oltre.
+- `Db::count_subagent` conta uno spawn solo finché `subagents_used < max_subagents` (in una sola istruzione).
+- Le righe degli allegati spariscono con il task o il progetto (cascade). File e log restano del chiamante, che legge prima gli id (`project_task_ids`, `project_attempt_ids`, `task_attempt_ids`).
+
 **Invarianti imposti dal DB:**
 - al massimo un attempt attivo per task;
 - al massimo un turno `running` per attempt, quindi mai due processi sulla stessa sessione.
@@ -533,7 +568,13 @@ pub type Id = String;            // UUID v4
 pub type Millis = i64;
 
 // model.rs
-pub struct Project { pub id: Id, pub name: String, pub repo_path: String, pub default_target_branch: String,
+pub const MODEL_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];   // unica lista di alias (CLI 2.1.284)
+pub const MAX_SUBAGENTS: u8 = 10;
+pub const MAX_ATTACHMENTS_PER_TASK: usize = 20;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 << 20;          // 25 MiB
+pub const MAX_PROJECT_DESCRIPTION: usize = 10_000;       // caratteri
+pub struct Project { pub id: Id, pub name: String, pub description: String /* ≤ 10 000 caratteri, "" di default */,
+    pub repo_path: String, pub default_target_branch: String,
     pub default_permission_mode: PermissionMode, pub default_model: Option<String>,
     pub config_policy: ConfigPolicy, pub trusted: bool /* Trusted e fingerprint approvato = quello del tip del branch target */,
     pub allow_bypass: bool, pub created_at: Millis, pub updated_at: Millis }
@@ -546,6 +587,8 @@ pub struct TaskCard { pub task: Task, pub attempt_id: Option<Id>,
 pub struct AttemptView { pub id: Id, pub task_id: Id, pub state: AttemptState, pub branch: String,
     pub target_branch: String, pub base_commit: String, pub worktree_path: String, pub worktree_state: WorktreeState,
     pub permission_mode: PermissionMode, pub model: Option<String>, pub effort: Option<Effort>,
+    pub subagent_model: Option<String> /* CLAUDE_CODE_SUBAGENT_MODEL; None = default del CLI */,
+    pub max_subagents: Option<u8> /* 0..=10; None = nessun limite */, pub subagents_used: u32,
     pub session_started: bool, pub merge_commit: Option<String>, pub running: bool, pub pending_approvals: u32,
     pub created_at: Millis, pub closed_at: Option<Millis> }
 pub struct ProcessInfo { pub id: Id, pub seq: u32, pub prompt: String, pub status: ProcessStatus,
@@ -553,7 +596,23 @@ pub struct ProcessInfo { pub id: Id, pub seq: u32, pub prompt: String, pub statu
     pub cost_usd_estimate: Option<f64>, pub duration_ms: Option<u64>, pub num_turns: Option<u32>,
     pub head_after: Option<String>, pub started_at: Millis, pub finished_at: Option<Millis> }
 pub struct TaskDetail { pub task: Task, pub attempt: Option<AttemptView>, pub processes: Vec<ProcessInfo>,
-    pub closed_attempts: Vec<AttemptView> }
+    pub closed_attempts: Vec<AttemptView>, pub attachments: Vec<Attachment> /* dal più vecchio */ }
+pub struct Attachment { pub id: Id, pub task_id: Id, pub name: String, pub size: u64,
+    pub path: String /* assoluto, calcolato dal Core */, pub created_at: Millis }
+pub struct PickedFile { pub token: Id /* monouso, scade dopo 10 min */, pub name: String, pub size: u64 }
+pub struct ProjectOverview { pub project_id: Id, pub branch: String, pub commit: String /* sha completo del tip */,
+    pub agents_load_config: bool /* policy Trusted e trusted */, pub files: Vec<ContextFile>,
+    pub mcp_servers: Vec<McpServer>, pub claude_agents: Vec<String>, pub claude_commands: Vec<String>,
+    pub claude_skills: Vec<String> }
+pub struct ContextFile { pub path: String, pub kind: ContextFileKind, pub size: u64,
+    pub content: Option<String> /* segreti mascherati; None se troppo grande, binario, symlink o JSON non valido */,
+    pub note: Option<String> /* "troppo grande (N KiB)", "→ AGENTS.md", "binario", "JSON non valido",
+                                "valori segreti mascherati" */,
+    pub hidden_chars: bool /* anche nel target di un symlink */, pub used_by_agents: bool, pub usage_note: String }
+pub enum ContextFileKind { Memory, Agents, Readme, Settings, Mcp }
+pub struct McpServer { pub name: String, pub transport: String /* type, altrimenti stdio | http | sconosciuto */,
+    pub target: String /* comando e argomenti, o URL senza userinfo, query e fragment; ≤ 200 caratteri */,
+    pub env_keys: Vec<String>, pub header_keys: Vec<String> /* solo i nomi, mai i valori */ }
 pub struct BranchList { pub current: Option<String>, pub branches: Vec<String> }
 pub struct Settings { pub claude_path_override: Option<String>, pub default_model: Option<String>,
     pub max_running: u32, pub allow_env_api_key: bool, pub worktree_root: String, pub editor_app: String,
@@ -628,6 +687,13 @@ pub fn merge_message(title: &str, description: &str, attempt_id: &str) -> String
 
 // api.rs (oltre a marker, Req e Changed)
 pub const CONTINUE_PROMPT: &str = "The previous run was interrupted when the app closed. Continue the task.";
+pub struct UpdateProjectReq { pub id: Id, pub name: String, pub default_target_branch: String,
+    pub default_permission_mode: PermissionMode, pub default_model: Option<String>,
+    #[serde(default)] pub description: String }
+pub struct StartAttemptReq { pub task_id: Id, pub target_branch: String, pub permission_mode: PermissionMode,
+    pub model: Option<String>, pub effort: Option<Effort>,
+    pub subagent_model: Option<String> /* un alias di MODEL_ALIASES */, pub max_subagents: Option<u8> /* 0..=10 */ }
+pub struct AddTaskAttachmentsReq { pub task_id: Id, pub tokens: Vec<Id> }
 
 // error.rs
 pub struct AppError { pub code: ErrorCode, pub message: String }
@@ -647,16 +713,20 @@ pub enum ErrorCode { NotFound, Invalid, Conflict, Busy, ConcurrencyLimit, UsageL
 | `list_projects` | `{}` → `Vec<Project>` | |
 | `pick_repo_folder` | `{}` → `Option<String>` | Chiama `blocking_pick_folder` in `spawn_blocking` [F] |
 | `add_project` | `{path}` → `{project, warnings: Vec<String>}` | §8.3 |
-| `update_project` | `{id, name, default_target_branch, default_permission_mode, default_model}` → `Project` | |
+| `update_project` | `{id, name, default_target_branch, default_permission_mode, default_model, description?}` → `Project` | `description` senza spazi in testa e in coda, al massimo 10 000 caratteri (`Invalid`); assente = vuota |
 | `set_project_security` | `{id, config_policy, allow_bypass}` → `Project` | M6. Conferma nativa quando si **eleva** il livello **effettivo**: Trusted se il progetto non è `trusted` ora (anche Trusted con fingerprint scaduto), oppure bypass. Il guscio legge una volta, prima del dialog, progetto, stato salvato e configurazione committata sul tip del branch target predefinito (`Core::security_snapshot`, con branch e commit); il testo della conferma nomina il repository per path (su una riga), il branch e il commit approvati, dice che cosa si concede (configurazione del repo, regole che consentono un tool intero, modalità Autonoma), che una configurazione che fattura fuori dall'abbonamento non si approva e che un turno con una chiave API viene fermato, e che il worktree non è una sandbox. `Core::apply_project_security` salva il fingerprint che il dialog ha descritto, solo se è ancora quello e se lo stato salvato è ancora quello letto (`Conflict` altrimenti, §8.9); `Invalid` se il repo è `$HOME`, se il branch non si legge, se la configurazione non è verificabile o se farebbe fatturare gli agenti fuori dall'abbonamento (nomina la chiave, §8.9). Annullato l'aumento, la parte che abbassa si applica comunque (l'errore lo dice). Togliere `allow_bypass` riporta a Auto-edit una modalità predefinita Autonoma; una revoca ferma i turni che la usano |
-| `remove_project` | `{id}` → `()` | Rifiutato se ci sono turni attivi. Snapshot e rimozione dei worktree; branch tenuti |
+| `remove_project` | `{id}` → `()` | Rifiutato se ci sono turni attivi (`Busy`). Snapshot e rimozione dei worktree; branch tenuti; task, cronologia, allegati e log grezzi cancellati (§4) |
 | `list_branches` | `{project_id}` → `BranchList` | |
+| `get_project_overview` | `{project_id}` → `ProjectOverview` | Letto dal commit in cima a `default_target_branch` (la base dei worktree, quello che il trust approva), mai dal checkout principale; `Invalid` se il repo è `$HOME` o la revisione non è valida, `Git` se il runner fallisce. `Core` risolve tip, record della configurazione (in cache) e `agents_load_config`, poi chiama `git::overview::read`: un solo `git ls-tree -z -l --end-of-options <tip> -- CLAUDE.md .claude/CLAUDE.md AGENTS.md README.md .claude/settings.json .mcp.json` sul runner irrobustito (sola lettura, stdout ≤ 64 KiB), poi un solo `cat-file --batch` che legge per id, con la dimensione esatta, i blob ≤ 64 KiB. Non in cache: ogni chiamata costa un `ls-tree` e al più un `cat-file` (§10.2, §13) |
 | `get_board` | `{project_id}` → `Vec<TaskCard>` | Unisce DB e registro live |
 | `create_task` / `update_task` | `{project_id, title, description, status?}` / `{id, title, description}` → `TaskCard` | |
 | `move_task` | `{id, status, before_id: Option<Id>}` → `()` | `Busy` se il task è in esecuzione e la destinazione è done o cancelled |
-| `delete_task` | `{id}` → `()` | `Busy` se in esecuzione. Fa discard dell'attempt attivo |
-| `get_task_detail` | `{id}` → `TaskDetail` | |
-| `start_attempt` | `{task_id, target_branch, permission_mode, model?, effort?}` → `AttemptView` | Ritorna dopo che worktree e righe esistono; lo spawn è asincrono. `bypassPermissions` senza `allow_bypass` → `Invalid` |
+| `delete_task` | `{id}` → `()` | `Busy` se in esecuzione. Fa discard dell'attempt attivo; allegati e log grezzi cancellati (§4) |
+| `get_task_detail` | `{id}` → `TaskDetail` | Con gli allegati del task |
+| `pick_attachment_files` | `{}` → `Vec<PickedFile>` | Picker nativo multiplo (`blocking_pick_files` in `spawn_blocking`); i path vanno solo a `Core::stage_picks`, la webview riceve token monouso. Annullato: lista vuota. In E2E usa il path in coda di `debug_e2e_queue_pick` |
+| `add_task_attachments` | `{task_id, tokens}` → `Vec<Attachment>` | Sotto il lock del task: copia i file nella cartella del task, poi una sola transazione che riconta e inserisce; `Invalid` oltre 20 allegati o con un token sconosciuto o scaduto ("File non più disponibile: sceglilo di nuovo"); a ogni errore le copie appena fatte si cancellano (§10.2) |
+| `remove_task_attachment` | `{id}` → `()` | Sotto il lock del task: cancella riga e copia |
+| `start_attempt` | `{task_id, target_branch, permission_mode, model?, effort?, subagent_model?, max_subagents?}` → `AttemptView` | Ritorna dopo che worktree e righe esistono; lo spawn è asincrono. `bypassPermissions` senza `allow_bypass` → `Invalid`; così `max_subagents` oltre 10 e un `subagent_model` fuori da `MODEL_ALIASES` |
 | `send_follow_up` | `{attempt_id, prompt, permission_mode?, fresh_session: bool}` → `ProcessInfo` | `Busy` se c'è un turno in corso. `permission_mode` vale **solo per quel turno** (`processes.permission_mode`); quella dell'attempt non cambia |
 | `stop_attempt` | `{attempt_id}` → `()` | Ritorna subito; l'escalation continua in background |
 | `respond_approval` | `{attempt_id, approval_id, decision: ApprovalDecision}` → `()` | |
@@ -771,14 +841,23 @@ Regole:
   [--allow-dangerously-skip-permissions]                          # solo se project.allow_bypass [V]
   ( --session-id=<attempt.session_id>                             # se session_started = 0
   | --resume=<attempt.session_id> )                               # altrimenti
-  --disallowedTools=AskUserQuestion                               # v1: domande rimandate
+  --disallowedTools=AskUserQuestion[,Agent,Task][,Workflow]       # v1: domande rimandate; sub-agent sotto
   --settings=<json>                                               # §7.8, a ogni turno
   [--setting-sources=user --strict-mcp-config]                    # policy Isolated (default)
   [--model=<m>] [--effort=<e>]
+  [--add-dir=<cartella canonica degli allegati del task>]         # solo se il task ha allegati
   --append-system-prompt=<ATM_APPEND>
 ```
 
 - La forma `--flag=value` impedisce l'iniezione di flag. Il prompt passa **solo da stdin**.
+- **Limite di sub-agent** (round feature del 2026-09-29; `attempts.max_subagents`, con `remaining = max_subagents − subagents_used` ricalcolato a ogni turno):
+  - `None` (nessun limite, il default): `--disallowedTools=AskUserQuestion`, come prima del round;
+  - `Some(n)` con `remaining == 0` (anche `n = 0`): `--disallowedTools=AskUserQuestion,Agent,Task,Workflow`;
+  - `Some(n)` con `remaining > 0`: `--disallowedTools=AskUserQuestion,Workflow` e `"ask":["Agent","Task"]` nelle `--settings` (§7.8), così ogni spawn arriva all'host come `can_use_tool` e l'host lo conta.
+  - `Workflow` (alias `RunWorkflow`) è un secondo modo di avviare agenti, con script che non passano dal tool Agent: con un limite è sempre vietato. Il CLI mappa `Task` su `Agent`; elencarli entrambi non costa nulla. Una regola `ask` sul tool intero il CLI la valuta prima della modalità, bypass compreso (letto nel bundle di 2.1.284; conferma con il CLI reale ancora da fare, §13).
+- **Modello dei sub-agent** (`attempts.subagent_model`, un alias di `MODEL_ALIASES`): `"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"<alias>"}` dentro le `--settings`, non nell'ambiente del figlio. Le impostazioni passate con il flag battono l'`env` delle impostazioni di utente e progetto, e il valore compare nell'argv salvato e nel record di fake-claude. Per il CLI è la fonte con la **priorità più bassa** (§13).
+- **Allegati** (`--add-dir`): un solo elemento argv, dopo `--effort` e prima di `--append-system-prompt`, a **ogni** turno finché il task ha almeno un allegato. La cartella è quella canonica del task (`/var/folders` diventa `/private/var/folders`), la stessa stringa dei path nel prompt (§7.4). Nessuna regola deny sulla cartella: proteggerebbe solo le copie, e Bash la aggira. "Sola lettura" è un'istruzione del prompt (§13); gli originali non vengono mai toccati.
+- **Senza opzioni** (nessun allegato, nessun limite e nessun modello dei sub-agent) l'argv è identico byte per byte a quello di prima del round: gli snapshot `claude__*` esistenti non cambiano.
 - **M5 [V]:** `--verbose` è obbligatorio (senza, `-p` con `--output-format stream-json` esce con 1: "requires --verbose"). `--permission-mode=default` è accettato anche se l'help di 2.1.283 elenca `manual` al suo posto (alias: la risposta a `initialize` dice `current_permission_mode: "default"` per entrambi).
 - **Mai passati:**
   - `--bare`: disabilita l'OAuth [F];
@@ -789,7 +868,7 @@ Regole:
   - `--allowedTools` con un tool intero: oscurerebbe `can_use_tool`.
 - **`ATM_APPEND`.** È fisso per attempt, perché `--system-prompt-snapshot` è attivo di default e il prompt si congela al primo turno [V]:
   > "You are working on a task from AI Task Manager inside a dedicated git worktree `<path>` on branch `<branch>` (created from `<target>`). Work only inside this directory. Do not push, switch or delete branches, rewrite history, or change git remotes/config. The host app commits your changes automatically after each turn. The user's later messages continue this task, even once it looks done: carry out what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow its conventions."
-- La frase finale su CLAUDE.md copre il caso non verificato E11.
+- La frase finale su CLAUDE.md copre il caso non verificato E11. Il Riepilogo del progetto la dà per scontata (`git/overview.rs`, `usage`: CLAUDE.md e AGENTS.md "letti su istruzione del prompt"): se questa frase cambia, cambiano anche quelle note.
 - La frase sui messaggi successivi (M6) risponde a M5, che ha visto il modello rifiutare un follow-up ritenuto estraneo a un task già finito (§13.4).
 - **Spawn:**
   - `tokio::process::Command` con `.current_dir(wt).process_group(0).kill_on_drop(true)`, stdin, stdout e stderr in pipe;
@@ -808,9 +887,10 @@ Regole:
    - Timeout: stop sequence, poi `failed` / `init_timeout`.
    - Con `hooks:null` gli hook di progetto non vengono sostituiti (Vibe Kanban #3327 [F]).
 2. Il runner invia `{"type":"user","message":{"role":"user","content":"<prompt>"},"parent_tool_use_id":null}`, senza `session_id` [F]. Contestualmente crea l'entry `UserMessage`.
-   - Primo turno: `"# {title}\n\n{description}"`.
-   - Follow-up: il testo dell'utente, invariato.
-   - `fresh_session`: task + descrizione + output di `git log --oneline <base>..HEAD` + il testo.
+   - Primo turno: `"# {title}\n\n{description}"`, senza spazi in coda, più la sezione degli allegati se il task ne ha.
+   - Follow-up: il testo dell'utente, invariato (niente sezione degli allegati: la cartella resta visibile con `--add-dir`, §7.3).
+   - `fresh_session`: task + descrizione + sezione degli allegati + output di `git log --oneline <base>..HEAD` + il testo.
+   - **Sezione degli allegati** (round feature del 2026-09-29, `attachments::prompt_section`; in inglese come gli altri testi per il modello): `\n\n## Attachments\n\nThe user attached these files to the task. They are read-only copies kept outside the repository: read them from these paths, do not modify, move or delete them.\n` e poi una riga `- \`<path assoluto canonico>\`` per file, dal più vecchio. Le immagini l'agente le legge con il tool Read (§14 q.7). Il nome di un allegato non contiene apici inversi (§10.2), quindi il code span non si rompe.
 3. All'arrivo di `result`: il runner registra il risultato, **chiude stdin** (drop del sender) e continua a leggere stdout fino a EOF, perché dopo `result` possono arrivare altri eventi [F]. Poi `wait` con timeout di 30 s; allo scadere, stop sequence con `exit_timeout`.
 4. Dopo qualunque uscita: `killpg(pgid, SIGTERM)` sul gruppo residuo, ignorando `ESRCH`. Termina i processi in background avviati dall'agente, come i dev server; è un limite documentato del modello un-processo-per-turno.
    - M5 [V]: il tool Bash del CLI 2.1.283 esegue ogni comando in un **process group suo** (pgid ≠ quello di claude), che il `killpg` del gruppo non raggiunge. Il CLI li chiude da sé su interrupt (osservato, anche per i task in background). Quando il leader è morto i suoi figli passano a launchd e nulla li lega più al turno, quindi il Core **registra i discendenti del leader mentre vive** (`ps -A -o pid,ppid,pgid`, `claude::tree_of`): all'arrivo di `result`, prima di chiudere stdin, e ai gradini EOF e SIGTERM della stop sequence. All'uscita del leader manda SIGTERM a quelli ancora vivi e poi, dopo 3 s, SIGKILL (`claude::survivors`: stesso pgid e genitore launchd o un altro discendente registrato, contro il riuso dei pid); `run_in_background` compresi. Dove il CLI riceve SIGKILL (ultimo gradino, runtime abbandonato con `KillGroupOnDrop`, recovery di un orfano vivo) il Core uccide anche i discendenti, raccolti prima (`claude::kill_tree`). Limite: se il leader muore da solo senza `result` (crash) o insieme all'app, i discendenti non registrati restano (§7.9).
@@ -936,14 +1016,21 @@ run_turn(attempt, prompt, mode):
 | `Allow{remember:true}` | Come sopra, più `"updatedPermissions":<solo le suggestion addRules/allow, con ogni destination riscritta a "session">`. In più si aggiungono le stringhe `Tool(ruleContent)` ad `attempts.allow_rules`, ripassate nei turni successivi via `--settings`. M5 [V]: le regole di sessione **non** sopravvivono a `--resume` (senza il re-pass il comando richiede di nuovo l'approvazione), mentre la regola in `--settings` evita la richiesta anche in una sessione nuova: il re-pass è necessario |
 | `Deny{message, interrupt}` | `{"behavior":"deny","message":"The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file). To tell you how to proceed, the user said: <msg>","interrupt":<bool>}` |
 | `AskUserQuestion` (arriva comunque) | Deny con `"Ask your question in plain text in your reply instead."`, `interrupt:false` |
+| Sub-agent (`Agent`/`Task`) di un attempt **con un limite** (round feature del 2026-09-29) | Risposta immediata, mai pendente, sullo stesso percorso di `AskUserQuestion` (`runner/turn.rs`, `count_subagent`). Se `Db::count_subagent` lo concede (`subagents_used < max_subagents`, incremento e controllo in un solo `UPDATE … RETURNING`): `{"behavior":"allow","updatedInput":<input originale>}`, `subagents_used` salvato e `changed` emesso (il pannello del task mostra il contatore). Altrimenti, e anche quando il conteggio non si può scrivere: `{"behavior":"deny","message":"Sub-agent limit for this task reached (N). Complete the work directly without starting sub-agents.","interrupt":false}` con N = `max_subagents`, **senza** il prefisso "The user doesn't want to proceed…" (costruito con `wire::control_success`); il `ToolCall` passa a `Denied` con quel testo. Si conta lo spawn concesso, non quello completato |
 
-**JSON di `--settings`** (snapshot-testato; stringhe esatte, senza ambiguità di split):
+- Senza limite (`max_subagents` `None`) un `Agent`/`Task` che chiede comunque (per una regola dell'utente) è un'approvazione normale, pendente e non contata.
+- Le richieste arrivano una alla volta nel ciclo del turno (`select!` unico, `on_can_use_tool` sincrono): anche una raffica di spawn in parallelo viene contata esattamente, senza `CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS` (non documentata, esclusa).
+
+**JSON di `--settings`** (snapshot-testato; stringhe esatte, senza ambiguità di split; `claude::settings_json(&SettingsParts{allow, ask, env})`, con `DENY_RULES` sempre in testa):
 ```json
 {"permissions":{
   "deny":["Bash(git push *)","Bash(git push)","Read(~/.ssh/**)","Read(~/.aws/**)",
           "Read(~/.claude/.credentials.json)","Edit(~/.claude/**)","Edit(~/.ssh/**)"],
-  "allow":[ /* attempts.allow_rules */ ]}}
+  "allow":[ /* attempts.allow_rules */ ]
+  /* ,"ask":["Agent","Task"]   solo con un limite di sub-agent non esaurito (§7.3) */ }
+  /* ,"env":{"CLAUDE_CODE_SUBAGENT_MODEL":"<alias>"}   solo con un modello dei sub-agent */ }
 ```
+- Senza `ask` ed `env` il JSON è esattamente quello di prima del round (i test piegano `DENY_RULES` nello snapshot e `check.sh` ammette `credentials.json` solo in quella costante).
 `-p` ignora in silenzio i settings non validi [V/F]: M5 ha dimostrato che il deny su `git push` funziona [V]: nessun `can_use_tool`, `tool_result` con `is_error` e testo "Permission to use Bash with command git push has been denied.", la voce in `result.permission_denials` (`{tool_name, tool_use_id, tool_input}`) e il remote intatto; il `result` resta `success`. È una difesa in profondità: `sh -c 'git push'` la aggira.
 
 ### 7.9 Follow-up, stop, resume
@@ -1156,7 +1243,7 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
   - **A runtime:** il `system/init` di ogni turno con una chiave API ferma il turno (§7.6), per ciò che l'app non vede (impostazioni dell'utente).
 - **Approvazione:** calcolata **sul commit di punta del branch target predefinito del progetto** (`default_target_branch`, da cui `start_attempt` crea i worktree), non sui file del checkout principale: `Core::security_snapshot` la calcola **una volta, prima della conferma nativa** e restituisce anche branch e commit (`ConfigBase`), che la conferma nomina; la salva solo se un nuovo calcolo sul tip, dopo la conferma e sotto il lock del progetto, dà lo stesso valore (`Core::apply_project_security`; altrimenti `Conflict`: la configurazione del branch è cambiata mentre il dialog era aperto; un tip nuovo con la stessa configurazione è la stessa approvazione). Anche lo stato salvato (policy, bypass, fingerprint) si scrive solo se è ancora quello letto prima del dialog (compare-and-set in un solo `UPDATE`, che azzera anche un default Autonomo quando il bypass viene tolto). Restando Trusted senza riapprovare, si tiene il fingerprint approvato. Un errore del calcolo (branch che non si legge, configurazione non verificabile, voci in `billing`) rifiuta l'approvazione. Un repository senza configurazione è approvabile: il fingerprint vuoto (`e3b0c442…`) è valido. Rifiutata se il toplevel del repo è `$HOME`: il suo `.claude` è quello dell'utente, che l'app non legge mai (§10.1); per lo stesso motivo nessun fingerprint di `$HOME`, né del checkout né dei suoi commit, viene mai calcolato né considerato valido (la home, anche canonica, si legge una volta all'avvio).
 - **I file locali del checkout principale non contano:** `.claude/settings.local.json` non tracciato, modifiche non committate, file ignorati non arrivano nei worktree e non entrano nell'approvazione; non bloccano più Trusted (prima di questa modifica i turni giravano Isolated finché esistevano).
-- **`Project.trusted`** è calcolato a ogni lettura: policy Trusted e fingerprint approvato uguale a quello del commit di punta attuale del branch target predefinito (senza voci in `billing`); **`Project.trust_error`** dice perché non si può calcolare o approvare (M6-REVIEW), e le Impostazioni lo mostrano, rileggendo il progetto a ogni apertura (un commit nuovo non manda eventi). Se il branch va avanti con una configurazione diversa, il progetto non è più `trusted` e gli attempt nuovi, che partono dal tip nuovo, girano Isolated finché l'utente non riapprova; un commit che non tocca la configurazione non cambia nulla.
+- **`Project.trusted`** è calcolato a ogni lettura: policy Trusted e fingerprint approvato uguale a quello del commit di punta attuale del branch target predefinito (senza voci in `billing`); **`Project.trust_error`** dice perché non si può calcolare o approvare (M6-REVIEW), e la pagina Impostazioni del progetto lo mostra, rileggendo il progetto a ogni visita (un commit nuovo non manda eventi). Se il branch va avanti con una configurazione diversa, il progetto non è più `trusted` e gli attempt nuovi, che partono dal tip nuovo, girano Isolated finché l'utente non riapprova; un commit che non tocca la configurazione non cambia nulla.
 - **Prima di ogni turno** (`Inner::untrusted_reason`): calcolata sul worktree, com'è su disco. Voci in `billing` → Isolated con `BILLING_WORKTREE_NOTICE`. Uguale all'approvata → Trusted. Diversa (o non calcolabile) → il turno gira Isolated con una Notice che dice perché, confrontando con la configurazione del **commit da cui è partito l'attempt** (`attempts.base_commit`, in cache): `UNTRUSTED_BASE_NOTICE` più `Commit di partenza: <sha> (<target>)` se quel commit non ha la configurazione approvata (il branch target è andato avanti dopo l'approvazione, o l'attempt ha un altro target: riapprovare), `UNVERIFIABLE_BASE_NOTICE` più `Motivo: <errore>` se non si può verificare; altrimenti è il worktree a essere cambiato: `UNTRUSTED_WORKTREE_NOTICE` più `File diversi: <path>` (i record diversi dal commit di partenza), `UNVERIFIABLE_WORKTREE_NOTICE` più `Motivo: <errore>` se il worktree non si può verificare. La stessa riga va sullo stderr dell'app.
 - **All'avvio del CLI:** un turno Trusted ripete lo stesso controllo al primo `system/init`; se è cambiato tra il controllo e l'avvio (un processo lasciato da un turno precedente, un hook della configurazione stessa) il turno viene fermato con `CHANGED_AT_START_NOTICE` e il motivo, e il successivo gira Isolated. A quel punto il CLI ha già caricato la configurazione (anche un `ANTHROPIC_BASE_URL` o un provider appena comparsi) e sta per mandare la prima richiesta: il suo gruppo viene **congelato** (`SIGSTOP`) mentre il controllo gira, poi ripreso (`SIGCONT`) se nulla è cambiato, altrimenti ucciso subito come nello stop per `apiKeySource` (albero registrato, `SIGKILL`); il turno è `failed` senza `stop_reason` (non uno stop dell'utente), con la Notice (livello errore) e `processes.error` (2026-09-29). Test: `tests/flow.rs::a_config_change_during_the_cli_start_stops_the_turn`, `a_billing_key_gained_during_the_cli_start_kills_the_turn_at_once`. È un rilevamento: gli hook `SessionStart` e i server MCP sono già partiti a quel punto.
 - **Revoca:** togliere il bypass o passare a Isolated ferma i turni in corso del progetto che li usano (argv con `--allow-dangerously-skip-permissions`, o senza i flag di isolamento; anche quelli non ancora lanciati), con `REVOKED_NOTICE`: una revoca non aspetta la fine del turno. Se la parte che alza il livello viene annullata nel dialog (o non si può approvare), la parte che lo abbassa si applica comunque.
@@ -1178,6 +1265,7 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
   - Chiusura con Esc (`window_event_listener(ev::keydown)`) e con click sul backdrop.
   - `use_scroll_lock::lock()`/`unlock()` chiamati da Rust.
   - Focus sul primo elemento focusabile, ripristinato alla chiusura.
+- **Scritto a mano** (round feature del 2026-09-29): il menu del progetto, `widgets/context_menu.rs` (`MenuState`, `ContextMenu`, `ContextMenuItem`), guidato da signal e senza script (`dropdown_menu` upstream ha un `<script>`). `role=menu` con `role=menuitem`, posizione fissa da `style:left/top` reattivi e limitata alla finestra; il primo elemento prende il focus, ↑/↓/Home/End lo spostano. Si chiude con Esc, un `pointerdown` fuori da menu e trigger, un click su una voce, `blur` o `resize` della finestra; Esc, Tab e una voce riportano il focus sul trigger. Niente chiusura sullo scroll né Shift+F10 (rimandati). Nessuna nuova feature di web-sys, nessuna modifica alla CSP.
 - **Non usati:**
   - sheet, select, dropdown_menu, popover, hover_card, command, drawer: hanno script;
   - sonner: dipende da JS del sito;
@@ -1187,21 +1275,59 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 
 ### 9.2 Schermate
 
-**Layout:** sidebar (240 px) | board | pannello del task (split a destra, 55 %, visibile quando un task è selezionato). Niente router: `AppCtx { env, projects, project, board_version, open_task, detail_version, toasts }` come signal.
+**Layout:** sidebar (240 px) | topbar con nome e path del progetto e i tab **Riepilogo | Task | Impostazioni** | pagina del progetto: Riepilogo; Task = board (Kanban o Lista) più il pannello del task (split a destra, 55 %, visibile quando un task è selezionato); Impostazioni del progetto. Niente router: `AppCtx { env, projects, project, project_view, remove_target, board_version, open_task, detail_version, toasts }` come signal.
+- **Pagina del progetto** (round feature del 2026-09-29): `ProjectView = Overview | Tasks | Settings`, non persistita. `AppCtx::select_project(id, view)` imposta `open_task = None`, il progetto e la pagina; la chiamano il click nella sidebar, `add_repository`, l'auto-selezione di `refresh_projects` e le voci del menu. Ogni selezione atterra sul **Riepilogo**, tranne la voce di menu "Impostazioni progetto" (Impostazioni) e il `?task=` del mock (Task). **Nessun Effect su `project` scrive `project_view`**: la voce di menu imposta progetto e pagina insieme. Un click sul progetto già selezionato non fa nulla (la pagina resta). Un click su un tab non chiude il pannello del task.
+- `Layout` mette ogni pagina dietro un proprio `<Show>` su un `Memo<ProjectView>`, mai un `match` ricostruito sul posto (Leptos 0.8 terrebbe i vecchi handler): ogni visita è un montaggio nuovo. Riepilogo e Impostazioni scorrono (`overflow-y-auto`). Senza progetto, una volta caricata la lista, `Layout` mostra `board::NoProject` ("Nessun progetto", "Aggiungi repository").
+- Tab: `role=tablist` "Pagine del progetto" con `role=tab`, `aria-selected`, tabindex 0 solo sul tab scelto, ←/→/Home/End (circolari); le pagine sono `#project-page-<v>[role=tabpanel]` (un `div` con `aria-labelledby` sul suo tab) dentro l'unico `main` del layout, che resta il landmark: un `main` con un altro ruolo non lo sarebbe più. I tab stanno fuori dalla closure che mostra nome e path del progetto.
+- Il dialog globale è diventato **"Impostazioni app"**: solo le impostazioni generali (§5.2), senza tab; il bottone nella sidebar si chiama così. Le impostazioni del progetto sono la pagina Impostazioni.
 
 | Schermata | Componenti Rust/UI | Scritto a mano |
 |---|---|---|
 | Onboarding (§7.10) | card, callout, alert, button, spinner, select_native, input, label, kbd, dialog* (attesa del login) | polling, logica del gate |
-| Sidebar e topbar | button (ghost), separator, scroll_area, badge, status, tooltip | lista progetti, "Aggiungi repository", chip account, banner di pausa con "Riprendi", contatore "in esecuzione x/y" (`EnvStatus.running`/`max_running`) |
-| Board (5 colonne; Annullati compressa) | card, badge (stato, "in esecuzione" con spinner, "Richiede approvazione", "Fallito", "Interrotto – Continua"), scroll_area, empty, skeleton, button | **DnD** (§9.3), creazione rapida in fondo alla colonna |
-| Dialog task (crea/modifica) e Impostazioni | dialog*, input, textarea, label, button, select_native | form |
-| Pannello task: header | badge, button (Avvia, Stop, Scarta, Apri in Finder/Terminale/Editor), tooltip, separator | – |
-| Dialog Avvia | dialog*, select_native (branch target, modello: Predefinito/opus/sonnet/fable, effort, modalità: Supervisionato/Auto-edit/Autonomo, quest'ultimo abilitato solo con `allow_bypass`, con sotto la descrizione della modalità scelta: Auto-edit approva da solo modifiche e comandi shell sui file del worktree e chiede per il resto, Supervisionato chiede per tutto tranne le letture, M5), callout (avviso bypass: il worktree non è una sandbox), button | – |
+| Sidebar e topbar | button (ghost), separator, scroll_area, badge, status, tooltip | lista progetti, "Aggiungi repository", "Impostazioni app", chip account, banner di pausa con "Riprendi", contatore "in esecuzione x/y" (`EnvStatus.running`/`max_running`), tab Riepilogo/Task/Impostazioni nella topbar; **menu del progetto** (§9.1): bottone "⋯" accanto al nome (visibile su hover e focus, `aria-haspopup=menu`, `aria-expanded`, `aria-label` "Azioni per «nome»") e clic destro sulla voce (`contextmenu` con `preventDefault`), stesso popover con "Impostazioni progetto" e "Rimuovi dalla lista…" |
+| Menu progetto e `RemoveProjectDialog` | dialog*, callout, button, spinner | **un'istanza sola di ciascuno a livello di Sidebar**, con il bersaglio (id e nome del progetto) in un signal, per il dialog `AppCtx::remove_target: Option<(Id, String)>`, letto al click, mai catturato (Leptos 0.8 ricostruisce sul posto e terrebbe il vecchio handler: si rimuoverebbe il progetto sbagliato). Il dialog chiede "Rimuovere «nome» dalla lista?", dice "I file del repository e i branch atm/… restano; i worktree dell'app vengono salvati con un commit sul loro branch e rimossi; task, cronologia e allegati vengono eliminati dall'app." e rimuove sempre il **bersaglio**, non il progetto selezionato. Errore (per esempio `Busy`, "Ferma gli agenti del progetto prima di rimuoverlo"): il dialog resta aperto con una callout (un toast se nel frattempo è stato chiuso o riaperto per un altro progetto). Ok: toast "«nome» rimosso dalla lista; i branch restano", `open_task` azzerato se il bersaglio era selezionato, il dialog chiuso solo se mostra ancora quel bersaglio (non se nel frattempo è stato riaperto per un altro progetto), poi `refresh_projects` seleziona il primo progetto rimasto sul Riepilogo (o `NoProject`). "Rimuovi" è disabilitato, con lo spinner, solo mentre è in corso la rimozione del bersaglio mostrato. Il menu si chiude e rende il focus al trigger prima che il dialog si apra. Lo apre anche il bottone "Rimuovi dalla lista…" della pagina Impostazioni |
+| **Riepilogo** (pagina di atterraggio, `views/overview.rs`) | card, collapsible, badge, callout, skeleton, button, spinner | card **Descrizione** (se vuota, un link alla pagina Impostazioni); **Stato**: conteggi per colonna da `get_board` (rifatti a ogni `board_version`), agenti attivi "n in questo progetto · x/y nell'app", branch "main @ 3f2a9c1", modello predefinito ("<m> (predefinito dell'app)" o "Predefinito di Claude Code", da un `get_settings` per montaggio), configurazione (Isolata/Attendibile); **Istruzioni agenti** (CLAUDE.md, .claude/CLAUDE.md, AGENTS.md, aperti di default); **Server MCP** (tabella nome, trasporto, target, chip con i **soli nomi** delle chiavi di env e header), con la nota che i server aggiunti con `claude mcp add` stanno in `~/.claude.json`, che l'app non legge; **.claude/** (settings.json già mascherato dal backend, liste di agenti, comandi e skill); **README**. Testo `whitespace-pre-wrap` monospace come text node dentro collapsible (sempre nel DOM): il trigger ha `aria-expanded` e `aria-controls` sul testo, che da chiuso è `inert` (fuori dall'albero di accessibilità e dal focus); niente markdown. Le card di una riga della griglia hanno l'altezza del loro contenuto (`items-start`): una Descrizione breve non si allunga fino all'altezza di Stato. Badge per i file con caratteri nascosti o bidi (`⟨U+XXXX⟩`). Il **testo di `.mcp.json` non si mostra mai**: solo intestazione, note e tabella dei server. Fetch al montaggio e al cambio di progetto con guardia di generazione, più "Aggiorna"; CTA **"Apri task (N)"** (N = tutte le card di `get_board`) che passa al tab Task. Un errore del backend è una callout |
+| **Impostazioni progetto** (pagina, `views/settings/project.rs`) | input, textarea, label, select_native, callout, button | montata da capo a ogni visita del tab (niente più prop `open`); l'Effect che la riempie traccia solo `project` (la voce di menu può cambiare progetto con la pagina aperta; le modifiche non salvate si perdono) e scarta le risposte arrivate dopo un cambio di progetto. Campi: nome, **Descrizione** (textarea, contatore "n/10000" sul testo senza spazi in testa e in coda, "Salva il progetto" disabilitato oltre `MAX_PROJECT_DESCRIPTION`), branch target, modello e modalità predefiniti; sicurezza (policy, bypass, "Applica", come in M6); "Rimuovi dalla lista…" apre il `RemoveProjectDialog` condiviso (prima era un bottone a due click) |
+| Board (5 colonne; Annullati compressa) | card, badge (stato, "in esecuzione" con spinner, "Richiede approvazione", "Fallito", "Interrotto – Continua"), scroll_area, empty, skeleton, button | **DnD** (§9.3), creazione rapida in fondo alla colonna; **toolbar Kanban \| Lista** (toggle con `aria-pressed`, non persistito, Kanban a ogni montaggio; le due viste dietro `Show` su un memo, una sola nel DOM) |
+| **Lista** (`views/board/list.rs`) | badge, button, skeleton, empty | `<table>` semantica sulle stesse card e sullo stesso `get_board` della kanban: **Titolo** (un `<button>` che apre il task, con la prima riga della descrizione; `aria-current` sul task aperto) più una matita "Modifica il task", **Stato** (titolo della colonna), **Agente** (gli stessi badge della card, o "—"), **Branch**, **Aggiornato** ("oggi, 14:05", "ieri, 09:12", "12 set", "12 set 2025"). Ordine fisso: colonna, poi posizione. Con il pannello aperto Branch e Aggiornato si nascondono. "Nuovo task" (solo in Lista, nella toolbar) apre il dialog in Da fare. Niente ricerca, filtro o ordinamento (filtrare la kanban romperebbe l'indice del DnD, `widgets/dnd.rs`); nessun cambio di stato in riga (si usa "Sposta in" del pannello) |
+| Dialog task (crea/modifica) | dialog*, input, textarea, label, button | form; sezione **Allegati**: "Aggiungi file…" (`type=button`, picker nativo multiplo, token) e righe con "×". In **creazione** i file scelti restano in attesa (solo nome e dimensione): "Crea task" fa `create_task`, poi `add_task_attachments` con i token, e chiude solo dopo entrambi; se l'aggiunta fallisce il task resta e compare il toast "Task creato, allegati non aggiunti: …". In **modifica** aggiunta e rimozione sono immediate, con `get_task_detail` all'apertura e una guardia contro le risposte vecchie. Un pick oltre i 20 allegati tiene i primi file (nell'ordine del picker) che ci stanno e dice quanti ne ha lasciati fuori in un avviso (`p[role=alert]`: "Al massimo 20 allegati per task: N file non aggiunti."); la dimensione la controlla il Core. Mentre "Crea task" o "Salva" sono in corso la sezione Allegati non cambia ("Aggiungi file…" e "×" disabilitati); una risposta arrivata dopo che il dialog è stato chiuso o riaperto non lo chiude e non ne cambia lo stato (solo il toast). Con un tentativo attivo: "La cartella allegati è visibile all'agente a ogni turno: cita i nuovi file nel messaggio." |
+| Dialog "Impostazioni app" | dialog*, input, label, button, select_native | form delle impostazioni generali (§5.2), senza tab |
+| Pannello task: header | badge, button (Avvia, Stop, Scarta, Apri in Finder/Terminale/Editor), tooltip, separator | chip degli allegati (nome e dimensione, tooltip con il path assoluto); riga dell'attempt attivo "Modello: opus · Sub-agent: sonnet, max 3 (usati 1)" (parti assenti omesse, "Sub-agent: nessuno" con max 0, riga assente se non c'è nulla) |
+| Dialog Avvia | dialog*, select_native (branch target; modello: "Predefinito (x)" con x il default del progetto, poi quello delle Impostazioni app, altrimenti "CLI", e `MODEL_ALIASES` (opus/sonnet/haiku/fable); effort; **Sub-agent (max)**: "Predefinito del CLI" (nessun limite), "Nessun sub-agent" (0), 1–10; **Modello dei sub-agent**: "Predefinito del CLI" o un alias, nascosto con max 0 (e allora non inviato); modalità: Supervisionato/Auto-edit/Autonomo, quest'ultimo abilitato solo con `allow_bypass`, con sotto la descrizione della modalità scelta: Auto-edit approva da solo modifiche e comandi shell sui file del worktree e chiede per il resto, Supervisionato chiede per tutto tranne le letture, M5), callout (avviso bypass: il worktree non è una sandbox), button | nota sui sub-agent: "Il massimo vale per tutto il tentativo. Il modello vale per i sub-agent che non ne chiedono uno proprio: Explore o una chiamata con un modello esplicito possono usarne un altro."; con "Predefinito" il modello inviato è `None` e il Core risolve lo stesso default (§6.3) |
 | Tab **Agente** | message, bubble, chat (classi di layout), marker (notice e righe tool), collapsible (output tool, thinking), badge (esito TurnEnd, costo "≈ stima API", durata), alert (errori, limiti, auth, resume fallito), button (approvazioni, Continua, Nuova sessione), textarea e button (composer, disabilitato durante il turno), kbd (⌘↩), empty | **lista del transcript** (§9.4), **card di approvazione** (tool, input completo, motivo; "Consenti", "Consenti sempre (attempt)" solo se `can_remember`, "Nega", "Nega e ferma", campo messaggio), annidamento dei subagent tramite `parent_tool_use_id`, riga di anteprima digitazione |
 | Tab **Modifiche** (`DiffView{attempt_id, task}`) | collapsible (un file per blocco), badge (A/M/D/R, +/−), button (Aggiorna, Merge, Risolvi con l'agente, Elimina branch), alert (conflitti, target avanti di N commit, checkout del target sporco, HEAD non corretto), skeleton, empty | **viewer diff** (righe con numeri e colori per `LineKind`, "mostra tutto" oltre 2000 righe, segnaposto per binari, file troppo grandi e omessi); dialog* di merge con messaggio modificabile; dialog* di conferma per lo scarto |
 | Toast | classi di alert | `Toaster` (Vec in un signal, al massimo 4, rimossi dopo 5 s) |
 
 `*` = componente portato.
+
+**Contratto selettori DOM** (round feature del 2026-09-29, fissato in Fase A): l'E2E (`ui/src/e2e.rs`) li usa, le viste li rispettano.
+
+| Elemento | Selettore |
+|---|---|
+| Tab progetto | `[data-project-view=overview\|tasks\|settings]` |
+| Radici delle pagine | `[data-view=overview]`, `[data-view=task-list]`, `[data-testid=project-settings]` |
+| Voce progetto in sidebar | `[data-testid=projects] [data-project=<nome>]` |
+| Menu progetto | trigger `[data-action=project-menu]`, contenuto `[data-name=ContextMenuContent]`, voci `[data-action=menu-settings\|menu-remove]` |
+| Dialog di rimozione | `data_name_prefix="RemoveProjectDialog"`, conferma `[data-action=confirm-remove]` |
+| Overview | `[data-overview-file="CLAUDE.md"]`, `[data-mcp-server=<nome>]` |
+| Vista task | toggle `[data-task-view=kanban\|list]`, righe `[data-row-task-id]` |
+| Allegati | `[data-action=add-attachment]`, `[data-attachment]` |
+| StartDialog | `#start-max-subagents`, `#start-subagent-model` |
+
+Hook aggiunti dai pacchetti UI oltre al contratto (stessa regola: l'E2E li usa, le viste li rispettano):
+
+| Elemento | Selettore |
+|---|---|
+| Tab e pagine | tab `button[role=tab][data-project-view=<v>]#project-tab-<v>` dentro `[data-view=topbar] [role=tablist]`; pagine `main > #project-page-<v>[role=tabpanel]` (`main` senza ruolo esplicito); la pagina Task contiene `section[data-view=board]` e, con un task aperto, `aside > [data-view=task-panel]` |
+| Sidebar | ogni voce è `li.group` con `button[data-project=<nome>]` (`aria-current="true"` se selezionata, etichetta nel primo `<span>`) e il trigger `button[data-action=project-menu]` (opacità 0 fuori da hover e focus, ma cliccabile); il `contextmenu` si ascolta sul `<li>`. Il bottone del piede dice "Impostazioni app" e apre il dialog con `data_name_prefix="Settings"`, che contiene `[data-testid=app-settings]` |
+| Menu progetto | `[role=menu][data-name=ContextMenuContent][aria-label="Azioni per «nome»"]`, montato sotto il `<nav>` della sidebar solo quando è aperto; voci `button[role=menuitem][data-action=menu-settings\|menu-remove]` |
+| Rimozione | `[data-name=RemoveProjectDialogContent]`, errore `[data-remove-error]`; nella pagina Impostazioni `[data-testid=project-settings] [data-action=remove-project]` |
+| Riepilogo | `[data-action=refresh-overview]`, `[data-action=open-tasks]` ("Apri task (N)"), `[data-testid=project-description]` o `[data-action=edit-description]`, `[data-testid=overview-counts] [data-count=todo\|inprogress\|inreview\|done\|cancelled]`, `[data-testid=overview-running\|overview-branch\|overview-config]`, `[data-hidden-chars]`, `tr[data-mcp-server=<nome>]`, `[data-claude-dir=agents\|commands\|skills]`, `[data-overview-error]` |
+| Impostazioni progetto | `#project-name`, `#project-description`, `[data-testid=project-description-count]`, `#project-branch`, `#project-model`, `#project-mode`; sicurezza invariata (`#project-policy`, `#project-bypass`, `[data-action=apply-security]`, `[data-trust=…]`) |
+| Board e Lista | `[data-testid=board-toolbar]`, `button[data-task-view=kanban\|list][aria-pressed]`; `[data-testid=columns]` solo in Kanban, `[data-view=task-list]` solo in Lista (un check sulla Lista torna a Kanban prima di usare `[data-column]`); righe `tr[data-row-task-id=<id>]` (titolo = primo `button` della riga, matita `button[aria-label="Modifica il task"]`), `[data-action=new-task]`; nessun `data-task-id` nella Lista |
+| Dialog task | `[data-name=TaskDialogContent] [data-testid=attachments]`, righe `li[data-attachment=<nome>]` con `button[data-action=remove-attachment]`, avviso del limite `p[role=alert]`, `[data-testid=attachments-hint]` |
+| Pannello task | chip `[data-view=task-panel] header li[data-attachment=<nome>]` (`title` = path), `[data-testid=attempt-meta]` |
+| StartDialog | `#start-model` (prima opzione `""` = "Predefinito (x)"), `#start-max-subagents` (valori `""`, `0`…`10`), `#start-subagent-model` (`""` e gli alias; assente dal DOM con max `0`), `[data-testid=subagent-help]` |
 
 **Aggiornamento del tab Modifiche:**
 - all'apertura del tab;
@@ -1260,11 +1386,13 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 | Configurazione del repo eseguita sotto `-p` (hook, env, `apiKeyHelper`, MCP, regole `permissions.allow`) | Isolated di default (`--setting-sources=user --strict-mcp-config`). Trusted solo con **conferma nativa** (che nomina il repository per path, non per nome modificabile, il branch e il commit approvati e le regole che consentono un tool intero) e fingerprint della configurazione **committata sul tip del branch target** (da cui partono i worktree; i file locali del checkout principale non contano), esteso ai file del repo che la configurazione esegue, ricontrollato sul worktree a ogni turno e al suo `system/init`: se non corrisponde, il turno gira Isolated (o viene fermato) con una Notice che dice cosa è diverso (il worktree, o il commit di partenza da riapprovare). Ciò che si conferma è ciò che si salva (compare-and-set). Riapprovare un fingerprint scaduto chiede di nuovo la conferma. Mai Trusted un repo che è `$HOME`. Link seguiti solo dentro il repo, aperture relative al descrittore della radice con `O_NOFOLLOW` (§8.9). Warning quando si aggiunge il progetto. Non coperta l'esecuzione indiretta (§8.9). Accettazione di M6: `tests/flow.rs::malicious_repo_config_runs_only_when_trusted_and_unchanged`, `trusted_config_covers_the_script_an_mcp_server_runs`; del commit (2026-09-29): `trusted_approves_the_target_tip_not_the_working_tree`, `tests/git.rs::commit_config_is_the_config_of_a_checkout_of_it`, `commit_config_limits_and_links` |
 | Codice del repo eseguito dal git dell'app | Runner del §8.1: hook, merge driver, filter driver e programmi `gpg` della configurazione del repository spenti; mai il fetch pigro di un partial clone (`GIT_NO_LAZY_FETCH=1` su ogni chiamata, git ≥ 2.44 o nessuna chiamata); l'env di git senza chiavi API né variabili di una sessione padre |
 | Prompt injection che porta a comandi distruttivi | Auto-edit di default (M5 [V]: in `acceptEdits` il CLI 2.1.283 approva da solo i comandi Bash che leggono o scrivono file nel cwd, per esempio `printf … >> README.md`; gli altri chiedono. In Supervisionato `ls` passa da solo, `touch` e `python3 -c` chiedono; un `sleep N` isolato il CLI lo blocca e suggerisce `run_in_background`); deny rules via `--settings`; bypass solo con opt-in, conferma nativa e `--allow-dangerously-skip-permissions`; la UI dice chiaramente che il worktree **non è una sandbox** |
-| XSS nella webview che abusa dell'IPC | CSP senza `unsafe-inline` negli script; solo text node; nessun `inner_html`; nav guard (plugin con `on_navigation`: consente solo `tauri://localhost`, `http://tauri.localhost` e in dev `http://localhost:1420`); `open_url` solo `http(s)`; **conferme native** (non cliccabili da un XSS) per bypass, Trusted, passthrough della chiave API e percorso di Claude Code, con il testo su una riga senza caratteri di controllo o di direzione; il nome del progetto non li può contenere |
+| XSS nella webview che abusa dell'IPC | CSP senza `unsafe-inline` negli script; solo text node; nessun `inner_html`; gli allegati passano solo per token del picker nativo (riga sotto); nav guard (plugin con `on_navigation`: consente solo `tauri://localhost`, `http://tauri.localhost` e in dev `http://localhost:1420`); `open_url` solo `http(s)`; **conferme native** (non cliccabili da un XSS) per bypass, Trusted, passthrough della chiave API e percorso di Claude Code, con il testo su una riga senza caratteri di controllo o di direzione; il nome del progetto non li può contenere |
 | Fatturazione API silenziosa (requisito: agenti solo con l'abbonamento) | Chiavi rimosse dall'env (passthrough solo con `allow_env_api_key`, conferma nativa e banner); banner su `authMethod`, `apiProvider`, sui `CLAUDE_CODE_USE_*` e su `ANTHROPIC_BASE_URL` (e gli endpoint dei provider) dell'ambiente (`EnvStatus.base_url_env`, §7.2); warning su `apiKeySource` diverso da `none` o assente; **Trusted mai approvato** per una configurazione del repo con `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` o con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`/`_VERTEX`/`_FOUNDRY` in `env` (`git::BILLING_SETTINGS_KEYS`/`BILLING_ENV_VARS`, `Invalid` che nomina la chiave), anche in un file che il filesystem apre come uno dei due file di impostazioni sotto un altro nome (`.claude/Settings.json` su APFS: nel worktree conta, nel commit non è verificabile), e un worktree che le acquista gira Isolated, o viene ucciso al `system/init` se le acquista mentre il CLI parte (§8.9); **in ogni turno** un `system/init` con `apiKeySource` fuori da `NO_API_KEY_SOURCES` e il passthrough spento ferma subito il turno (`failed`, Notice; §7.6); `ATM_CLAUDE_PATH` vincolante (§7.1); `claude_path_override` solo con conferma nativa e fuori dai repository. Test: `tests/flow.rs::trusted_is_refused_when_the_config_bills_outside_the_subscription`, `a_worktree_config_that_bills_outside_the_subscription_runs_isolated`, `an_api_key_source_stops_the_turn_unless_the_passthrough_is_on`, `a_settings_file_under_another_case_is_checked_like_the_settings`, `a_billing_key_gained_during_the_cli_start_kills_the_turn_at_once`, `tests/claude.rs::api_key_and_cloud_provider_detection` |
 | App lanciata da dentro una sessione Claude Code (o da un terminale cmux o IDE) | Le variabili della sessione padre (id, messaggi, effort, PID, …) e del suo host (`CMUX_*`, IDE, e il `NODE_OPTIONS` con cui cmux fa caricare il suo modulo a ogni programma node, riportato a quello dell'utente) non arrivano agli agenti né a git e lasciano anche il processo dell'app, che all'avvio si ri-esegue senza (§7.2); verificato da `tests/claude.rs`, `tests/flow.rs` e dall'E2E (anche con `ps -E` dell'app). Resta vero che i processi antenati ancora vivi (la shell o la sessione che ha lanciato l'app) hanno quelle variabili, leggibili con `ps -E` da ogni processo dello stesso utente: per non esporle agli agenti si lancia l'app da un terminale pulito o dal Finder |
+| Allegati dei task: una webview compromessa che fa copiare all'host un file segreto (Portachiavi, `~/.ssh`, `~/.aws`, il DB e i log dell'app) in una cartella che l'agente legge senza chiedere (round feature del 2026-09-29) | **Il picker è l'autorità**: la webview non passa mai un path. `pick_attachment_files` apre il picker nativo nel guscio e consegna i path solo a `Core::stage_picks`; la webview riceve `PickedFile{token, name, size}` e `add_task_attachments` accetta solo token, **monouso**, validi **10 minuti**, al più **100** in memoria (i più vecchi scartati), al più 20 file per pick; un pick è tutto o niente. Difesa in profondità sul path, **canonicalizzato** (link risolti): rifiutato se sta sotto `~/.claude*` (ogni voce della home che inizia per `.claude`, in qualunque maiuscola, e il target di una tale voce se è un link), `$CLAUDE_CONFIG_DIR`, `~/.ssh`, `~/.aws`, `~/Library/Keychains`, la cartella dati o quella della cache dell'app (confronto ASCII senza maiuscole, come APFS; anche le forme canoniche delle cartelle); poi `symlink_metadata().is_file()`; poi apertura con `O_NOFOLLOW\|O_NONBLOCK` (un file sostituito da un link dopo lo staging dà `ELOOP`, una FIFO non blocca), `fstat` regolare e ≤ 25 MiB (`MAX_ATTACHMENT_BYTES`), copia con `take(MAX+1)`. Alla copia il file riaperto deve essere **lo stesso** dello staging (device e inode dell'`fstat`, salvati con il token): una cartella del percorso sostituita da un link, un hard link o un rename sopra il file danno "«nome» è cambiato dopo la scelta (sostituito o spostato): sceglilo di nuovo"; una modifica sul posto dello stesso file no. Il nome viene da `file_name()` senza caratteri nascosti o bidi; vuoto, `.`, `..` o con un apice inverso è rifiutato, oltre 120 caratteri è accorciato (estensione fino a 16 caratteri tenuta). Gli errori nominano solo il file, mai il path intero. Le copie stanno in `data_dir/attachments/…` (dir 0700, file 0600 `create_new`), fuori da ogni worktree e da git (`git add -A` non le vede); aggiunta e rimozione girano sotto il lock del task e una transazione riconta e inserisce, e a ogni errore (anche la FK di un task appena cancellato) le cartelle appena create si rimuovono. All'agente: `--add-dir` sulla cartella del task e i path nel prompt (§7.3, §7.4), nessuna regola deny: Bash può modificare le copie, mai gli originali (§13). Test: `tests/flow.rs::attachments_reach_the_agent_and_go_with_the_task`, `removing_the_project_removes_its_attachments_and_logs`, `picks_outside_the_rules_are_refused`, `tokens_are_single_use_and_the_copy_checks_again`, `the_attachment_limit_removes_the_copies_it_refuses`, `staged_picks_expire_and_the_oldest_go_first` |
+| Riepilogo del progetto: il testo del repository mostrato all'utente (segreti, caratteri che ingannano, file fuori dal repo) | Letto dal **commit in cima al branch target predefinito** (`ls-tree` e `cat-file --batch` sul runner irrobustito del §8.1, sola lettura), mai dal checkout principale, mai da `$HOME` (repo che è la home: `Invalid`), mai da `~/.claude.json` (i server aggiunti con `claude mcp add` non compaiono). Nessun link seguito: un symlink mostra solo "→ target". Segreti mascherati (`•••`) a ogni profondità in `.claude/settings.json` e `.mcp.json`: i valori di `env` e `headers`, ogni chiave che finisce in `Helper` più `awsAuthRefresh`/`awsCredentialExport`, e dal valore di ogni chiave `url` (e dall'URL di un server MCP) userinfo, query e fragment, anche nelle forme che il parser WHATWG del CLI accetta senza `scheme://` (`https:/`, `https:///`, `https:\\`, spazi in testa e in coda, tab e a capo interni); un JSON non valido non si mostra mai grezzo ("JSON non valido"). I server MCP si riducono a nome, trasporto, target e **nomi** delle chiavi di env e header; la UI non rende mai il testo di `.mcp.json`. Caratteri nascosti e bidi resi visibili lato server come `⟨U+XXXX⟩` (con un badge), `\r\n` → `\n`; solo testo semplice, mai HTML né markdown. Limite: il mascheramento è euristico, un segreto dentro `command`/`args`, nel comando di un hook, nel path di un URL o in un URL sotto una chiave diversa da `url` (o dentro un altro testo) si vede. Test: `tests/git.rs::overview_masks_every_secret` (nessuna sottostringa "secret" nell'overview serializzato), `overview_strips_lax_urls_too`, `overview_shows_the_committed_context_in_order`, `overview_notes_what_it_does_not_show`, `core_overview_reads_the_target_tip_and_never_home` |
 | Attacchi di rete | Nessun socket TCP/UDP in ascolto. L'unico socket in ascolto è quello Unix del plugin single-instance (`/tmp/dev_aitaskmanager_desktop_si.sock`, release e debug senza selftest/E2E): riceve cwd e argv di un secondo avvio e porta avanti la finestra. `/tmp` è condiviso tra gli account: se a quel path c'è un socket di un altro utente, che altrimenti riceverebbe il lancio e lo farebbe uscire con 0, l'app spegne il controllo di istanza singola e lo dice sullo stderr (M6-REVIEW) |
-| Fuga di segreti | Log 0600 in dir 0700; valori dell'env mai registrati; transcript solo locali, cancellati con il progetto |
+| Fuga di segreti | Log 0600 in dir 0700; valori dell'env mai registrati; transcript solo locali; righe, log grezzi (`logs/<attempt>`) e allegati cancellati con il task o il progetto (§4) |
 | Iniezione di comandi | Sempre argv; `--flag=value`; prompt solo via stdin come JSON; branch validati; target presi dalla lista dei ref; `-z` e `--` ovunque. Nel `.command` c'è solo il path di claude, con escape |
 | Perdita di dati | Commit di snapshot prima di ogni rimozione; mai rimozione automatica di lavoro non mergiato; `update-ref` CAS; `ff-only`; branch tenuti |
 | Processi orfani | Process group, stop sequence, `killpg` del gruppo residuo più i discendenti del leader registrati mentre viveva (i comandi Bash del CLI hanno gruppi propri, §7.4 passo 4), shutdown ordinato, recovery con kill verificato. Non coperti: i discendenti di un leader morto da solo senza `result` o insieme all'app (§7.9) |
@@ -1431,7 +1559,7 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 - Verifica prestazioni con `flood` e 3 agenti fake.
 - Controllo finale dei grep.
 - Probe di debug solo sotto `cfg(debug_assertions)`. **Fatto (M6-PKG):** anche i driver della UI (`ui/src/selftest.rs`, `ui/src/e2e.rs`) sono fuori dalla release: esistono solo con la feature `testkit` di `atm-ui`, che `cargo tauri dev` passa sempre (`trunk serve --features testkit`) e le build di debug che si guidano da sole aggiungono con `--config src-tauri/tauri.testkit.conf.json` (`trunk build --release --features testkit`); `cargo tauri build` usa il `beforeBuildCommand` senza. `scripts/check.sh` fa clippy su release, `testkit` e `mock` e fallisce se `tauri.conf.json` o `ui/src/main.rs` li rimettono nella release; `scripts/release.sh` controlla con `strings` il WASM e il binario di release (1,73 MB contro 2,02 MB del WASM `testkit`, che i nomi li contiene).
-- **Fatto (M6-PKG):** icona kanban (`src-tauri/icons/icon.svg`, PNG 1024 con `scripts/render-icon.swift`, poi `cargo tauri icon`); `scripts/release.sh` → `AI Task Manager.app` (9,9 MiB) e `AI Task Manager_0.1.0_aarch64.dmg` (5,5 MiB), non firmati (Gatekeeper nel README), con `CI=true` perché l'AppleScript del bundler che impagina il .dmg nel Finder va in timeout (-1712) senza il permesso Automazione; la riga `get_env` su stderr (percorso e versione di claude e di git, login senza email) c'è anche in release e Impostazioni → Generali dice "In uso: Claude Code … ; git …".
+- **Fatto (M6-PKG):** icona kanban (`src-tauri/icons/icon.svg`, PNG 1024 con `scripts/render-icon.swift`, poi `cargo tauri icon`); `scripts/release.sh` → `AI Task Manager.app` (9,9 MiB) e `AI Task Manager_0.1.0_aarch64.dmg` (5,5 MiB), non firmati (Gatekeeper nel README), con `CI=true` perché l'AppleScript del bundler che impagina il .dmg nel Finder va in timeout (-1712) senza il permesso Automazione; la riga `get_env` su stderr (percorso e versione di claude e di git, login senza email) c'è anche in release e Impostazioni → Generali (dal round feature del 2026-09-29 il dialog "Impostazioni app") dice "In uso: Claude Code … ; git …".
 
 - **Fatto (2026-09-29, tre scelte dell'utente: gli agenti solo con l'abbonamento):** (1) Trusted mai approvato per una configurazione del repo che fattura fuori dall'abbonamento, un worktree che la acquista gira Isolated, e ogni turno il cui `system/init` riporta una chiave API viene fermato (§7.6, §8.9); (2) approvato il commit di punta del branch target, letto con `git cat-file` dal runner irrobustito, non il checkout principale: i file locali non bloccano più Trusted, un branch andato avanti chiede di riapprovare (§8.9); (3) `NODE_OPTIONS` di cmux tolto o riportato a quello dell'utente in ogni figlio e nella ri-esecuzione dell'app (§7.2). Dopo la revisione: file di impostazioni riconosciuti per ciò che il filesystem apre (APFS), link risolti senza `realpath`, visita del commit limitata e i suoi errori `Invalid` in cache (§8.9); `GIT_NO_LAZY_FETCH` su ogni chiamata git e git ≥ 2.44 (§8.1); `ANTHROPIC_BASE_URL` dell'ambiente mostrato nel banner (§7.2); al `system/init` il gruppo congelato durante il ricontrollo e ucciso se la configurazione è cambiata (§8.9). Test: `tests/flow.rs` (approvazione rifiutata, fallback per turno, stop su `apiKeySource`, approvazione del tip), `tests/git.rs` (commit = checkout, limiti e link del commit, chiavi di fatturazione), `tests/claude.rs` (regola di `NODE_OPTIONS`), `tests/normalize.rs` (`api_key_billing`), l'E2E (`NODE_OPTIONS` di cmux nell'ambiente dell'app, assente da `ps -E` dell'app e dagli agenti).
 - **Fatto (M6-REVIEW, revisione di sicurezza):** fingerprint esteso ai file che la configurazione esegue, con directory contate e aperture relative al descrittore della radice (§8.9); approvazione e stato di sicurezza compare-and-set, riduzioni applicate anche se l'aumento viene annullato, revoche che fermano i turni che le usano, ricontrollo al `system/init` (§8.9); motivo di un fingerprint non calcolabile nella Notice e nelle Impostazioni; variabili dell'host (cmux, IDE) tolte e l'app che si ri-esegue senza le variabili della sessione padre (§7.2); probe con cwd `/` (§7.1); `claude_path_override` con conferma nativa e validato; filter driver e `gpg` del repository spenti nel git dell'app, che non riceve più chiavi API (§8.1); conferme con il path del repository su una riga e nomi di progetto senza caratteri nascosti; socket del single-instance dichiarato e ignorato se di un altro utente (§10.2); un `result` di errore arrivato prima dell'interrupt resta un errore col suo testo.
@@ -1443,6 +1571,23 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 4. 0 violazioni CSP su tutte le schermate (selftest di release: build con flag `--debug` solo per la console, poi controllo manuale nella release). **Fatto (M6-PKG):** 0 violazioni sulle tre fasi dell'E2E (bundle di debug con asset incorporati e la stessa CSP, `eval` bloccato) e nel selftest; la release (senza contatore) si apre e disegna board e Impostazioni.
 5. Dopo una reinstallazione DB, log e worktree sono ancora lì. **Fatto (M6-PKG):** `scripts/e2e.sh` installa il bundle di debug nella cartella del giro e tra le fasi 1 e 2 ci copia sopra un bundle nuovo: DB, 18 log e 2 worktree intatti, la fase 2 riparte sui dati. Con il `.app` di release (installato in una cartella temporanea, `HOME` sui dati di un giro `--perf`): reinstallato con `ditto` (inode nuovo), 1 progetto, 3 task, 3 attempt, 30 009 entry, 9 log (stesso hash) e 3 worktree prima e dopo, e la board mostra i tre task.
 6. (Verifica prestazioni) **Fatto (M6-PKG):** fase 3 dell'E2E (`scripts/e2e.sh --perf` da sola): Agenti in parallelo = 3, tre `[fake:flood]` da 10 000 testi (pausa di 100 ms ogni 100, `FAKE_CLAUDE_FLOOD_PAUSE_MS`) avviati dalla UI, l'ultimo aperto: 3 turni in ~11 s con ~10 s di sovrapposizione, un timer da 20 ms mai più di 27 ms in ritardo, cambio tab Modifiche/Agente visibile al primo controllo (51–55 ms, polling a 50 ms), al massimo 300 righe nel DOM, turni `completed/success` con tutti i testi. I due tempi valgono solo a pagina visibile (una pagina nascosta, con lo schermo bloccato o la finestra coperta, ha i timer a 1 Hz): la finestra resta sopra le altre durante la fase, i campioni contano solo a pagina visibile e altrimenti il report dice `perf_responsiveness: "not measured (page hidden)"` (avviso nel giro completo, errore con `--perf`); la finestra dei bundle `testkit` ha `backgroundThrottling: disabled`, così una pagina nascosta non viene sospesa (prima il giro restava fermo fino al watchdog).
+
+#### Round feature 2026-09-29: pagina progetto, allegati, vista lista, sub-agent
+
+Stesse regole del §11.1 (Opus, al massimo 15 agent per workflow, un worktree per pacchetto su `wp/f-<pkg>`, merge `--no-ff` su `wp/f-int`, `check.sh` dopo ogni merge; i commit su `main` li fa l'utente).
+
+| Fase | Pacchetto | Ownership |
+|---|---|---|
+| A | CONTRATTI | tipi (`atm-types`), migrazione 0002 e `db.rs`, wrapper finale `Core::get_project_overview` e stub dei metodi degli allegati, `git/overview.rs` stub, `attachments.rs` (layout su disco), comandi Tauri (`pick_attachment_files` completo), dichiarazioni e stub UI, mock, spec §5, §6, §9.2 |
+| B1 | CORE-RUNNER | `lib.rs`, `claude.rs`, `runner.rs`, `runner/turn.rs`, `bin/fake-claude.rs`, `attachments.rs`; `tests/{flow,claude,real_cli}.rs` |
+| B2 | CORE-OVERVIEW | `git/overview.rs`, `tests/git.rs` |
+| B3 | UI-SHELL | `app.rs`, `views/{sidebar,settings,settings/project,overview}.rs`, `widgets/context_menu.rs`, `ipc/mock/overview.rs` |
+| B4 | UI-TASKS | `views/{board,board/list,task_dialog,task_panel,start_dialog}.rs`, `state/board.rs`, `ipc/mock/attachments.rs` |
+| C1 | MERGE | merge in ordine RUNNER → OVERVIEW → SHELL → TASKS su `wp/f-int`; spec §7.3, §7.8, §9.2, §10, §12.2, §13, §14, README |
+| C2 | E2E | `ui/src/e2e.rs`, `src-tauri/src/e2e.rs`; `scripts/e2e.sh` verde |
+| D | REVIEW | backend e sicurezza, UI/Leptos/a11y, test e spec; verifica avversariale dei finding HIGH, poi un agent di fix |
+
+Item `pub` congelati durante B: `sidebar::{add_repository, projects_loaded}`, `start_dialog::mode_help`, `board::{column_title, NoProject}`, `git::overview::{Source, read}`.
 
 ---
 
@@ -1457,6 +1602,7 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
   - registra argv, cwd, `$PWD` e la presenza di `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `GIT_DIR`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, delle altre variabili di una sessione padre e del suo host (`RECORDED_VARS`), di `NODE_OPTIONS` e `CMUX_ORIGINAL_NODE_OPTIONS_PRESENT` e di `CLAUDE_CONFIG_DIR` in `$FAKE_CLAUDE_RECORD` (una riga JSON per chiamata);
   - `system/init.apiKeySource` (2026-09-29) vale `none`, oppure `ANTHROPIC_API_KEY` se quella variabile gli arriva non vuota, oppure `apiKeyHelper` dopo un helper del repo (sotto), oppure il valore di `FAKE_CLAUDE_API_KEY_SOURCE`, che vince su tutti: così i test vedono l'app fermare un turno che fatturerebbe via API;
   - con `FAKE_CLAUDE_PROJECT_CONFIG=1` (M6) carica la configurazione del repo come il CLI reale: salvo `--setting-sources` senza `project` (o `local`), esegue con `sh -c` gli hook `SessionStart` di tipo command e l'`apiKeyHelper` di `.claude/settings.json` (o `settings.local.json`); salvo `--strict-mcp-config`, avvia i server di `.mcp.json` con `command`; registra ogni esecuzione (`kind: "project_config"`) e riporta server e `apiKeySource: "apiKeyHelper"` in `system/init`;
+  - registra anche, per ogni messaggio utente, `{"kind":"turn",…,"prompt":<testo intero>}` (round feature del 2026-09-29: così un test vede la sezione `## Attachments` del prompt, §7.4) e, nello scenario `subagents`, ogni risposta dell'host a uno spawn come `{"kind":"subagent","n":i,"behavior":"allow"|"deny","message":…}`;
   - risponde a `initialize` (tranne `noinit`);
   - a ogni messaggio utente esegue lo scenario scelto con `[fake:NOME]` nel testo, altrimenti `$FAKE_CLAUDE_SCENARIO`, altrimenti `simple`;
   - esce con 0 all'EOF di stdin.
@@ -1478,6 +1624,7 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 | `usage_limit` | `result` con testo di limite d'uso |
 | `auth_fail` | `result` con testo "Not logged in · Please run /login" |
 | `resolve_merge` | `git merge <FAKE_CLAUDE_TARGET>`, risolve concatenando le versioni, `git commit --no-edit` |
+| `subagents` | `FAKE_CLAUDE_SUBAGENTS` spawn (default 3) uno dopo l'altro, ciascuno un `tool_use` `Agent` più un `can_use_tool`; registra ogni risposta (`kind: "subagent"`) e chiude con `result` success (round feature del 2026-09-29) |
 
 - Sull'interrupt risponde success ed emette `result` `error_during_execution` (tranne `hang_ignore`).
 - Le forme JSON seguono le catture reali di M5 (`tests/fixtures/real/`): risposta a `initialize` con `account`, `system/status` prima di ogni richiesta, `rate_limit_event` dopo il primo messaggio assistant, `can_use_tool` con `display_name`, `description`, `decision_reason` stringa e le tre suggestion (`addRules`, `addDirectories`, `setMode`), risposta all'interrupt `{"still_queued":[]}` seguita da `[Request interrupted by user]`. Il `sleep` di `hang_ignore` guida un process group suo, come i comandi del tool Bash reale.
@@ -1498,6 +1645,18 @@ Se M0 conferma che `atm-ui` compila per l'host, si aggiunge anche `cargo test -p
 12. `[fake:usage_limit]` → banner di pausa → "Riprendi". `[fake:auth_fail]` → torna il gate.
 13. (M6) Sicurezza, `security_confirmations` nella fase 2: le conferme native ricevono la risposta che il run mette in coda (`debug_e2e_queue_confirm`, solo build di debug con `ATM_E2E=1`, come il folder picker); il run vede ogni conferma chiesta e il suo testo. Attendibile + Annulla → resta Isolato; + OK → Trusted e `trusted`, annotato nelle impostazioni del progetto; bypass + OK → consentito; abbassare entrambi non chiede nulla. Passthrough della chiave API + OK → banner nella topbar; disattivarlo non chiede nulla. Al passo 7 il `TurnEnd` del turno fermato dice "Interrotto dall'utente" senza `[ede_diagnostic]`; nessun agente riceve le variabili di una sessione Claude Code padre (`scripts/e2e.sh` le imposta all'app).
 14. (M6) Il giro gira un bundle `.app` di debug (con `testkit`) installato nella sua cartella: dopo l'uscita del passo 8 lo reinstalla (copia nuova sopra) e controlla che DB, log e worktree restino; `pgrep -f` della copia di fake-claude del giro è vuoto dopo ogni uscita. Fase 3: `[fake:flood]` su 3 attempt concorrenti con reattività e finestra del DOM misurate (§11.2 M6).
+15. (Round feature del 2026-09-29; i dettagli stanno in `ui/src/e2e.rs` e, per le fixture, in `src-tauri/src/e2e.rs`) La pagina del progetto cambia il percorso: selezionare un progetto atterra sul **Riepilogo**, quindi
+    - `select_main`/`select_tasks` cliccano sempre il tab `[data-project-view=tasks]` e aspettano le colonne (`[data-column=todo] [data-card-list]`); `exit_during_turn` passa prima ai Task;
+    - le Impostazioni si dividono: `open_app_settings()` apre il dialog "Impostazioni app" senza tab (usata per gli agenti in parallelo e il passthrough della chiave API), `open_project_settings()` apre il tab Impostazioni di `main` e restituisce `[data-testid=project-settings]` (usata dalle conferme di sicurezza);
+    - le voci della sidebar si leggono da `[data-testid=projects] [data-project]`, non da ogni `button` (c'è anche il "⋯").
+    - **Fixture** (`create_repos` del backend): il repo `mcp` **committa** sul branch target un `CLAUDE.md` ("# Istruzioni E2E") e un `.mcp.json` con il server `e2e-tools` (`command`, `args` e `env: {TOKEN: "secret-value"}`; il Riepilogo legge solo il commit); il repo `da-rimuovere` (solo un README) e il file da allegare `attach/specifiche-e2e.txt`, fuori da ogni cartella che il Core rifiuta; `main` resta com'è.
+    - **Passo 3** (fase 1): dopo i tre rifiuti si aggiunge prima `mcp` (toast e avviso su `.mcp.json` e Isolato), che atterra sul suo Riepilogo (`overview_of_mcp`): card CLAUDE.md con "non caricato" e "letto dall'agente su istruzione del prompt", riga `[data-mcp-server=e2e-tools]` con `stdio` e la chiave `TOKEN`, blocchi di README.md e `.mcp.json`, configurazione "Isolata"; `secret-value` non compare né nel markup della pagina (testo e attributi) né nella risposta di `get_project_overview`; la pagina è `main > #project-page-overview[role=tabpanel]`, con `main` senza ruolo; il blocco di CLAUDE.md è aperto, quello di README.md chiuso con il testo `inert` finché il suo trigger (`aria-expanded`, `aria-controls`) non lo apre; "Apri task (0)" porta alla sua board vuota. Poi si aggiunge `main`, che atterra sul proprio Riepilogo (il README, nessun CLAUDE.md), e si passa ai suoi Task.
+    - **Fase 2**, dopo `security_confirmations` e `csp_enforced`, nell'ordine:
+      - `task_list_view` su `main`: la Lista mostra una riga `tr[data-row-task-id]` per card, nell'ordine di `get_board` (colonna, poi posizione) e con il titolo della colonna, nessuna card; il titolo di T4 apre il suo pannello e nasconde Branch e Aggiornato; Kanban riporta le colonne;
+      - `attachment_to_the_agent`: aggiunge il progetto `da-rimuovere` (atterra sul Riepilogo) e dal dialog crea un task con "Aggiungi file…", che prende il file messo in coda con `debug_e2e_queue_pick`, copiato in `<data_dir>/attachments/<progetto>/<task>/<id>/specifiche-e2e.txt`; lo avvia con "Nessun sub-agent": il primo turno ha nel prompt `## Attachments` con il path della copia e "read-only", e nell'argv `--add-dir=…/attachments/<progetto>/<task>` e `--disallowedTools=AskUserQuestion,Agent,Task,Workflow`; il pannello mostra il chip dell'allegato e "Sub-agent: nessuno";
+      - `subagent_limit`: sullo stesso progetto un task `[fake:subagents]` (tre spawn) avviato con "Sub-agent (max)" 2 e modello haiku ha `--disallowedTools=AskUserQuestion,Workflow`, nessun `--add-dir`, `"ask":["Agent","Task"]` e `CLAUDE_CODE_SUBAGENT_MODEL=haiku` nelle `--settings`; l'host risponde allow, allow, deny, quest'ultimo con "Sub-agent limit for this task reached (2)."; DB e pannello dicono "Sub-agent: haiku, max 2 (usati 2)";
+      - `project_removal`: con `main` selezionato, il menu di `da-rimuovere` si apre con un `contextmenu` sintetico che la pagina deve annullare (voci Impostazioni progetto e Rimuovi dalla lista…, trigger "⋯" `aria-expanded`) e si chiude con un `pointerdown` fuori; riaperto, "Rimuovi dalla lista…" → `RemoveProjectDialog` ("Rimuovere «da-rimuovere» dalla lista?") → "Rimuovi": il progetto sparisce dalla sidebar e da `list_projects`, `main` resta selezionato sulla sua board, il task del progetto dà `get_task_detail: NotFound`, gli allegati e i log dei due attempt spariscono dalla cartella dati e i worktree dal disco e da git; branch e checkout restano.
+    - **Errori IPC attesi**: il giro confronta, nell'ordine, i comandi falliti con quelli che provoca: nella fase 1 i tre `add_project: Invalid` del passo 3 (`EXPECTED_FAILURES`); nella fase 2, tutti dopo il passo 10, `["set_project_security: Invalid", "get_task_detail: NotFound"]` (`EXPECTED_FAILURES_PHASE2`: Attendibile + Annulla, poi il task del progetto rimosso); nella fase 3 nessuno.
 
 ### 12.3 Checklist con il CLI reale (M5, eseguita dall'utente)
 
@@ -1541,6 +1700,9 @@ M5 (2026-09-28) l'ha eseguita l'agente, con l'OK esplicito dell'utente e **solo 
 | R10 | Nessun E2E automatico su WKWebView | Logica in `atm-core` testata con fake-claude; UI in mock nel browser; selftest; checklist manuali |
 | R11 | I worktree non hanno `node_modules`, `.env` e cache | Accettato in v1 (i primi turni sono più lenti); script di setup e `copy_files` rimandati |
 | R12 | Transcript del CLI in `~/.claude/projects/<worktree>` | Documentato; l'app non li tocca per policy |
+| R13 | Il modello dei sub-agent non è garantito: per il CLI `CLAUDE_CODE_SUBAGENT_MODEL` è la fonte con la priorità più bassa. Vincono il `model` della chiamata Agent e quello del frontmatter dell'agente (Explore ha `inheritCap: "opus"`); `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` li scavalcherebbe, ma si è visto solo nel bundle e non si usa (round feature del 2026-09-29) | Detto nel dialog Avvia ("vale per i sub-agent che non ne chiedono uno proprio") e nel README; valore nelle `--settings`, che battono l'`env` delle impostazioni di utente e repo (§7.3) |
+| R14 | Il limite di sub-agent dipende da una regola `ask` su `Agent`/`Task` che arriva all'host in ogni modalità, bypass compreso: visto nel bundle, non ancora con il CLI reale. Non copre percorsi di spawn diversi da Agent, Task e Workflow; conta gli spawn concessi, non quelli completati | `Workflow` vietato con un limite; spawn oltre il limite negati dall'host; test `#[ignore]` pronti in `tests/real_cli.rs` (§13.3) |
+| R15 | Gli allegati sono copie che l'agente può modificare o cancellare con Bash (in Auto-edit e Autonomo senza chiedere): "sola lettura" è solo un'istruzione del prompt | Gli originali non vengono mai toccati; nessuna regola deny, che proteggerebbe solo le copie e Bash aggirerebbe (§7.3, §10.2) |
 
 ### 13.2 Rimandati (con il trigger che li riporta in scope)
 
@@ -1549,7 +1711,7 @@ M5 (2026-09-28) l'ha eseguita l'agente, con l'OK esplicito dell'utente e **solo 
 | Plan mode ed ExitPlanMode, risposte ad AskUserQuestion | Quando servono flussi di pianificazione |
 | Cambio della modalità di permesso a turno in corso | Richiesta degli utenti |
 | Follow-up in coda o inseriti a metà turno | Quando gli utenti scrivono mentre l'agente lavora |
-| Rendering markdown (pulldown-cmark, HTML come testo) | Lamentele sulla leggibilità |
+| Rendering markdown (pulldown-cmark, HTML come testo), anche di CLAUDE.md e README nel Riepilogo | Lamentele sulla leggibilità |
 | `--replay-user-messages`, rewind, `--fork-session` | Funzione "torna a un turno precedente" |
 | Più attempt attivi per task (confronto tra modelli) | Dopo il MVP |
 | Rebase, abort e continue | Se il merge-tree con squash non basta |
@@ -1561,6 +1723,11 @@ M5 (2026-09-28) l'ha eseguita l'agente, con l'OK esplicito dell'utente e **solo 
 | Report di trust completo (UI con anteprima dei file) | Dopo M6, se il fingerprint minimale non basta |
 | Diff inline delle Edit nel transcript, evidenziazione della sintassi | Dopo la v1 |
 | Linux e Windows, altri agenti (Codex, …), firma e notarizzazione, `freezePrototype` | v2 o distribuzione |
+| Ricerca, filtro e ordinamento nella vista Lista (solo lì: filtrare la kanban romperebbe l'indice del DnD) | Progetti con molti task |
+| Drag&drop di file negli allegati (`dragDropEnabled:false` serve al DnD HTML5 della kanban) | Se il picker non basta |
+| Cache del Riepilogo per `(repo, tip)`, come quella della configurazione del commit | Se `ls-tree` più `cat-file` a ogni visita diventano lenti |
+| Default di progetto per limite e modello dei sub-agent; cambio del modello a ogni turno | Richiesta degli utenti |
+| Pagina e vista (Kanban/Lista) ricordate per progetto; chiusura del menu del progetto sullo scroll e Shift+F10 | Richiesta degli utenti |
 
 ### 13.3 Voci da verificare, e dove si chiudono
 
@@ -1574,6 +1741,7 @@ M5 (2026-09-28) l'ha eseguita l'agente, con l'OK esplicito dell'utente e **solo 
 | Le regole con destination `session` sopravvivono a `--resume` (le ripassiamo comunque) | M5, chiusa (§13.4) |
 | Nome della directory del progetto nel CLI: realpath o `$PWD` (per noi è la stessa stringa) | M5, chiusa (§13.4) |
 | ~~`claude auth status` e `--version` con cwd `/` (M6-REVIEW, §7.1) rispondono come dalla cartella dell'app; il CLI legge o no le impostazioni di progetto per `auth status`~~ **Chiuso 2026-09-29 (CLI 2.1.284, nessuna quota):** da `/` rispondono `2.1.284 (Claude Code)` e `authMethod: claude.ai`. In una cartella con `.claude/settings.json` che dichiara `apiKeyHelper`, `auth status` riporta `authMethod: api_key_helper` (legge le impostazioni di progetto del cwd, senza eseguire né hook né helper): `PROBE_CWD = "/"` è quindi necessario | M6 (chiuso) |
+| Round feature 2026-09-29: la regola `ask` su `Agent`/`Task` arriva all'host in Supervisionato, Auto-edit e Autonomo; il deny del limite viene rispettato; `CLAUDE_CODE_SUBAGENT_MODEL` si applica a un sub-agent senza modello proprio; `--add-dir` con uno spazio nel path (`Application Support`) è leggibile | Test `#[ignore]` in `tests/real_cli.rs` (`real_cli_subagent_ask_rule_reaches_the_host_in_every_mode`, `real_cli_subagent_deny_is_respected`, `real_cli_subagent_model_applies_without_an_explicit_model`, `real_cli_add_dir_with_spaces_is_readable`), scritti ma **non ancora eseguiti**: li lancia l'utente quando vuole (7 turni reali, quota dell'abbonamento; comando nel README) |
 
 ### 13.4 Esiti di M5 (CLI 2.1.283, 2026-09-28)
 
@@ -1598,6 +1766,22 @@ Osservati con l'harness `tests/real_cli.rs` (18 turni reali in tutto, stima del 
 | Process group dei comandi Bash | Ognuno nel suo gruppo: il CLI li chiude su interrupt; il Core registra i discendenti del leader mentre vive e a fine turno chiude quelli rimasti, anche su un'uscita normale, e li uccide con il leader sui percorsi con SIGKILL (fix, §7.4). `ps -o command=` mostra il path di claude e il `--session-id`/`--resume`: la verifica degli orfani (§7.9) funziona |
 | Follow-up "fuori tema" | Il modello può rifiutare un follow-up che ritiene estraneo al task ("Task done already…"). M6: `ATM_APPEND` dice che i messaggi successivi dell'utente continuano il task anche quando sembra finito (§7.3); vale per gli attempt nuovi (il prompt si congela al primo turno) |
 
+### 13.5 Limiti noti del round feature del 2026-09-29
+
+- **Riepilogo** (`git/overview.rs`):
+  - i symlink non si seguono: un `CLAUDE.md → AGENTS.md` mostra solo "→ AGENTS.md", benché il CLI legga attraverso il link, e un `.claude` che è un link nasconde `.claude/CLAUDE.md` e `.claude/settings.json`;
+  - maiuscole e forme Unicode di APFS non si considerano: un `claude.md` non compare, benché il CLI su APFS lo apra;
+  - `.claude/settings.local.json` non si mostra mai; un `.mcp.json` oltre 64 KiB non dà l'elenco dei server;
+  - il JSON mostrato ha le chiavi riordinate alfabeticamente e perde la formattazione originale;
+  - un URL con una password che contiene `/`, `?`, `#` o `\` non codificati (quindi non un URL valido) può comparire in parte: la divisione segue WHATWG;
+  - U+200D nelle sequenze emoji conta come carattere nascosto;
+  - in un partial clone senza i blob del tip, `ls-tree -l` fallisce e il Riepilogo dà un errore `Git` (lì l'app non può nemmeno creare worktree);
+  - il mascheramento è euristico (§10.2) e il Riepilogo non ha cache (ogni visita costa un `ls-tree` e al più un `cat-file`);
+  - i server MCP aggiunti con `claude mcp add` (in `~/.claude.json`, scope local o user) non compaiono: l'app non legge mai quel file.
+- **Allegati:** Bash può modificare le copie (R15); un token scade dopo 10 minuti, quindi un dialog di creazione lasciato aperto più a lungo finisce con il toast "Task creato, allegati non aggiunti"; lo stesso file scelto due volte dà due allegati; la UI controlla solo il numero, la dimensione la controlla il Core allo staging; un'aggiunta in corsa con `remove_project` può lasciare cartelle vuote; niente drag&drop di file.
+- **Sub-agent:** R13 e R14; i test con il CLI reale non sono ancora stati eseguiti (§13.3).
+- **UI:** pagina e vista non ricordate; nessun cambio di stato dalla Lista ("Sposta in" del pannello); le date "oggi"/"ieri" della Lista non si aggiornano da sole dopo mezzanotte; il trigger di `Collapsible` (vendorizzato) non ha `aria-expanded` fuori dal Riepilogo (che glielo passa, con `aria-controls` e il testo chiuso `inert`), cioè negli output dei tool e nei file del diff; rimosso il progetto selezionato, la sua pagina resta per un giro di `list_projects` finché `refresh_projects` non ne seleziona un altro; se la voce rimossa aveva il focus, alla chiusura del dialog il focus va sul `body`.
+
 ---
 
 ## 14. Domande aperte per l'utente
@@ -1608,4 +1792,4 @@ Osservati con l'harness `tests/real_cli.rs` (18 turni reali in tutto, stima del 
 4. Dopo il merge: worktree rimosso e **branch tenuto**. Oppure vuoi la cancellazione automatica del branch?
 5. Consenti la validazione con il CLI reale in M5, che consuma quota dell'abbonamento?
 6. L'uso è personale o l'app verrà distribuita ad altri? In caso di distribuzione si pone la questione dei Commercial Terms per "offrire Claude Code in un prodotto". Non cambia l'architettura.
-7. È confermato che in v1 sono esclusi: push, fetch e PR, immagini nei prompt, server MCP per i task, rewind?
+7. È confermato che in v1 sono esclusi: push, fetch e PR, server MCP per i task, rewind? Le immagini non sono più escluse (round feature del 2026-09-29): si allegano al task come file qualsiasi e l'agente le legge con il tool Read dal path che il prompt gli dà (§7.4); restano esclusi l'incolla di immagini nel composer e il drag&drop di file.

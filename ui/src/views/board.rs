@@ -1,6 +1,10 @@
-//! Kanban board of the selected project (spec §9.2, §9.3): five columns (Annullati
-//! collapsed), drag-and-drop, quick create at the bottom of a column. Refetches `get_board`
-//! when `AppCtx::project` or `AppCtx::board_version` changes. Owner: M2-UI-BOARD.
+//! Board of the selected project (spec §9.2, §9.3): a toolbar with the Kanban | Lista toggle
+//! (spec F4), then either the five columns (Annullati collapsed, drag-and-drop, quick create
+//! at the bottom of a column) or the list (`board/list.rs`), both over the same cards.
+//! Refetches `get_board` when `AppCtx::project` or `AppCtx::board_version` changes.
+//! Owner: M2-UI-BOARD, toolbar and list UI-TASKS.
+
+mod list;
 
 use std::time::Duration;
 
@@ -9,7 +13,7 @@ use atm_types::{
     ProcessStatus, ProjectIdReq, SendFollowUp, SendFollowUpReq, StopReason, TaskCard, TaskStatus,
     WorktreeState,
 };
-use icons::{ChevronLeft, ChevronRight, FolderPlus, GitBranch, Pencil, Plus};
+use icons::{ChevronLeft, ChevronRight, FolderPlus, GitBranch, List, Pencil, Plus, SquareKanban};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -25,10 +29,11 @@ use crate::ui::input::Input;
 use crate::ui::scroll_area::ScrollArea;
 use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
-use crate::views::sidebar::{add_repository, projects_loaded};
+use crate::views::sidebar::add_repository;
 use crate::views::start_dialog::StartDialog;
 use crate::views::task_dialog::{TaskDialog, TaskDialogMode};
 use crate::widgets::dnd::DragCtx;
+use list::TaskList;
 
 /// Column heading shown on the board.
 pub fn column_title(status: TaskStatus) -> &'static str {
@@ -41,7 +46,24 @@ pub fn column_title(status: TaskStatus) -> &'static str {
     }
 }
 
-/// State shared by the columns and cards of the board.
+/// How the board shows the tasks (spec F4). Not persisted: every mount starts on Kanban.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskView {
+    Kanban,
+    List,
+}
+
+impl TaskView {
+    /// `data-task-view` of the toggle's buttons.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Kanban => "kanban",
+            Self::List => "list",
+        }
+    }
+}
+
+/// State shared by the columns, the cards and the list of the board.
 #[derive(Clone, Copy)]
 struct BoardState {
     ctx: AppCtx,
@@ -144,6 +166,8 @@ impl BoardState {
     }
 }
 
+/// Mounted by `Layout` only while a project is selected; without one, `Layout` renders
+/// [`NoProject`] itself.
 #[component]
 pub fn Board() -> impl IntoView {
     let ctx = use_app();
@@ -159,7 +183,6 @@ pub fn Board() -> impl IntoView {
         start_for,
         task_dialog,
     };
-    let projects_ready = projects_loaded(ctx);
     let shown = StoredValue::new(None::<Id>);
     Effect::new(move |_| {
         ctx.board_version.track();
@@ -173,6 +196,10 @@ pub fn Board() -> impl IntoView {
             board.fetch(project);
         }
     });
+    let task_view = RwSignal::new(TaskView::Kanban);
+    // Behind memoized `Show`s: each view mounts fresh on a switch, never rebuilt in place, and
+    // the hidden one is not in the DOM (the E2E measures the columns' cards).
+    let list = Memo::new(move |_| task_view.get() == TaskView::List);
 
     view! {
         <section
@@ -180,16 +207,20 @@ pub fn Board() -> impl IntoView {
             data-view="board"
             data-start-for=move || start_for.get()
         >
-            <Show
-                when=move || ctx.project.with(Option::is_some)
-                fallback=move || projects_ready.get().then(|| view! { <NoProject /> })
-            >
-                <div class="flex min-h-0 flex-1 gap-3 overflow-x-auto p-4" data-testid="columns">
+            <Toolbar board task_view list />
+            <Show when=move || !list.get()>
+                <div
+                    class="flex min-h-0 flex-1 gap-3 overflow-x-auto px-4 pt-3 pb-4"
+                    data-testid="columns"
+                >
                     {TaskStatus::ALL
                         .iter()
                         .map(|&status| view! { <Column board status /> })
                         .collect_view()}
                 </div>
+            </Show>
+            <Show when=move || list.get()>
+                <TaskList board />
             </Show>
             <StartDialog task_id=start_for />
             <TaskDialog mode=task_dialog />
@@ -197,8 +228,68 @@ pub fn Board() -> impl IntoView {
     }
 }
 
+/// Kanban | Lista toggle (`[data-task-view]`, `aria-pressed`) and, in the list, "Nuovo task"
+/// (the columns have their own "+"). Neither button captures an id.
 #[component]
-fn NoProject() -> impl IntoView {
+fn Toolbar(board: BoardState, task_view: RwSignal<TaskView>, list: Memo<bool>) -> impl IntoView {
+    view! {
+        <div class="flex items-center gap-2 px-4 pt-3" data-testid="board-toolbar">
+            <div
+                class="bg-muted text-muted-foreground inline-flex h-8 items-center rounded-lg p-[3px]"
+                role="group"
+                aria-label="Vista dei task"
+            >
+                {view_toggle(task_view, TaskView::Kanban, "Kanban", view! { <SquareKanban /> })}
+                {view_toggle(task_view, TaskView::List, "Lista", view! { <List /> })}
+            </div>
+            <div class="flex-1" />
+            <Show when=move || list.get()>
+                <Button
+                    size=ButtonSize::Sm
+                    attr:data-action="new-task"
+                    on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(TaskStatus::Todo)))
+                >
+                    <Plus />
+                    "Nuovo task"
+                </Button>
+            </Show>
+        </div>
+    }
+}
+
+fn view_toggle(
+    current: RwSignal<TaskView>,
+    value: TaskView,
+    label: &'static str,
+    icon: impl IntoView + 'static,
+) -> impl IntoView {
+    let active = move || current.get() == value;
+    view! {
+        <button
+            type="button"
+            class=move || {
+                if active() {
+                    "bg-background text-foreground inline-flex h-full items-center gap-1.5 rounded-md px-2.5 text-sm font-medium shadow-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30 [&_svg]:size-4"
+                } else {
+                    "text-foreground/60 hover:text-foreground inline-flex h-full items-center gap-1.5 rounded-md px-2.5 text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-4"
+                }
+            }
+            data-task-view=value.as_str()
+            aria-pressed=move || active().to_string()
+            on:click=move |_| {
+                if current.get_untracked() != value {
+                    current.set(value);
+                }
+            }
+        >
+            {icon}
+            {label}
+        </button>
+    }
+}
+
+#[component]
+pub fn NoProject() -> impl IntoView {
     let ctx = use_app();
     view! {
         <div class="flex flex-1 items-center justify-center p-8">
@@ -443,7 +534,7 @@ fn TaskCardView(
                                     }
                                 })
                         }}
-                        {move || card_badges(ctx, &card.get())}
+                        {move || card.with(|c| (card_badges(ctx, c), branch_line(c)))}
                     </CardContent>
                 </Card>
             </div>
@@ -452,8 +543,9 @@ fn TaskCardView(
 }
 
 /// Badges of a card (spec §9.2): running, pending approvals, failed, interrupted (with
-/// "Continua", spec §7.9), missing worktree, closed attempt; then the branch.
-fn card_badges(ctx: AppCtx, card: &TaskCard) -> impl IntoView + use<> {
+/// "Continua", spec §7.9), missing worktree, closed attempt. `None` without any: the list
+/// view shows a dash instead.
+fn card_badges(ctx: AppCtx, card: &TaskCard) -> Option<impl IntoView + use<>> {
     let active = card.attempt_state == Some(AttemptState::Active);
     let idle = active && !card.running;
     let interrupted = idle && interrupted_by_app(card.last_stop_reason);
@@ -470,7 +562,7 @@ fn card_badges(ctx: AppCtx, card: &TaskCard) -> impl IntoView + use<> {
     let any = card.running || approvals > 0 || failed || stopped || interrupted || missing;
     let any = any || closed.is_some();
 
-    let badges = any.then(|| {
+    any.then(|| {
         view! {
             <div class="flex flex-wrap items-center gap-1.5" data-testid="badges">
                 {card
@@ -547,16 +639,19 @@ fn card_badges(ctx: AppCtx, card: &TaskCard) -> impl IntoView + use<> {
                     })}
             </div>
         }
-    });
-    let branch = card.branch.clone().map(|branch| {
+    })
+}
+
+/// The branch of the card's attempt, if it has one.
+fn branch_line(card: &TaskCard) -> Option<impl IntoView + use<>> {
+    card.branch.clone().map(|branch| {
         view! {
             <p class="text-muted-foreground flex min-w-0 items-center gap-1 font-mono text-[11px]">
                 <GitBranch class="size-3 shrink-0" />
                 <span class="truncate">{branch}</span>
             </p>
         }
-    });
-    (badges, branch)
+    })
 }
 
 /// A turn cut by the app's lifecycle rather than by the user or the agent: stopped by the

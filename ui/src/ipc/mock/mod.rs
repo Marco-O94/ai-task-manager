@@ -1,16 +1,20 @@
 //! In-browser backend for `trunk serve --features mock` (spec D13), with the signatures of
 //! `ipc::tauri`. This file routes commands by `NAME` and emulates events and channels; the
-//! data lives in `board.rs` (env, settings, projects, board: M2-UI-BOARD) and `attempt.rs`
-//! (task detail, attempts, transcript, diff, merge: M2-UI-TASK).
+//! data lives in `board.rs` (env, settings, projects, board: M2-UI-BOARD), `attempt.rs`
+//! (task detail, attempts, transcript, diff, merge: M2-UI-TASK), `overview.rs` (project
+//! overview: UI-SHELL) and `attachments.rs` (task attachments: UI-TASKS).
 //!
 //! Hooks for those files: [`emit`] (like `app.emit`), [`send_transcript`] (like
 //! `Channel::send`), [`sleep`], [`now_ms`], [`new_id`]. `subscribe_transcript` and
 //! `unsubscribe_transcript` are handled here and forwarded to `attempt::on_subscribe` /
-//! `attempt::on_unsubscribe`. Between the two files: `board::{task, set_task_status,
-//! update_env}` and `attempt::{decorate, forget_task}`.
+//! `attempt::on_unsubscribe`. Between the files: `board::{task, find_project,
+//! set_task_status, update_env}`, `attempt::{decorate, forget_task}` and
+//! `attachments::of_task`.
 
+mod attachments;
 mod attempt;
 mod board;
+mod overview;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -30,7 +34,15 @@ pub struct Channel;
 /// Simulated round trip, so loading states are visible.
 const LATENCY_MS: i32 = 120;
 
-/// Commands served by `board.rs`; every other §6.3 command goes to `attempt.rs`.
+/// Commands served by `attachments.rs`.
+const ATTACHMENT_COMMANDS: &[&str] = &[
+    PickAttachmentFiles::NAME,
+    AddTaskAttachments::NAME,
+    RemoveTaskAttachment::NAME,
+];
+
+/// Commands served by `board.rs`; `get_project_overview` goes to `overview.rs`, the
+/// attachments to `attachments.rs`, every other §6.3 command to `attempt.rs`.
 const BOARD_COMMANDS: &[&str] = &[
     GetEnv::NAME,
     OpenLoginTerminal::NAME,
@@ -79,6 +91,8 @@ pub async fn call<C: Command>(req: &C::Req) -> Result<C::Res, AppError> {
             attempt::on_unsubscribe(&req.subscription_id);
             Ok(Value::Null)
         }
+        GetProjectOverview::NAME => overview::handle(req),
+        name if ATTACHMENT_COMMANDS.contains(&name) => attachments::handle(name, req),
         name if BOARD_COMMANDS.contains(&name) => board::handle(name, req).await,
         name if COMMAND_NAMES.contains(&name) => attempt::handle(name, req).await,
         name => Err(AppError::not_implemented(name)),

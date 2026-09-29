@@ -177,6 +177,9 @@ impl Attempt {
                 permission_mode: PermissionMode::AcceptEdits,
                 model: None,
                 effort: None,
+                subagent_model: None,
+                max_subagents: None,
+                subagents_used: 0,
                 session_started: false,
                 merge_commit: None,
                 running: false,
@@ -530,6 +533,7 @@ fn task_detail(task_id: &str) -> Result<TaskDetail, AppError> {
             attempt: active.map(|a| a.view.clone()),
             processes: active.map(|a| a.processes.clone()).unwrap_or_default(),
             closed_attempts,
+            attachments: super::attachments::of_task(task_id),
         }
     }))
 }
@@ -543,6 +547,12 @@ fn start_attempt(req: StartAttemptReq) -> Result<AttemptView, AppError> {
     let merge = query("merge")
         .and_then(|m| Merge::parse(&m))
         .unwrap_or(Merge::Clean);
+    // Like the core: the requested model, else the project's default, else the settings'.
+    let model = req
+        .model
+        .map(|m| m.trim().to_owned())
+        .filter(|m| !m.is_empty())
+        .or_else(|| board::default_model(&task.project_id));
     let view = STATE.with_borrow_mut(|s| {
         let busy = s
             .attempts
@@ -553,8 +563,10 @@ fn start_attempt(req: StartAttemptReq) -> Result<AttemptView, AppError> {
         }
         let mut a = Attempt::new(&task, req.target_branch, fixture, merge);
         a.view.permission_mode = req.permission_mode;
-        a.view.model = req.model;
+        a.view.model = model;
         a.view.effort = req.effort;
+        a.view.subagent_model = req.subagent_model;
+        a.view.max_subagents = req.max_subagents;
         a.open_turn(prompt_of(&task));
         let view = a.view.clone();
         s.attempts.push(a);

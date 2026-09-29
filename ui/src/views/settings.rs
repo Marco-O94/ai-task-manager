@@ -1,9 +1,10 @@
-//! Settings dialog (`get_settings` / `update_settings`, spec §5.2 keys), with the selected
-//! project's settings in a second tab (`project.rs`). Owner: M2-UI-BOARD.
+//! "Impostazioni app" dialog (`get_settings` / `update_settings`, spec §5.2 keys), and the
+//! helpers of the project settings page (`project.rs`, the project's "Impostazioni" tab).
+//! Owner: M2-UI-BOARD, UI-SHELL.
 
 mod project;
 
-use atm_types::{Empty, EnvStatus, GetSettings, Settings, UpdateSettings};
+use atm_types::{Empty, EnvStatus, GetSettings, MODEL_ALIASES, Settings, UpdateSettings};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -16,51 +17,32 @@ use crate::ui::dialog::{
 use crate::ui::input::Input;
 use crate::ui::label::Label;
 use crate::ui::select_native::SelectNative;
-use crate::ui::tabs::{Tabs, TabsContent, TabsList, TabsTrigger};
-use project::ProjectSettings;
+pub use project::ProjectSettings;
 
-/// `--model` choices (spec §9.2); `""` = the CLI default.
-const MODELS: &[(&str, &str)] = &[
-    ("", "Predefinito"),
-    ("opus", "opus"),
-    ("sonnet", "sonnet"),
-    ("fable", "fable"),
-];
+/// `--model` choices (spec §9.2): `""` = the CLI default, then [`MODEL_ALIASES`].
+fn models() -> Vec<(String, String)> {
+    let aliases = MODEL_ALIASES
+        .iter()
+        .map(|m| ((*m).to_owned(), (*m).to_owned()));
+    std::iter::once((String::new(), "Predefinito".to_owned()))
+        .chain(aliases)
+        .collect()
+}
 
+/// App-wide settings; a project's own are on its "Impostazioni" page.
 #[component]
 pub fn SettingsDialog(open: RwSignal<bool>) -> impl IntoView {
-    let ctx = use_app();
     view! {
         <Dialog open=open>
             <DialogContent class="overflow-y-auto sm:max-w-xl" data_name_prefix="Settings">
                 <DialogBody>
                     <DialogHeader>
-                        <DialogTitle>"Impostazioni"</DialogTitle>
+                        <DialogTitle>"Impostazioni app"</DialogTitle>
                         <DialogDescription>
-                            "Salvate sul Mac; valgono per tutti i progetti salvo dove indicato."
+                            "Salvate sul Mac; valgono per tutti i progetti. Quelle di un progetto sono nella sua pagina Impostazioni."
                         </DialogDescription>
                     </DialogHeader>
-                    <Tabs default_value="app">
-                        <TabsList>
-                            <TabsTrigger value="app">"Generali"</TabsTrigger>
-                            <TabsTrigger value="project">"Progetto"</TabsTrigger>
-                        </TabsList>
-                        <TabsContent value="app">
-                            <AppSettings open />
-                        </TabsContent>
-                        <TabsContent value="project">
-                            <Show
-                                when=move || ctx.project.with(Option::is_some)
-                                fallback=|| {
-                                    view! {
-                                        <p class="text-muted-foreground py-4">"Nessun progetto selezionato."</p>
-                                    }
-                                }
-                            >
-                                <ProjectSettings open />
-                            </Show>
-                        </TabsContent>
-                    </Tabs>
+                    <AppSettings open />
                 </DialogBody>
             </DialogContent>
         </Dialog>
@@ -156,7 +138,7 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
             </p>
             <div class="grid grid-cols-2 gap-4">
                 <Field id="settings-model" label="Modello predefinito">
-                    <Select id="settings-model" value=model options=owned(MODELS) />
+                    <Select id="settings-model" value=model options=models() />
                 </Field>
                 <Field id="settings-max-running" label="Agenti in parallelo">
                     <Select id="settings-max-running" value=max_running options=running_options />

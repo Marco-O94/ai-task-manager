@@ -1,5 +1,6 @@
 //! Hardened git CLI runner and the worktree / commit / diff / merge operations (spec §8).
-//! Owner: M2-GIT; the fingerprint (§8.9, `git/fingerprint.rs`) is M6's.
+//! Owner: M2-GIT; the fingerprint (§8.9, `git/fingerprint.rs`) is M6's, the project overview
+//! (`git/overview.rs`) CORE-OVERVIEW's.
 //!
 //! Locking is the caller's (spec §8.1): Core holds the per-attempt mutex and, for
 //! `worktree add/remove`, merge and branch deletion, the per-repo mutex (order attempt → repo).
@@ -12,6 +13,7 @@
 mod diff;
 mod fingerprint;
 mod merge;
+pub mod overview;
 mod parse;
 
 use std::collections::{BTreeMap, BTreeSet};

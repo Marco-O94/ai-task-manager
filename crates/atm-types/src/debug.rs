@@ -146,7 +146,9 @@ cmd!(
     DebugE2eSetAuth, "debug_e2e_set_auth", E2eAuthReq => ()
 );
 cmd!(
-    /// The next `pick_repo_folder` returns this path instead of opening the native picker.
+    /// The next native picker, `pick_repo_folder` or `pick_attachment_files` (one slot:
+    /// whichever opens first takes it), returns this path instead of opening; with nothing
+    /// queued, in a run `pick_repo_folder` returns `None` and `pick_attachment_files` no file.
     DebugE2eQueuePick, "debug_e2e_queue_pick", E2ePathReq => ()
 );
 cmd!(

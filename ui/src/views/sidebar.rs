@@ -1,23 +1,33 @@
-//! Sidebar (projects, "Aggiungi repository", settings) and topbar (account chip, pause banner
-//! with "Riprendi", running counter), spec §9.2. Owner: M2-UI-BOARD.
+//! Sidebar (projects with their menu, "Aggiungi repository", app settings, the removal
+//! confirmation) and topbar (project name and page tabs, account chip, pause banner with
+//! "Riprendi", running counter), spec §9.2. Owner: M2-UI-BOARD, UI-SHELL.
 
 use atm_types::{
-    AddProject, AddProjectReq, AuthState, Empty, EnvStatus, GetSettings, PickRepoFolder,
-    ResumeAgents,
+    AddProject, AddProjectReq, AuthState, Empty, EnvStatus, GetSettings, Id, IdReq, PickRepoFolder,
+    RemoveProject, ResumeAgents,
 };
-use icons::{FolderGit2, FolderPlus, Settings as SettingsIcon, TriangleAlert};
+use icons::{Ellipsis, FolderGit2, FolderPlus, Settings as SettingsIcon, Trash2, TriangleAlert};
+use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use wasm_bindgen::JsCast;
+use web_sys::{HtmlElement, KeyboardEvent, MouseEvent};
 
-use crate::app::{AppCtx, use_app};
+use crate::app::{AppCtx, ProjectView, use_app};
 use crate::ipc;
 use crate::ui::badge::{Badge, BadgeVariant};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
+use crate::ui::callout::{Callout, CalloutVariant};
+use crate::ui::dialog::{
+    Dialog, DialogBody, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader,
+    DialogTitle,
+};
 use crate::ui::scroll_area::ScrollArea;
 use crate::ui::separator::Separator;
 use crate::ui::spinner::Spinner;
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
 use crate::views::settings::SettingsDialog;
+use crate::widgets::context_menu::{ContextMenu, ContextMenuItem, MenuState};
 
 /// Left column, 240 px.
 #[component]
@@ -25,6 +35,17 @@ pub fn Sidebar() -> impl IntoView {
     let ctx = use_app();
     let settings_open = RwSignal::new(false);
     let loaded = projects_loaded(ctx);
+    let menu = ProjectMenu {
+        state: MenuState::new(),
+        target: RwSignal::new(None),
+    };
+    // One menu for every project: the items read the target when chosen, never capture it.
+    let chosen = move || menu.target.get_untracked();
+    let menu_label = Signal::derive(move || {
+        menu.target
+            .with(|t| t.as_ref().map(|(_, name)| actions_label(name)))
+            .unwrap_or_default()
+    });
     view! {
         <nav class="bg-sidenav flex w-60 shrink-0 flex-col border-r" data-view="sidebar">
             <div class="flex h-12 shrink-0 items-center px-4 font-semibold">"AI Task Manager"</div>
@@ -39,7 +60,12 @@ pub fn Sidebar() -> impl IntoView {
                         key=|p| (p.id.clone(), p.name.clone())
                         let:project
                     >
-                        <ProjectItem id=project.id name=project.name repo_path=project.repo_path />
+                        <ProjectItem
+                            id=project.id
+                            name=project.name
+                            repo_path=project.repo_path
+                            menu
+                        />
                     </For>
                 </ul>
                 <Show when=move || loaded.get() && ctx.projects.with(Vec::is_empty)>
@@ -62,16 +88,73 @@ pub fn Sidebar() -> impl IntoView {
                     on:click=move |_| settings_open.set(true)
                 >
                     <SettingsIcon />
-                    "Impostazioni"
+                    "Impostazioni app"
                 </Button>
             </div>
             <SettingsDialog open=settings_open />
+            <ContextMenu state=menu.state label=menu_label>
+                <ContextMenuItem
+                    attr:data-action="menu-settings"
+                    on_select=move |()| {
+                        if let Some((id, _)) = chosen() {
+                            ctx.select_project(id, ProjectView::Settings);
+                        }
+                    }
+                >
+                    <SettingsIcon />
+                    "Impostazioni progetto"
+                </ContextMenuItem>
+                <ContextMenuItem
+                    attr:data-action="menu-remove"
+                    destructive=true
+                    on_select=move |()| {
+                        // The menu has already put the focus back on its trigger, which the
+                        // dialog then restores when it closes.
+                        if let Some(target) = chosen() {
+                            ctx.remove_target.set(Some(target));
+                        }
+                    }
+                >
+                    <Trash2 />
+                    "Rimuovi dalla lista…"
+                </ContextMenuItem>
+            </ContextMenu>
+            <RemoveProjectDialog />
         </nav>
     }
 }
 
+/// The sidebar's project menu: its state and the project it acts on, `(id, name)`.
+#[derive(Clone, Copy)]
+struct ProjectMenu {
+    state: MenuState,
+    target: RwSignal<Option<(Id, String)>>,
+}
+
+impl ProjectMenu {
+    /// Sets the project the menu acts on, before it opens (or moves) there.
+    fn aim(self, id: &str, name: &str) {
+        self.target.set(Some((id.to_owned(), name.to_owned())));
+    }
+
+    /// Open on project `id` (tracked).
+    fn open_on(self, id: &str) -> bool {
+        self.state.is_open()
+            && self
+                .target
+                .with(|t| t.as_ref().is_some_and(|(t, _)| t == id))
+    }
+}
+
+fn actions_label(name: &str) -> String {
+    format!("Azioni per «{name}»")
+}
+
+/// A project of the sidebar: selects it on its overview; its menu (right click or "⋯") leads
+/// to its settings and to its removal. Items are keyed by `(id, name)`, so capturing them is
+/// safe: a change makes a new item.
 #[component]
-fn ProjectItem(id: String, name: String, repo_path: String) -> impl IntoView {
+fn ProjectItem(id: String, name: String, repo_path: String, menu: ProjectMenu) -> impl IntoView {
     let ctx = use_app();
     let selected = {
         let id = id.clone();
@@ -79,30 +162,182 @@ fn ProjectItem(id: String, name: String, repo_path: String) -> impl IntoView {
     };
     let class = move || {
         if selected.get() {
-            "bg-accent text-accent-foreground w-full justify-start font-medium"
+            "bg-accent text-accent-foreground w-full justify-start pr-8 font-medium"
         } else {
-            "text-muted-foreground w-full justify-start font-normal"
+            "text-muted-foreground w-full justify-start pr-8 font-normal"
+        }
+    };
+    let item = NodeRef::<html::Li>::new();
+    let more = NodeRef::<html::Button>::new();
+    let (id, name) = (StoredValue::new(id), StoredValue::new(name));
+    let open_here = move || id.with_value(|id| menu.open_on(id));
+    let on_context = move |ev: MouseEvent| {
+        ev.prevent_default();
+        // The focus comes back to the project's button.
+        let trigger = item
+            .get_untracked()
+            .and_then(|li| li.query_selector("[data-project]").ok().flatten())
+            .and_then(|el| el.dyn_into::<HtmlElement>().ok());
+        menu.aim(&id.get_value(), &name.get_value());
+        let (x, y) = (f64::from(ev.client_x()), f64::from(ev.client_y()));
+        menu.state.open_at(x, y, trigger);
+    };
+    let on_more = move |_| {
+        let Some(button) = more.get_untracked() else {
+            return;
+        };
+        let button: HtmlElement = button.into();
+        if menu.state.opened_by(&button) {
+            menu.state.close(true);
+        } else {
+            menu.aim(&id.get_value(), &name.get_value());
+            menu.state.open_below(button);
         }
     };
     view! {
-        <li>
+        <li class="group relative" node_ref=item on:contextmenu=on_context>
             <Button
                 variant=ButtonVariant::Ghost
                 size=ButtonSize::Sm
                 class=Signal::derive(move || class().to_owned())
                 attr:title=repo_path
+                attr:data-project=name.get_value()
                 attr:aria-current=move || selected.get().then_some("true")
                 on:click=move |_| {
                     if !selected.get_untracked() {
-                        ctx.open_task.set(None);
-                        ctx.project.set(Some(id.clone()));
+                        ctx.select_project(id.get_value(), ProjectView::Overview);
                     }
                 }
             >
                 <FolderGit2 />
-                <span class="truncate">{name}</span>
+                <span class="truncate">{name.get_value()}</span>
             </Button>
+            <button
+                type="button"
+                node_ref=more
+                class="text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:ring-ring/50 absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-md opacity-0 outline-none group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-[3px] aria-expanded:opacity-100 [&_svg]:size-4"
+                data-action="project-menu"
+                aria-haspopup="menu"
+                aria-expanded=move || open_here().to_string()
+                aria-label=actions_label(&name.get_value())
+                on:click=on_more
+            >
+                <Ellipsis />
+            </button>
         </li>
+    }
+}
+
+/// Confirmation of `remove_project` for [`AppCtx::remove_target`]: one instance, opened by the
+/// sidebar menu and by the project settings page. It removes that target, never the selected
+/// project as such; `Busy` (agents still running) keeps it open with the reason.
+#[component]
+fn RemoveProjectDialog() -> impl IntoView {
+    let ctx = use_app();
+    let open = RwSignal::new(false);
+    // The target on screen, kept while the dialog animates out.
+    let shown = RwSignal::new(None::<(Id, String)>);
+    let error = RwSignal::new(None::<String>);
+    // The projects whose removal is in flight: the dialog is busy only for its own target.
+    let removing = RwSignal::new(Vec::<Id>::new());
+    Effect::new(move |_| {
+        if let Some(target) = ctx.remove_target.get() {
+            shown.set(Some(target));
+            error.set(None);
+            open.set(true);
+        }
+    });
+    Effect::new(move |_| {
+        if !open.get() && ctx.remove_target.with_untracked(Option::is_some) {
+            ctx.remove_target.set(None);
+        }
+    });
+    // The dialog still shows project `id`.
+    let on_screen = move |id: &Id| {
+        open.try_get_untracked() == Some(true)
+            && shown
+                .try_with_untracked(|s| s.as_ref().is_some_and(|(s, _)| s == id))
+                .unwrap_or(false)
+    };
+    let busy = move || {
+        shown.with(|s| {
+            s.as_ref()
+                .is_some_and(|(id, _)| removing.with(|r| r.contains(id)))
+        })
+    };
+    let confirm = move |_| {
+        let Some((id, name)) = shown.get_untracked() else {
+            return;
+        };
+        if removing.with_untracked(|r| r.contains(&id)) {
+            return;
+        }
+        removing.update(|r| r.push(id.clone()));
+        error.set(None);
+        spawn_local(async move {
+            match ipc::call::<RemoveProject>(&IdReq { id: id.clone() }).await {
+                Ok(()) => {
+                    if ctx.project.get_untracked().as_ref() == Some(&id) {
+                        ctx.open_task.try_set(None);
+                    }
+                    ctx.toasts
+                        .success(format!("«{name}» rimosso dalla lista; i branch restano"));
+                    // Not a dialog reopened meanwhile for another project.
+                    if on_screen(&id) {
+                        open.try_set(false);
+                    }
+                    ctx.refresh_projects();
+                }
+                // E.g. `Busy`, agents still running: the reason goes in the dialog.
+                Err(e) if on_screen(&id) => {
+                    error.try_set(Some(e.message));
+                }
+                Err(e) => ctx.toasts.app_error(&e),
+            }
+            removing.try_update(|r| r.retain(|r| *r != id));
+        });
+    };
+    let title = move || {
+        shown.with(|s| {
+            s.as_ref()
+                .map(|(_, name)| format!("Rimuovere «{name}» dalla lista?"))
+        })
+    };
+    view! {
+        <Dialog open>
+            <DialogContent class="sm:max-w-md" data_name_prefix="RemoveProjectDialog">
+                <DialogBody>
+                    <DialogHeader>
+                        <DialogTitle>{title}</DialogTitle>
+                        <DialogDescription>
+                            "I file del repository e i branch atm/… restano; i worktree dell'app vengono salvati con un commit sul loro branch e rimossi; task, cronologia e allegati vengono eliminati dall'app."
+                        </DialogDescription>
+                    </DialogHeader>
+                    <Show when=move || error.with(Option::is_some)>
+                        <Callout
+                            variant=CalloutVariant::Warning
+                            class="md:mx-0"
+                            title="Impossibile rimuovere il progetto"
+                            attr:data-remove-error=""
+                        >
+                            {move || error.get()}
+                        </Callout>
+                    </Show>
+                    <DialogFooter>
+                        <DialogClose>"Annulla"</DialogClose>
+                        <Button
+                            variant=ButtonVariant::Destructive
+                            attr:data-action="confirm-remove"
+                            attr:disabled=busy
+                            on:click=confirm
+                        >
+                            {move || busy().then(|| view! { <Spinner class="size-4" /> })}
+                            "Rimuovi"
+                        </Button>
+                    </DialogFooter>
+                </DialogBody>
+            </DialogContent>
+        </Dialog>
     }
 }
 
@@ -138,8 +373,7 @@ pub fn add_repository(ctx: AppCtx) {
                 for warning in res.warnings {
                     ctx.toasts.info(warning);
                 }
-                ctx.open_task.try_set(None);
-                ctx.project.try_set(Some(res.project.id));
+                ctx.select_project(res.project.id, ProjectView::Overview);
                 ctx.refresh_projects();
             }
             Err(e) => ctx.toasts.app_error(&e),
@@ -147,7 +381,8 @@ pub fn add_repository(ctx: AppCtx) {
     });
 }
 
-/// Bar above the board and the task panel, with the environment banners under it.
+/// Bar above the project's page: its name and path, the page tabs, the environment chips;
+/// the environment banners under it.
 #[component]
 pub fn Topbar() -> impl IntoView {
     let ctx = use_app();
@@ -156,6 +391,7 @@ pub fn Topbar() -> impl IntoView {
         ctx.projects
             .with(|ps| ps.iter().find(|p| p.id == id).cloned())
     });
+    let has_project = Memo::new(move |_| ctx.project.with(Option::is_some));
     view! {
         <div class="shrink-0" data-view="topbar">
             <header class="flex h-12 items-center gap-3 border-b px-4">
@@ -173,9 +409,78 @@ pub fn Topbar() -> impl IntoView {
                             })
                     }}
                 </div>
+                // Outside the closure above, which re-runs on every `refresh_projects`.
+                <Show when=move || has_project.get()>
+                    <PageTabs />
+                </Show>
                 {move || ctx.env.get().map(|env| view! { <EnvChips env /> })}
             </header>
             <Banners />
+        </div>
+    }
+}
+
+/// Riepilogo | Task | Impostazioni of the selected project (`role=tablist`, ←/→/Home/End move
+/// and select, spec F2).
+#[component]
+fn PageTabs() -> impl IntoView {
+    let ctx = use_app();
+    let keys = move |e: KeyboardEvent| {
+        let all = ProjectView::ALL;
+        let i = all
+            .iter()
+            .position(|v| *v == ctx.project_view.get_untracked())
+            .unwrap_or(0);
+        let next = match e.key().as_str() {
+            "ArrowRight" => (i + 1) % all.len(),
+            "ArrowLeft" => (i + all.len() - 1) % all.len(),
+            "Home" => 0,
+            "End" => all.len() - 1,
+            _ => return,
+        };
+        e.prevent_default();
+        ctx.project_view.set(all[next]);
+        if let Some(tab) = document()
+            .get_element_by_id(&all[next].tab_id())
+            .and_then(|el| el.dyn_into::<HtmlElement>().ok())
+        {
+            let _ = tab.focus();
+        }
+    };
+    let tab = move |view: ProjectView, label: &'static str| {
+        let selected = Memo::new(move |_| ctx.project_view.get() == view);
+        view! {
+            <button
+                type="button"
+                role="tab"
+                id=view.tab_id()
+                data-project-view=view.as_str()
+                aria-selected=move || selected.get().to_string()
+                aria-controls=move || selected.get().then(|| view.page_id())
+                tabindex=move || if selected.get() { "0" } else { "-1" }
+                class=move || {
+                    if selected.get() {
+                        "bg-background text-foreground dark:bg-input/30 dark:border-input rounded-md border px-2.5 text-sm font-medium shadow-sm"
+                    } else {
+                        "text-foreground/60 hover:text-foreground rounded-md border border-transparent px-2.5 text-sm font-medium"
+                    }
+                }
+                on:click=move |_| ctx.project_view.set(view)
+            >
+                {label}
+            </button>
+        }
+    };
+    view! {
+        <div
+            role="tablist"
+            aria-label="Pagine del progetto"
+            class="bg-muted flex h-8 shrink-0 items-stretch rounded-lg p-[3px] [&>button]:focus-visible:ring-ring/50 [&>button]:outline-none [&>button]:focus-visible:ring-[3px]"
+            on:keydown=keys
+        >
+            {tab(ProjectView::Overview, "Riepilogo")}
+            {tab(ProjectView::Tasks, "Task")}
+            {tab(ProjectView::Settings, "Impostazioni")}
         </div>
     }
 }

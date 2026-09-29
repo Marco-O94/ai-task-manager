@@ -9,6 +9,20 @@ pub const CLAUDE_MIN_VERSION: &str = "2.1.223";
 /// Newest CLI the app was tested with; newer ones only get an informative badge.
 pub const CLAUDE_TESTED_VERSION: &str = "2.1.283";
 
+/// `--model` aliases of the CLI 2.1.284, the only list the UI offers (the main agent's model,
+/// the sub-agents' `CLAUDE_CODE_SUBAGENT_MODEL`). A full model id stays accepted where a
+/// model is free text (`Project::default_model`, `Settings::default_model`).
+pub const MODEL_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "fable"];
+/// Upper bound of `StartAttemptReq::max_subagents` (sub-agents one task's main agent may
+/// spawn; `attempts.max_subagents` CHECK).
+pub const MAX_SUBAGENTS: u8 = 10;
+/// Attachments one task may have (re-counted in the insertion's transaction).
+pub const MAX_ATTACHMENTS_PER_TASK: usize = 20;
+/// Largest attachment accepted, in bytes (25 MiB).
+pub const MAX_ATTACHMENT_BYTES: u64 = 25 << 20;
+/// Longest `Project::description`, in characters (`projects.description` CHECK).
+pub const MAX_PROJECT_DESCRIPTION: usize = 10_000;
+
 /// Enums whose strings are shared with the DB `CHECK`s and the CLI (spec §5.3). Each gets
 /// `ALL` (declaration order), `as_str()`, `Display` and `FromStr` (`Invalid` on unknown input),
 /// all driven by the same literals as the serde renames.
@@ -137,6 +151,9 @@ db_enum! {
 pub struct Project {
     pub id: Id,
     pub name: String,
+    /// Free text shown on the overview page, at most [`MAX_PROJECT_DESCRIPTION`] characters;
+    /// empty by default.
+    pub description: String,
     /// Canonical toplevel of the main checkout.
     pub repo_path: String,
     pub default_target_branch: String,
@@ -204,6 +221,14 @@ pub struct AttemptView {
     pub permission_mode: PermissionMode,
     pub model: Option<String>,
     pub effort: Option<Effort>,
+    /// `CLAUDE_CODE_SUBAGENT_MODEL` of every turn (one of [`MODEL_ALIASES`]); `None` = the
+    /// CLI's default. A sub-agent that asks for its own model may still use another one.
+    pub subagent_model: Option<String>,
+    /// Sub-agents the main agent may spawn over the whole attempt (0..=[`MAX_SUBAGENTS`]);
+    /// `None` = no limit (the argv is the one without this feature).
+    pub max_subagents: Option<u8>,
+    /// Sub-agent spawns allowed so far (counted by the host, persisted).
+    pub subagents_used: u32,
     pub session_started: bool,
     pub merge_commit: Option<String>,
     pub running: bool,
@@ -240,6 +265,113 @@ pub struct TaskDetail {
     pub processes: Vec<ProcessInfo>,
     /// Merged and discarded attempts, oldest first.
     pub closed_attempts: Vec<AttemptView>,
+    /// Files attached to the task, oldest first.
+    pub attachments: Vec<Attachment>,
+}
+
+/// A file attached to a task: a copy in the app's data dir (never in a worktree, never
+/// committed), read-only for the agents (spec F5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attachment {
+    pub id: Id,
+    pub task_id: Id,
+    /// File name as picked (sanitized), also the copy's name.
+    pub name: String,
+    /// Bytes, at most [`MAX_ATTACHMENT_BYTES`].
+    pub size: u64,
+    /// Absolute path of the copy, computed by the core:
+    /// `<data_dir>/attachments/<project_id>/<task_id>/<attachment_id>/<name>`.
+    pub path: String,
+    pub created_at: Millis,
+}
+
+/// A file chosen in the native picker, staged by the core: the webview only ever sees the
+/// token, never the path (`add_task_attachments` redeems it once; it expires after 10 min).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickedFile {
+    pub token: Id,
+    pub name: String,
+    pub size: u64,
+}
+
+/// What the agents of a project find in its repository (spec F3): read from the commit at
+/// the tip of `default_target_branch`, where new worktrees start and what a Trusted approval
+/// approves, never from the main checkout nor from `$HOME`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOverview {
+    pub project_id: Id,
+    /// `default_target_branch`.
+    pub branch: String,
+    /// Full hex id of the commit read.
+    pub commit: String,
+    /// The agents load the repository's configuration (`.claude/`, `.mcp.json`, CLAUDE.md as
+    /// memory): policy Trusted and `Project::trusted`.
+    pub agents_load_config: bool,
+    /// `CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`, `README.md`, `.claude/settings.json`,
+    /// `.mcp.json`: those present in the commit, in this order.
+    pub files: Vec<ContextFile>,
+    /// Servers of `.mcp.json` (never those of `~/.claude.json`, which the app does not read).
+    pub mcp_servers: Vec<McpServer>,
+    /// Names under `.claude/agents`, `.claude/commands`, `.claude/skills`, sorted.
+    pub claude_agents: Vec<String>,
+    pub claude_commands: Vec<String>,
+    pub claude_skills: Vec<String>,
+}
+
+/// One file of [`ProjectOverview::files`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextFile {
+    /// Relative to the repository root, e.g. `.claude/settings.json`.
+    pub path: String,
+    pub kind: ContextFileKind,
+    /// Bytes of the blob (of the link target string for a symlink).
+    pub size: u64,
+    /// UTF-8 text with hidden and bidirectional characters shown as `⟨U+XXXX⟩`, secrets masked
+    /// (values of `env` and `headers`, `*Helper` and credential helpers, URLs without
+    /// userinfo/query/fragment); `None` if too large, binary, a symlink or invalid JSON.
+    pub content: Option<String>,
+    /// Why `content` is missing or altered (Italian), e.g. `troppo grande (80 KiB)`,
+    /// `→ AGENTS.md`, `binario`, `JSON non valido`, `valori segreti mascherati`.
+    pub note: Option<String>,
+    /// `content`, or the symlink target shown in `note`, had hidden or bidirectional
+    /// characters, replaced.
+    pub hidden_chars: bool,
+    /// The CLI loads this file on its own in this project's agents (not merely readable).
+    pub used_by_agents: bool,
+    /// How the agents get this file (Italian), e.g. `caricato all'avvio` or `letto
+    /// dall'agente su istruzione del prompt`.
+    pub usage_note: String,
+}
+
+/// What a [`ContextFile`] is to the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContextFileKind {
+    /// `CLAUDE.md`, `.claude/CLAUDE.md`.
+    Memory,
+    /// `AGENTS.md`.
+    Agents,
+    /// `README.md`.
+    Readme,
+    /// `.claude/settings.json`.
+    Settings,
+    /// `.mcp.json`.
+    Mcp,
+}
+
+/// One server of `.mcp.json`: names only, never an env or header value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServer {
+    pub name: String,
+    /// `type` as declared (`stdio`, `http`, `sse`, …); else `stdio` with a `command`, `http`
+    /// with a `url`, else `sconosciuto`.
+    pub transport: String,
+    /// The command and its arguments (stdio) or the URL without userinfo, query and fragment,
+    /// at most 200 characters; empty when there is neither.
+    pub target: String,
+    /// Names of the `env` entries.
+    pub env_keys: Vec<String>,
+    /// Names of the `headers` entries.
+    pub header_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,9 +10,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalDecision, AttemptView, BranchList, BranchStatus, ConfigPolicy, DiffResult, Effort,
-    EntryPage, EnvStatus, Id, LoginMethod, MergeOutcome, OpenTarget, PermissionMode, ProcessInfo,
-    Project, Settings, TaskCard, TaskDetail, TaskStatus,
+    ApprovalDecision, Attachment, AttemptView, BranchList, BranchStatus, ConfigPolicy, DiffResult,
+    Effort, EntryPage, EnvStatus, Id, LoginMethod, MergeOutcome, OpenTarget, PermissionMode,
+    PickedFile, ProcessInfo, Project, ProjectOverview, Settings, TaskCard, TaskDetail, TaskStatus,
 };
 
 /// Typed marker of one IPC command.
@@ -103,6 +103,9 @@ pub struct UpdateProjectReq {
     pub default_target_branch: String,
     pub default_permission_mode: PermissionMode,
     pub default_model: Option<String>,
+    /// Trimmed, at most `MAX_PROJECT_DESCRIPTION` characters (`Invalid`). Absent = empty.
+    #[serde(default)]
+    pub description: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,6 +147,17 @@ pub struct StartAttemptReq {
     pub permission_mode: PermissionMode,
     pub model: Option<String>,
     pub effort: Option<Effort>,
+    /// One of `MODEL_ALIASES`; `None` = the CLI's default (`Invalid` otherwise).
+    pub subagent_model: Option<String>,
+    /// 0..=`MAX_SUBAGENTS` (`Invalid` otherwise); `None` = no limit.
+    pub max_subagents: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddTaskAttachmentsReq {
+    pub task_id: Id,
+    /// `PickedFile::token`s from `pick_attachment_files`, each usable once.
+    pub tokens: Vec<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +245,10 @@ cmd!(
     RemoveProject, "remove_project", IdReq => ()
 );
 cmd!(ListBranches, "list_branches", ProjectIdReq => BranchList);
+cmd!(
+    /// Read from the tip of the default target branch, never from `$HOME` (`Invalid`).
+    GetProjectOverview, "get_project_overview", ProjectIdReq => ProjectOverview
+);
 cmd!(GetBoard, "get_board", ProjectIdReq => Vec<TaskCard>);
 cmd!(CreateTask, "create_task", CreateTaskReq => TaskCard);
 cmd!(UpdateTask, "update_task", UpdateTaskReq => TaskCard);
@@ -243,6 +261,20 @@ cmd!(
     DeleteTask, "delete_task", IdReq => ()
 );
 cmd!(GetTaskDetail, "get_task_detail", IdReq => TaskDetail);
+cmd!(
+    /// Native multi-file picker; the core stages the files and returns one-use tokens (the
+    /// webview never passes a path). Empty if cancelled.
+    PickAttachmentFiles, "pick_attachment_files", Empty => Vec<PickedFile>
+);
+cmd!(
+    /// Copies the staged files into the task's folder; `Invalid` past
+    /// `MAX_ATTACHMENTS_PER_TASK` or for an unknown or expired token.
+    AddTaskAttachments, "add_task_attachments", AddTaskAttachmentsReq => Vec<Attachment>
+);
+cmd!(
+    /// Deletes the attachment's row and its copy.
+    RemoveTaskAttachment, "remove_task_attachment", IdReq => ()
+);
 cmd!(
     /// Returns once the worktree and the rows exist; the spawn is asynchronous.
     StartAttempt, "start_attempt", StartAttemptReq => AttemptView
@@ -293,12 +325,16 @@ pub const COMMAND_NAMES: &[&str] = &[
     SetProjectSecurity::NAME,
     RemoveProject::NAME,
     ListBranches::NAME,
+    GetProjectOverview::NAME,
     GetBoard::NAME,
     CreateTask::NAME,
     UpdateTask::NAME,
     MoveTask::NAME,
     DeleteTask::NAME,
     GetTaskDetail::NAME,
+    PickAttachmentFiles::NAME,
+    AddTaskAttachments::NAME,
+    RemoveTaskAttachment::NAME,
     StartAttempt::NAME,
     SendFollowUp::NAME,
     StopAttempt::NAME,

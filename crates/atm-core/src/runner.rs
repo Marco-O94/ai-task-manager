@@ -193,9 +193,15 @@ pub fn classify(outcome: &TurnOutcome) -> (ProcessStatus, Option<StopReason>) {
     }
 }
 
+/// `<data_dir>/logs/<attempt_id>` (spec §4): the raw logs of an attempt's turns, removed with
+/// its task or project.
+pub fn attempt_log_dir(data_dir: &Path, attempt_id: &str) -> PathBuf {
+    data_dir.join("logs").join(attempt_id)
+}
+
 /// `<data_dir>/logs/<attempt_id>/<process_id>` (spec §4); files inside are 0600.
 pub fn log_dir(data_dir: &Path, attempt_id: &str, process_id: &str) -> PathBuf {
-    data_dir.join("logs").join(attempt_id).join(process_id)
+    attempt_log_dir(data_dir, attempt_id).join(process_id)
 }
 
 /// Append-only log file (`stdout.jsonl`, `stderr.log`) that stops writing at `cap` bytes.
@@ -388,6 +394,8 @@ pub(crate) struct TurnRequest<'a> {
     pub(crate) head_before: Option<String>,
     /// `Db::next_entry_idx` of the attempt.
     pub(crate) next_idx: u32,
+    /// The task's attachments folder, canonical, when it has any (`--add-dir`, spec F5).
+    pub(crate) attachments_dir: Option<PathBuf>,
 }
 
 /// Everything a turn task needs; `process` is the row inserted before the spawn.
@@ -598,6 +606,11 @@ impl Inner {
             allow_rules: a.allow_rules.clone(),
             model: a.model.clone(),
             effort: a.effort,
+            subagents_left: a
+                .max_subagents
+                .map(|max| u32::from(max).saturating_sub(a.subagents_used)),
+            subagent_model: a.subagent_model.clone(),
+            attachments_dir: r.attachments_dir,
             append_prompt: claude::append_prompt(worktree, &a.branch, &a.target_branch),
         });
         let env = self

@@ -1,0 +1,93 @@
+---
+source: crates/atm-core/tests/git.rs
+expression: pinned(&isolated)
+---
+{
+  "project_id": "project-1",
+  "branch": "main",
+  "commit": "<tip>",
+  "agents_load_config": false,
+  "files": [
+    {
+      "path": "CLAUDE.md",
+      "kind": "Memory",
+      "size": 30,
+      "content": "# Regole\n\n- Esegui i test.\n",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "letto dall'agente su istruzione del prompt"
+    },
+    {
+      "path": ".claude/CLAUDE.md",
+      "kind": "Memory",
+      "size": 22,
+      "content": "Memoria del progetto.\n",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "non caricato in modalità Isolata: il prompt fa leggere solo il CLAUDE.md della radice"
+    },
+    {
+      "path": "AGENTS.md",
+      "kind": "Agents",
+      "size": 27,
+      "content": "Istruzioni per gli agenti.\n",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "letto su istruzione del prompt"
+    },
+    {
+      "path": "README.md",
+      "kind": "Readme",
+      "size": 30,
+      "content": "# Demo\n\nUn progetto di prova.\n",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "solo contesto per te"
+    },
+    {
+      "path": ".claude/settings.json",
+      "kind": "Settings",
+      "size": 42,
+      "content": "{\n  \"permissions\": {\n    \"allow\": [\n      \"Read(src/**)\"\n    ]\n  }\n}",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "non caricato in modalità Isolata"
+    },
+    {
+      "path": ".mcp.json",
+      "kind": "Mcp",
+      "size": 67,
+      "content": "{\n  \"mcpServers\": {\n    \"docs\": {\n      \"args\": [\n        \"tools/docs.js\"\n      ],\n      \"command\": \"node\"\n    }\n  }\n}",
+      "note": null,
+      "hidden_chars": false,
+      "used_by_agents": false,
+      "usage_note": "non caricato in modalità Isolata"
+    }
+  ],
+  "mcp_servers": [
+    {
+      "name": "docs",
+      "transport": "stdio",
+      "target": "node tools/docs.js",
+      "env_keys": [],
+      "header_keys": []
+    }
+  ],
+  "claude_agents": [
+    "linked",
+    "reviewer",
+    "team/planner"
+  ],
+  "claude_commands": [
+    "frontend/test",
+    "release"
+  ],
+  "claude_skills": [
+    "pdf"
+  ]
+}

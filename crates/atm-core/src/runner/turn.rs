@@ -10,7 +10,7 @@ use std::time::Duration;
 use atm_types::{
     AppError, ApprovalDecision, Level, LimitKind, NoticeAction, ProcessStatus, StopReason,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::io::{AsyncRead, BufReader};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -694,8 +694,10 @@ impl Turn {
     fn on_can_use_tool(&mut self, req: wire::CanUseTool, d: &mut Driver) {
         let approval_id = new_id();
         let pending = Pending::new(approval_id.clone(), &req);
+        let is_spawn = claude::SUBAGENT_TOOLS.contains(&req.tool_name.as_str());
+        let subagent = self.plan.ctx.attempt.max_subagents.filter(|_| is_spawn);
         let ask = req.tool_name == ASK_USER_QUESTION;
-        if !ask {
+        if !ask && subagent.is_none() {
             // Registered before the entry is visible, so the card counts it at once.
             guard(&self.handle.pending).insert(approval_id.clone(), pending.clone());
         }
@@ -707,18 +709,61 @@ impl Turn {
             now_ms(),
         );
         self.publish(ops);
-        if ask {
+        // Answered at once, never pending: `AskUserQuestion`, and a sub-agent spawn under a
+        // limit, which the host counts (spec F6).
+        let (decision, response) = if ask {
             let decision = ApprovalDecision::Deny {
                 message: wire::ASK_USER_QUESTION_DENY.into(),
                 interrupt: false,
             };
-            d.send(wire::approval_response(&pending, &decision));
-            let ops = self
-                .normalizer
-                .on_approval_resolved(&approval_id, &decision);
-            return self.publish(ops);
+            let response = wire::approval_response(&pending, &decision);
+            (decision, response)
+        } else if let Some(max) = subagent {
+            self.count_subagent(&pending, max)
+        } else {
+            return self.changed();
+        };
+        d.send(response);
+        let ops = self
+            .normalizer
+            .on_approval_resolved(&approval_id, &decision);
+        self.publish(ops);
+        if subagent.is_some() && matches!(decision, ApprovalDecision::Allow { .. }) {
+            // `subagents_used` changed: the task panel shows it.
+            self.changed();
         }
-        self.changed();
+    }
+
+    /// A sub-agent spawn under the attempt's limit of `max` (spec F6): allowed and counted
+    /// (`subagents_used`, persisted) while the limit allows it, else denied with a text for the
+    /// model rather than the user's deny wording. A count that cannot be written denies too.
+    fn count_subagent(&self, pending: &Pending, max: u8) -> (ApprovalDecision, Value) {
+        let counted = self
+            .inner
+            .db
+            .count_subagent(self.attempt_id(), now_ms())
+            .unwrap_or_else(|e| {
+                eprintln!("attempt {}: sub-agent not counted: {e}", self.attempt_id());
+                None
+            });
+        if counted.is_some() {
+            let decision = ApprovalDecision::Allow { remember: false };
+            let response = wire::approval_response(pending, &decision);
+            return (decision, response);
+        }
+        let message = format!(
+            "Sub-agent limit for this task reached ({max}). Complete the work directly without \
+             starting sub-agents."
+        );
+        let response = wire::control_success(
+            &pending.request_id,
+            json!({"behavior": "deny", "message": message, "interrupt": false}),
+        );
+        let decision = ApprovalDecision::Deny {
+            message,
+            interrupt: false,
+        };
+        (decision, response)
     }
 
     async fn on_cmd(&mut self, cmd: Cmd, d: &mut Driver) {
