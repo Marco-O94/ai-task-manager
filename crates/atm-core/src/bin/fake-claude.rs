@@ -33,6 +33,20 @@
 //! `sleep 300` running in a process group of its own, like a `run_in_background` command of the
 //! real Bash tool, then succeeds and exits at EOF as usual).
 //! Counts: `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
+//! `FAKE_CLAUDE_FLOOD_PAUSE_MS` (default 0): pause after every 100 texts of `flood`, so that
+//! several floods started one after the other overlap (the E2E's perf phase, M6).
+//!
+//! `FAKE_CLAUDE_PROJECT_CONFIG=1` (M6, the malicious-repo test): at startup, like the real CLI
+//! (M5, spec §13.4), the fake loads the repo's Claude configuration from its cwd. Unless
+//! `--setting-sources` leaves out `project` (resp. `local`; no flag = all sources), the
+//! `SessionStart` command hooks and the `apiKeyHelper` of `.claude/settings.json` (resp.
+//! `.claude/settings.local.json`) run through `sh -c`; unless `--strict-mcp-config`, every
+//! `.mcp.json` server with a `command` is started (waited for at most 5 s, then killed). Each
+//! run is recorded as `{"kind":"project_config","what":"hook"|"apiKeyHelper"|"mcp",…}`, and
+//! `system/init` lists the servers and says `apiKeySource: "apiKeyHelper"` after a helper ran.
+//! `apiKeySource` is otherwise `none`, or `ANTHROPIC_API_KEY` when that variable reached the
+//! fake (not empty), or the value of `FAKE_CLAUDE_API_KEY_SOURCE` when set, which wins over
+//! both: the app must stop a turn that would bill through an API key (spec §7.6).
 //! `FAKE_CLAUDE_DELTA_MS` (default 0): pause between the text deltas of a streamed text, so a
 //! UI can be seen rendering it progressively.
 
@@ -45,14 +59,38 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// Variables whose presence is recorded (never their values).
+/// Variables whose presence is recorded (never their values): the credentials, a parent
+/// Claude Code session's variables and its host's (every name of `claude::CLAUDE_NESTING_VARS`
+/// and `HOST_SESSION_VARS`, one per prefix: `tests/claude.rs` checks it; cmux's `NODE_OPTIONS`
+/// and its marker) and the git ones the app must remove (spec §7.2), plus
+/// `CLAUDE_CONFIG_DIR`, the user's configuration that must pass.
 const RECORDED_VARS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "GIT_DIR",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_SSE_PORT",
+    "ENABLE_IDE_INTEGRATION",
+    "CMUX_SOCKET_PATH",
+    "CMUX_CUA_AUTH_TOKEN_FILE",
+    "CMUX_ORIGINAL_NODE_OPTIONS_PRESENT",
+    "NODE_OPTIONS",
+    "CLAUDE_CONFIG_DIR",
 ];
+/// Overrides `system/init.apiKeySource` (any value, `none` included).
+const API_KEY_SOURCE_ENV: &str = "FAKE_CLAUDE_API_KEY_SOURCE";
+/// `1` = load the repo's configuration at startup ([`Session::load_project_config`]).
+const PROJECT_CONFIG_ENV: &str = "FAKE_CLAUDE_PROJECT_CONFIG";
+/// How long a project MCP server may run before the fake kills it.
+const MCP_SERVER_WAIT: Duration = Duration::from_secs(5);
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -131,6 +169,10 @@ struct Session {
     counter: u64,
     /// Text of the user message being played.
     prompt: String,
+    /// Project MCP servers started at startup (`system/init.mcp_servers`).
+    mcp_servers: Vec<String>,
+    /// `system/init.apiKeySource`.
+    api_key_source: String,
 }
 
 impl Session {
@@ -140,7 +182,7 @@ impl Session {
                 .find_map(|a| a.strip_prefix(name))
                 .map(str::to_owned)
         };
-        let session = Session {
+        let mut session = Session {
             rx: spawn_stdin_reader(),
             session_id: flag("--session-id=")
                 .or_else(|| flag("--resume="))
@@ -151,6 +193,13 @@ impl Session {
             record: std::env::var_os("FAKE_CLAUDE_RECORD").map(PathBuf::from),
             counter: 0,
             prompt: String::new(),
+            mcp_servers: Vec::new(),
+            api_key_source: if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|k| !k.is_empty())
+            {
+                "ANTHROPIC_API_KEY".into()
+            } else {
+                "none".into()
+            },
         };
         let env: serde_json::Map<String, Value> = RECORDED_VARS
             .iter()
@@ -165,7 +214,102 @@ impl Session {
             "pid": std::process::id(),
             "env": env,
         }));
+        if std::env::var(PROJECT_CONFIG_ENV).as_deref() == Ok("1") {
+            session.load_project_config(args);
+        }
+        if let Ok(source) = std::env::var(API_KEY_SOURCE_ENV) {
+            session.api_key_source = source;
+        }
         session
+    }
+
+    /// What the real CLI runs of the repo's configuration at startup (module docs).
+    fn load_project_config(&mut self, args: &[String]) {
+        let sources: Vec<&str> = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--setting-sources="))
+            .map_or_else(
+                || vec!["user", "project", "local"],
+                |list| list.split(',').map(str::trim).collect(),
+            );
+        for (source, file) in [
+            ("project", "settings.json"),
+            ("local", "settings.local.json"),
+        ] {
+            if !sources.contains(&source) {
+                continue;
+            }
+            let path = self.cwd.join(".claude").join(file);
+            let Some(settings) = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            else {
+                continue;
+            };
+            let hooks = settings["hooks"]["SessionStart"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|matcher| matcher["hooks"].as_array().into_iter().flatten());
+            for command in hooks.filter_map(|h| h["command"].as_str()) {
+                self.run_config("hook", command);
+            }
+            if let Some(helper) = settings["apiKeyHelper"].as_str() {
+                self.run_config("apiKeyHelper", helper);
+                self.api_key_source = "apiKeyHelper".into();
+            }
+        }
+        if args.iter().any(|a| a == "--strict-mcp-config") {
+            return;
+        }
+        let Some(mcp) = std::fs::read_to_string(self.cwd.join(".mcp.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        else {
+            return;
+        };
+        let servers = mcp["mcpServers"].as_object().cloned().unwrap_or_default();
+        for (name, server) in servers {
+            let Some(command) = server["command"].as_str() else {
+                continue;
+            };
+            let server_args: Vec<&str> = server["args"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let spawned = Command::new(command)
+                .args(&server_args)
+                .current_dir(&self.cwd)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            if let Ok(mut child) = spawned {
+                let deadline = Instant::now() + MCP_SERVER_WAIT;
+                while matches!(child.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            self.record(json!({"kind": "project_config", "what": "mcp", "server": name}));
+            self.mcp_servers.push(name);
+        }
+    }
+
+    /// `sh -c <command>` in the cwd, waited for, then recorded.
+    fn run_config(&self, what: &str, command: &str) {
+        let _ = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(&self.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        self.record(json!({"kind": "project_config", "what": what, "command": command}));
     }
 
     fn record(&self, line: Value) {
@@ -320,7 +464,12 @@ impl Session {
                 self.result("success", false, Some("Output grande completato."));
             }
             "flood" => {
+                let pause =
+                    Duration::from_millis(count_env("FAKE_CLAUDE_FLOOD_PAUSE_MS", 0).into());
                 for i in 0..count_env("FAKE_CLAUDE_FLOOD_EVENTS", 10_000) {
+                    if i > 0 && i % 100 == 0 && !pause.is_zero() {
+                        std::thread::sleep(pause);
+                    }
                     self.text(&format!("Evento {i}"));
                 }
                 self.result("success", false, Some("Flood completato."));
@@ -527,10 +676,12 @@ impl Session {
                 "subtype": "init",
                 "cwd": self.cwd,
                 "tools": ["Bash", "Read", "Write", "Edit"],
-                "mcp_servers": [],
+                "mcp_servers": self.mcp_servers.iter()
+                    .map(|name| json!({"name": name, "status": "connected"}))
+                    .collect::<Vec<_>>(),
                 "model": "claude-fake",
                 "permissionMode": self.permission_mode,
-                "apiKeySource": "none",
+                "apiKeySource": self.api_key_source,
                 "claude_code_version": atm_types::CLAUDE_TESTED_VERSION,
                 "slash_commands": [], "skills": [], "plugins": [], "agents": [],
                 "output_style": "default",

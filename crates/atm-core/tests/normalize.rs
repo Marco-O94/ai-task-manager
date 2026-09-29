@@ -142,6 +142,34 @@ fn session_init_warns_without_an_api_key_source() {
     assert!(key[0].contains("chiave API (ANTHROPIC_API_KEY)"), "{key:?}");
 }
 
+/// What makes the runner stop a turn (spec §7.6): a `system/init` whose `apiKeySource` is
+/// present and not in `NO_API_KEY_SOURCES` (any case). A missing value only warns (above);
+/// other lines never count.
+#[test]
+fn api_key_billing_of_system_init() {
+    let init = |source: Value| json!({"type":"system","subtype":"init","session_id":"s1","apiKeySource":source});
+    for source in [
+        "ANTHROPIC_API_KEY",
+        "apiKeyHelper",
+        "/login managed key",
+        "",
+    ] {
+        assert_eq!(
+            normalize::api_key_billing(&init(source.into())),
+            Some(source),
+            "{source}"
+        );
+    }
+    for none in normalize::NO_API_KEY_SOURCES {
+        assert_eq!(normalize::api_key_billing(&init((*none).into())), None);
+        let upper = none.to_uppercase();
+        assert_eq!(normalize::api_key_billing(&init(upper.into())), None);
+    }
+    assert_eq!(normalize::api_key_billing(&init(Value::Null)), None);
+    let status = json!({"type":"system","subtype":"status","apiKeySource":"ANTHROPIC_API_KEY"});
+    assert_eq!(normalize::api_key_billing(&status), None);
+}
+
 #[test]
 fn stream_event_typing_preview() {
     let mut n = normalizer();
@@ -812,4 +840,184 @@ fn fixture_approval_turn() {
         _ => None,
     });
     insta::assert_json_snapshot!(view(ops));
+}
+
+/// M6, from M5's `git push` (spec §13.4): a call denied by a settings rule is `Denied` with the
+/// CLI's text, whichever of the three signals arrives: `system/permission_denied`, the
+/// `tool_result` (its `non_execution_kind` or its text alone), `result.permission_denials`.
+#[test]
+fn rule_denials_are_denied_not_failed() {
+    let denial = "Permission to use Bash with command git push has been denied.";
+    let push = || tool_use("toolu_push", "Bash", json!({"command":"git push"}));
+    let result = |ids: &[&str]| {
+        let denials: Vec<Value> = ids
+            .iter()
+            .map(|id| json!({"tool_name":"Bash","tool_use_id":id,"tool_input":{}}))
+            .collect();
+        json!({"type":"result","subtype":"success","is_error":false,"result":"Blocked.",
+               "permission_denials":denials})
+    };
+    let denied = |ops: &[EntryOp]| {
+        tool_status(ops)
+            .last()
+            .map(|(_, _, status)| status.clone())
+            .unwrap()
+    };
+    let expected = ToolStatus::Denied {
+        message: denial.into(),
+    };
+
+    // The real sequence: system/permission_denied, then the tool_result with its meta.
+    let mut n = normalizer();
+    let mut ops = n.on_line(&push(), 1000);
+    let line = json!({"type":"system","subtype":"permission_denied","tool_name":"Bash",
+        "tool_use_id":"toolu_push","decision_reason_type":"rule","message":denial});
+    ops.extend(n.on_line(&line, 1010));
+    assert_eq!(denied(&ops), expected);
+    let mut result_line = tool_result("toolu_push", json!(denial), true);
+    result_line["tool_result_meta"] =
+        json!([{"id":"toolu_push","non_execution_kind":"permission-rule"}]);
+    ops.extend(n.on_line(&result_line, 1020));
+    assert_eq!(denied(&ops), expected);
+    let end = n.on_line(&result(&["toolu_push"]), 1030);
+    assert!(tool_status(&end).is_empty(), "already Denied: no update");
+    insta::assert_json_snapshot!(view(ops));
+
+    // Only the text of the tool_result.
+    let mut n = normalizer();
+    let mut ops = n.on_line(&push(), 1000);
+    ops.extend(n.on_line(&tool_result("toolu_push", json!(denial), true), 1010));
+    assert_eq!(denied(&ops), expected);
+    assert!(normalize::is_rule_denial(denial));
+    assert!(!normalize::is_rule_denial("Permission to use Bash: yes"));
+
+    // Only `permission_denials`: a failed call becomes Denied with its output, an unknown or
+    // succeeded one is left alone.
+    let mut n = normalizer();
+    let mut ops = n.on_line(&push(), 1000);
+    ops.extend(n.on_line(&tool_result("toolu_push", json!("blocked"), true), 1010));
+    ops.extend(n.on_line(&tool_use("toolu_ok", "Bash", json!({"command":"ls"})), 1020));
+    ops.extend(n.on_line(&tool_result("toolu_ok", json!("a.txt"), false), 1030));
+    let end = n.on_line(&result(&["toolu_push", "toolu_ok", "toolu_gone"]), 1040);
+    let statuses = tool_status(&end);
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    assert_eq!(
+        statuses[0].2,
+        ToolStatus::Denied {
+            message: "blocked".into()
+        }
+    );
+    // A user's denial stays as the user wrote it.
+    let mut n = normalizer();
+    n.on_line(&push(), 1000);
+    n.on_approval_requested(
+        "ap-1",
+        &json!({"tool_use_id":"toolu_push","tool_name":"Bash",
+        "input":{"command":"git push"}}),
+        false,
+        1001,
+    );
+    n.on_approval_resolved(
+        "ap-1",
+        &ApprovalDecision::Deny {
+            message: "no".into(),
+            interrupt: false,
+        },
+    );
+    let ops = n.on_line(&tool_result("toolu_push", json!(denial), true), 1010);
+    assert_eq!(
+        denied(&ops),
+        ToolStatus::Denied {
+            message: "no".into()
+        }
+    );
+}
+
+/// M6, from M5's Stop (spec §13.4): after `on_stop_requested` the error `result` answering the
+/// interrupt is a `TurnEnd` with `stopped` and without the CLI's `[ede_diagnostic]`, and the
+/// approved call the CLI rejected on the interrupt is `Cancelled` without that canned text.
+/// Without a stop nothing changes.
+#[test]
+fn a_stopped_turn_ends_interrupted_not_failed() {
+    let interrupted = json!({"type":"result","subtype":"error_during_execution","is_error":true,
+        "num_turns":4,"duration_ms":4291,"total_cost_usd":0.2,"permission_denials":[],
+        "errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"],
+        "terminal_reason":"aborted_tools"});
+    let mut rejected = tool_result(
+        "toolu_wait",
+        json!("The user doesn't want to proceed with this tool use. STOP what you are doing."),
+        true,
+    );
+    rejected["tool_result_meta"] =
+        json!([{"id":"toolu_wait","non_execution_kind":"user-rejected"}]);
+    let wait = tool_use("toolu_wait", "Bash", json!({"command":"sleep 41"}));
+
+    let mut n = normalizer();
+    let mut ops = n.on_line(&wait, 1000);
+    n.on_stop_requested(atm_types::StopReason::UserStop);
+    n.on_stop_requested(atm_types::StopReason::AppShutdown); // the first reason wins
+    ops.extend(n.on_line(&rejected, 1010));
+    ops.extend(n.on_line(&interrupted, 1020));
+    insta::assert_json_snapshot!(view(ops));
+
+    let mut n = normalizer();
+    n.on_line(&wait, 1000);
+    let ops = n.on_line(&rejected, 1010);
+    assert_eq!(tool_status(&ops)[0].2, ToolStatus::Failed);
+    let end = n.on_line(&interrupted, 1020);
+    let body = &upserts(&end)[0].body;
+    assert!(
+        matches!(body, EntryBody::TurnEnd { stopped: None, text: Some(t), .. }
+            if t.starts_with("[ede_diagnostic]")),
+        "{body:?}"
+    );
+
+    // A stop that lost the race against a successful result keeps it as it is.
+    let mut n = normalizer();
+    n.on_stop_requested(atm_types::StopReason::UserStop);
+    let ok = json!({"type":"result","subtype":"success","is_error":false,"result":"Done."});
+    let body = upserts(&n.on_line(&ok, 1000))[0].body.clone();
+    assert!(
+        matches!(body, EntryBody::TurnEnd { stopped: None, text: Some(ref t), .. } if t == "Done."),
+        "{body:?}"
+    );
+
+    // Finding M6 #18: a real error already queued when Stop was pressed keeps its text and is
+    // not labelled as the user's stop; the answer to the interrupt still is, whatever its
+    // `terminal_reason` (`aborted_streaming`, or only `[ede_diagnostic]` text).
+    for real in [
+        json!({"type":"result","subtype":"success","is_error":true,
+            "result":"API Error: 529 Overloaded"}),
+        json!({"type":"result","subtype":"error_max_turns","is_error":true,
+            "errors":["Reached maximum number of turns (3)"],"terminal_reason":"max_turns"}),
+    ] {
+        let mut n = normalizer();
+        n.on_stop_requested(atm_types::StopReason::UserStop);
+        let body = upserts(&n.on_line(&real, 1000))[0].body.clone();
+        assert!(
+            matches!(body, EntryBody::TurnEnd { stopped: None, text: Some(ref t), .. }
+                if !t.is_empty() && !t.starts_with("[ede_diagnostic]")),
+            "{body:?}"
+        );
+    }
+    for answer in [
+        json!({"type":"result","subtype":"error_during_execution","is_error":true,
+            "errors":["something"],"terminal_reason":"aborted_streaming"}),
+        json!({"type":"result","subtype":"error_during_execution","is_error":true}),
+    ] {
+        let mut n = normalizer();
+        n.on_stop_requested(atm_types::StopReason::UserStop);
+        let body = upserts(&n.on_line(&answer, 1000))[0].body.clone();
+        assert!(
+            matches!(
+                body,
+                EntryBody::TurnEnd {
+                    stopped: Some(atm_types::StopReason::UserStop),
+                    text: None,
+                    ..
+                }
+            ),
+            "{body:?}"
+        );
+    }
 }

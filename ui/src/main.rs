@@ -1,10 +1,12 @@
 mod app;
-#[cfg(not(feature = "mock"))]
+// The selftest and E2E drivers exist only with `--features testkit` (debug bundles), never in the
+// release WASM (spec §11.2 M6), and not in the mock (there is no backend to drive).
+#[cfg(all(feature = "testkit", not(feature = "mock")))]
 mod e2e;
 #[rustfmt::skip] // vendored Rust/UI code, kept byte-identical to upstream
 mod hooks;
 mod ipc;
-#[cfg(not(feature = "mock"))]
+#[cfg(all(feature = "testkit", not(feature = "mock")))]
 mod selftest;
 #[rustfmt::skip] // vendored Rust/UI code, kept byte-identical to upstream
 mod ui;
@@ -37,11 +39,11 @@ use leptos::prelude::*;
 
 fn main() {
     console_error_panic_hook::set_once();
-    #[cfg(not(feature = "mock"))]
+    #[cfg(all(feature = "testkit", not(feature = "mock")))]
     selftest::count_csp_violations();
     apply_color_scheme();
     leptos::mount::mount_to_body(app::App);
-    #[cfg(not(feature = "mock"))]
+    #[cfg(all(feature = "testkit", not(feature = "mock")))]
     {
         leptos::task::spawn_local(selftest::run_if_enabled());
         leptos::task::spawn_local(e2e::run_if_enabled());

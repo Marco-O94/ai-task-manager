@@ -3,7 +3,7 @@
 
 mod project;
 
-use atm_types::{Empty, GetSettings, Settings, UpdateSettings};
+use atm_types::{Empty, EnvStatus, GetSettings, Settings, UpdateSettings};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -151,6 +151,9 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
                     placeholder="/Users/…/.local/bin/claude"
                 />
             </Field>
+            <p class="text-muted-foreground -mt-2 text-xs break-all" data-testid="settings-env">
+                {move || ctx.env.with(|env| env.as_ref().map(env_summary))}
+            </p>
             <div class="grid grid-cols-2 gap-4">
                 <Field id="settings-model" label="Modello predefinito">
                     <Select id="settings-model" value=model options=owned(MODELS) />
@@ -181,6 +184,7 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
                 </Button>
                 <Button
                     attr:r#type="submit"
+                    attr:data-action="save-settings"
                     attr:disabled=move || saving.get() || loaded.with(Option::is_none)
                 >
                     "Salva"
@@ -260,6 +264,21 @@ fn Select(
     }
 }
 
+/// The CLI and the git the app found (spec §7.1, §8.1): an app launched from the Finder does not
+/// have the Terminal's `PATH`, so this says which ones it is using.
+fn env_summary(env: &EnvStatus) -> String {
+    let claude = match (&env.claude.path, &env.claude.version) {
+        (Some(path), Some(version)) => format!("Claude Code {version} ({path})"),
+        (Some(path), None) => format!("Claude Code ({path})"),
+        (None, _) => "Claude Code non trovato".to_owned(),
+    };
+    let git = env
+        .git_version
+        .as_ref()
+        .map_or_else(|| "git non disponibile".to_owned(), |v| format!("git {v}"));
+    format!("In uso: {claude}; {git}.")
+}
+
 fn owned(options: &[(&str, &str)]) -> Vec<(String, String)> {
     options
         .iter()
@@ -270,4 +289,50 @@ fn owned(options: &[(&str, &str)]) -> Vec<(String, String)> {
 fn non_empty(s: String) -> Option<String> {
     let s = s.trim();
     (!s.is_empty()).then(|| s.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use atm_types::{AuthState, ClaudeInfo};
+
+    use super::*;
+
+    fn env(path: Option<&str>, version: Option<&str>, git: Option<&str>) -> EnvStatus {
+        EnvStatus {
+            claude: ClaudeInfo {
+                path: path.map(Into::into),
+                version: version.map(Into::into),
+                supported: true,
+                min_version: "2.1.0".into(),
+                tested_version: "2.1.283".into(),
+            },
+            auth: AuthState::LoggedOut,
+            git_version: git.map(Into::into),
+            api_key_in_env: false,
+            cloud_provider_env: false,
+            base_url_env: false,
+            paused: None,
+            running: 0,
+            max_running: 2,
+            problems: Vec::new(),
+            checked_at: 0,
+        }
+    }
+
+    #[test]
+    fn env_summary_names_the_cli_and_git_in_use() {
+        let found = env(
+            Some("/u/.local/bin/claude"),
+            Some("2.1.284"),
+            Some("2.54.0"),
+        );
+        assert_eq!(
+            env_summary(&found),
+            "In uso: Claude Code 2.1.284 (/u/.local/bin/claude); git 2.54.0."
+        );
+        assert_eq!(
+            env_summary(&env(None, None, None)),
+            "In uso: Claude Code non trovato; git non disponibile."
+        );
+    }
 }

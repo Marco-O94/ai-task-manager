@@ -88,8 +88,28 @@ impl ProjectRow {
             allow_bypass: self.allow_bypass,
             created_at: self.created_at,
             updated_at: self.updated_at,
+            trust_error: None,
         }
     }
+
+    /// The security fields, as a compare-and-set expects them ([`Db::set_project_security`]).
+    pub fn security(&self) -> SecurityState {
+        SecurityState {
+            config_policy: self.config_policy,
+            allow_bypass: self.allow_bypass,
+            trusted_fingerprint: self.trusted_fingerprint.clone(),
+        }
+    }
+}
+
+/// The stored security state of a project that a change applies to (M6): a change whose
+/// expected state is no longer the stored one is refused (`Conflict`), so what the user
+/// confirmed is what gets stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SecurityState {
+    pub config_policy: ConfigPolicy,
+    pub allow_bypass: bool,
+    pub trusted_fingerprint: Option<String>,
 }
 
 /// `attempts` row (spec §5.2).
@@ -362,49 +382,87 @@ impl Db {
         now: Millis,
     ) -> Result<ProjectRow, AppError> {
         self.write(|c| {
-            c.query_row(
-                "UPDATE projects SET name = ?2, default_target_branch = ?3,
-                    default_permission_mode = ?4, default_model = ?5, updated_at = ?6
-                 WHERE id = ?1 RETURNING *",
-                params![
-                    req.id,
-                    req.name,
-                    req.default_target_branch,
-                    req.default_permission_mode.as_str(),
-                    req.default_model,
-                    now,
-                ],
-                project_row,
-            )
-            .or_missing("Progetto", &req.id)
+            // Autonomo only while the project allows it, checked with the write (a revocation
+            // may have landed since the caller read the row).
+            let row = c
+                .query_row(
+                    "UPDATE projects SET name = ?2, default_target_branch = ?3,
+                        default_permission_mode = ?4, default_model = ?5, updated_at = ?6
+                     WHERE id = ?1 AND (?4 <> 'bypassPermissions' OR allow_bypass = 1)
+                     RETURNING *",
+                    params![
+                        req.id,
+                        req.name,
+                        req.default_target_branch,
+                        req.default_permission_mode.as_str(),
+                        req.default_model,
+                        now,
+                    ],
+                    project_row,
+                )
+                .optional()?;
+            match row {
+                Some(row) => Ok(row),
+                None => {
+                    get_project(c, &req.id)?;
+                    Err(AppError::invalid(
+                        "La modalità Autonoma richiede di abilitarla nella sicurezza del progetto",
+                    )
+                    .into())
+                }
+            }
         })
     }
 
-    /// Sets policy, bypass opt-in and the approved fingerprint (`None` clears it).
-    /// Errors: `NotFound`.
+    /// Sets policy, bypass opt-in and the approved fingerprint (`None` clears it), and resets
+    /// a default mode of Autonomo to Auto-edit when the bypass is off, in one statement, only
+    /// if the project still has `expected` (compare-and-set). Errors: `NotFound`, `Conflict`
+    /// (the stored state is no longer `expected`).
     pub fn set_project_security(
         &self,
         id: &str,
+        expected: &SecurityState,
         config_policy: ConfigPolicy,
         allow_bypass: bool,
         trusted_fingerprint: Option<&str>,
         now: Millis,
     ) -> Result<ProjectRow, AppError> {
         self.write(|c| {
-            c.query_row(
-                "UPDATE projects SET config_policy = ?2, allow_bypass = ?3,
-                    trusted_fingerprint = ?4, updated_at = ?5
-                 WHERE id = ?1 RETURNING *",
-                params![
-                    id,
-                    config_policy.as_str(),
-                    allow_bypass,
-                    trusted_fingerprint,
-                    now
-                ],
-                project_row,
-            )
-            .or_missing("Progetto", id)
+            let row = c
+                .query_row(
+                    "UPDATE projects SET config_policy = ?2, allow_bypass = ?3,
+                        trusted_fingerprint = ?4,
+                        default_permission_mode = CASE
+                            WHEN ?3 = 0 AND default_permission_mode = 'bypassPermissions'
+                            THEN 'acceptEdits' ELSE default_permission_mode END,
+                        updated_at = ?5
+                     WHERE id = ?1 AND config_policy = ?6 AND allow_bypass = ?7
+                        AND trusted_fingerprint IS ?8
+                     RETURNING *",
+                    params![
+                        id,
+                        config_policy.as_str(),
+                        allow_bypass,
+                        trusted_fingerprint,
+                        now,
+                        expected.config_policy.as_str(),
+                        expected.allow_bypass,
+                        expected.trusted_fingerprint,
+                    ],
+                    project_row,
+                )
+                .optional()?;
+            match row {
+                Some(row) => Ok(row),
+                None => {
+                    get_project(c, id)?;
+                    Err(AppError::conflict(
+                        "La sicurezza del progetto è cambiata nel frattempo: riapri le \
+                         impostazioni e riprova",
+                    )
+                    .into())
+                }
+            }
         })
     }
 

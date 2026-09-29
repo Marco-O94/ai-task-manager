@@ -63,9 +63,13 @@ pub struct E2eSetup {
     pub mcp_repo: String,
     pub fake_claude: String,
     /// Which of the variables fake-claude records the presence of (`ANTHROPIC_API_KEY`,
-    /// `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `GIT_DIR`) are set in the
-    /// app's own environment (`scripts/e2e.sh` sets them all: the agents must not get them).
+    /// `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`, `GIT_DIR`, …) are set in
+    /// the app's own environment (`scripts/e2e.sh` sets them all: the agents must not get them).
     pub app_env: Vec<String>,
+    /// The variables of a parent session the app removed from its own environment at startup
+    /// by re-executing itself (M6), names only.
+    #[serde(default)]
+    pub scrubbed_at_start: Vec<String>,
     /// What phase 1 handed over with `debug_e2e_quit`.
     pub phase1: Option<serde_json::Value>,
 }
@@ -78,6 +82,12 @@ pub struct E2eAuthReq {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct E2ePathReq {
     pub path: String,
+}
+
+/// The answer of the next native confirmation (spec §10.2): OK (`true`) or Annulla.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct E2eConfirmReq {
+    pub accept: bool,
 }
 
 /// The login `.command` written by `open_login_terminal`, the `open` calls recorded instead of
@@ -138,6 +148,16 @@ cmd!(
 cmd!(
     /// The next `pick_repo_folder` returns this path instead of opening the native picker.
     DebugE2eQueuePick, "debug_e2e_queue_pick", E2ePathReq => ()
+);
+cmd!(
+    /// The next native confirmation (Trusted, bypass, API key; M6) gets this answer instead of
+    /// being shown: the run cannot click a native dialog. One answer per confirmation; one
+    /// asked with nothing queued is answered Annulla.
+    DebugE2eQueueConfirm, "debug_e2e_queue_confirm", E2eConfirmReq => ()
+);
+cmd!(
+    /// `"<title>: <text>"` of every native confirmation asked since the app started.
+    DebugE2eConfirms, "debug_e2e_confirms", Empty => Vec<String>
 );
 cmd!(DebugE2eLoginScript, "debug_e2e_login_script", Empty => E2eLoginScript);
 cmd!(

@@ -1,5 +1,5 @@
 //! Hardened git CLI runner and the worktree / commit / diff / merge operations (spec §8).
-//! Owner: M2-GIT (the fingerprint, §8.9, is M6).
+//! Owner: M2-GIT; the fingerprint (§8.9, `git/fingerprint.rs`) is M6's.
 //!
 //! Locking is the caller's (spec §8.1): Core holds the per-attempt mutex and, for
 //! `worktree add/remove`, merge and branch deletion, the per-repo mutex (order attempt → repo).
@@ -10,6 +10,7 @@
 //! `worktree prune`, `branch -D` outside `atm/*`, `rm -rf` outside the worktree root.
 
 mod diff;
+mod fingerprint;
 mod merge;
 mod parse;
 
@@ -23,13 +24,23 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use atm_types::{AppError, BranchList, ErrorCode, WorktreeState};
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+pub use fingerprint::{
+    BILLING_ENV_VARS, BILLING_SETTINGS_KEYS, CONFIG_ENTRIES, ConfigSnapshot, MAX_COMMAND_WORDS,
+    MAX_CONFIG_BYTES, MAX_CONFIG_DEPTH, MAX_CONFIG_FILES, MAX_LINK_HOPS, MAX_TREE_BYTES,
+    MAX_WALK_STEPS, MAX_WALK_TIME, MCP_FILE, RecordDigest, SETTINGS_FILES,
+    commit_snapshot_blocking, config_fingerprint_blocking, config_snapshot_blocking,
+    differing_paths, is_broad_rule, shell_words,
+};
 pub use parse::{parse_hunks, parse_worktree_list};
 
-/// `merge-tree --write-tree` (spec §2.1).
-pub const MIN_GIT_VERSION: &str = "2.38";
+/// `merge-tree --write-tree` (2.38, spec §2.1) and `GIT_NO_LAZY_FETCH` (2.44): without it the
+/// lazy fetch of a partial clone runs a command of the repository's configuration
+/// (`remote.<name>.uploadpack`, a transport) from any read of a missing object. A [`Git`]
+/// found older runs nothing ([`Git::gated`]).
+pub const MIN_GIT_VERSION: &str = "2.44";
 /// Used when `git` is not on the login-shell PATH.
 pub const FALLBACK_GIT: &str = "/usr/bin/git";
 
@@ -189,6 +200,8 @@ pub struct Git {
     bin: PathBuf,
     path_var: OsString,
     extra_env: Vec<(OsString, OsString)>,
+    /// Set by [`Git::gated`] for a git older than [`MIN_GIT_VERSION`]: why every call fails.
+    refused: Option<String>,
 }
 
 impl Git {
@@ -198,7 +211,21 @@ impl Git {
             bin,
             path_var,
             extra_env: Vec::new(),
+            refused: None,
         }
+    }
+
+    /// This runner, refusing every call (`Git`, with the reason) but [`Git::version`] when git
+    /// answers `--version` with a version older than [`MIN_GIT_VERSION`]: such a git ignores
+    /// `GIT_NO_LAZY_FETCH` (spec §8.1). A git that does not answer is left alone (its calls
+    /// fail on their own).
+    pub async fn gated(mut self) -> Git {
+        if let Ok((version, found)) = self.found_version().await
+            && Some(found) < parse::major_minor(MIN_GIT_VERSION)
+        {
+            self.refused = Some(too_old(&version));
+        }
+        self
     }
 
     /// Adds `vars` to the inherited environment of every call, before the scrub and the
@@ -215,6 +242,15 @@ impl Git {
 
     /// `git --version` → `"2.54.0"`. Errors: `Git` if missing or older than [`MIN_GIT_VERSION`].
     pub async fn version(&self) -> Result<String, AppError> {
+        let (version, found) = self.found_version().await?;
+        if Some(found) < parse::major_minor(MIN_GIT_VERSION) {
+            return Err(AppError::git(too_old(&version)));
+        }
+        Ok(version)
+    }
+
+    /// `git --version`, parsed: the version and its major and minor numbers.
+    async fn found_version(&self) -> Result<(String, (u32, u32)), AppError> {
         let opts = RunOpts {
             timeout: Some(VERSION_TIMEOUT),
             ..RunOpts::read()
@@ -223,32 +259,29 @@ impl Git {
             .spawn(None, &["--version"], &opts, &[], MAX_OUTPUT)
             .await?;
         let text = out.text();
-        let (version, found) = parse::parse_version(&text)
+        parse::parse_version(&text)
             .filter(|_| out.code == 0)
             .ok_or_else(|| {
                 AppError::git(format!(
                     "{} non risponde come git: {text}",
                     self.bin.display()
                 ))
-            })?;
-        if Some(found) < parse::major_minor(MIN_GIT_VERSION) {
-            return Err(AppError::git(format!(
-                "git {version} è troppo vecchio: serve almeno la versione {MIN_GIT_VERSION}"
-            )));
-        }
-        Ok(version)
+            })
     }
 
     /// Runs `git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.quotePath=false
     /// -c color.ui=never -c gc.auto=0 -c maintenance.auto=false -C <dir> <args>` with stdin
     /// null, `kill_on_drop`, the scrubbed environment plus `LC_ALL=C LANGUAGE=C
-    /// GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_PAGER=cat` (spec §8.1). Unless the call is
+    /// GIT_TERMINAL_PROMPT=0 GIT_EDITOR=true GIT_PAGER=cat GIT_NO_LAZY_FETCH=1` (spec §8.1;
+    /// the last: a partial clone never fetches a missing object, which would run the
+    /// configuration's transport and `uploadpack` commands). Unless the call is
     /// `read_only` without an `index_file` (it cannot write refs or an index) and is not
     /// `merge-tree`, the commands defined in the configuration that these flags do not cover
     /// are listed first and disabled: hooks (`hook.<name>.command`) and merge drivers
     /// (`merge.<name>.driver`). Clean/smudge filters stay on (git-lfs needs them). A non-zero
     /// exit is returned in `code`. Errors: `Git` on spawn failure, timeout (the process is
-    /// killed) or stdout over [`MAX_OUTPUT`].
+    /// killed), stdout over [`MAX_OUTPUT`] or a git older than [`MIN_GIT_VERSION`]
+    /// ([`Git::gated`]).
     pub async fn run(
         &self,
         dir: &Path,
@@ -829,54 +862,55 @@ impl Git {
         opts: &RunOpts,
         limit: usize,
     ) -> Result<(GitOutput, bool), AppError> {
-        // Hooks run only on writes, merge drivers only inside `merge-tree`.
-        let overrides =
-            if opts.read_only && opts.index_file.is_none() && subcommand(args) != "merge-tree" {
-                Vec::new()
-            } else {
-                self.config_overrides(dir).await?
-            };
+        self.check_version()?;
+        // Hooks, filters and signing run only on writes, merge drivers only inside
+        // `merge-tree`; `status` runs the clean filter of a file whose stat data changed.
+        let reads_config = matches!(subcommand(args), "merge-tree" | "status");
+        let overrides = if opts.read_only && opts.index_file.is_none() && !reads_config {
+            Vec::new()
+        } else {
+            self.config_overrides(dir, opts.timeout).await?
+        };
         self.spawn(Some(dir), args, opts, &overrides, limit).await
     }
 
-    /// `hook.<name>.enabled=false` for every hook and [`MERGE_DRIVER_OFF`] for every merge
-    /// driver defined in the configuration seen from `dir`, sorted by key.
-    async fn config_overrides(&self, dir: &Path) -> Result<Vec<(OsString, OsString)>, AppError> {
+    /// Errors: `Git` when [`Git::gated`] found git too old.
+    fn check_version(&self) -> Result<(), AppError> {
+        match &self.refused {
+            Some(why) => Err(AppError::git(why.clone())),
+            None => Ok(()),
+        }
+    }
+
+    /// [`config_overrides_from`] the configuration seen from `dir`, within the call's `timeout`.
+    async fn config_overrides(
+        &self,
+        dir: &Path,
+        timeout: Option<Duration>,
+    ) -> Result<Vec<(OsString, OsString)>, AppError> {
         let args = [
             "config",
+            "--show-scope",
             "--null",
-            "--name-only",
             "--get-regexp",
-            r"^(hook|merge)\.",
+            r"^(hook|merge|filter|gpg)\.",
         ];
-        let (out, _) = self
-            .spawn(Some(dir), &args, &RunOpts::read(), &[], MAX_OUTPUT)
-            .await?;
+        let opts = RunOpts {
+            timeout,
+            ..RunOpts::read()
+        };
+        let (out, overflow) = self.spawn(Some(dir), &args, &opts, &[], MAX_OUTPUT).await?;
+        if overflow {
+            return Err(AppError::git(format!(
+                "git config: output oltre {} MiB",
+                MAX_OUTPUT >> 20
+            )));
+        }
         match out.code {
-            0 => {}
-            1 => return Ok(Vec::new()),
-            _ => return Err(failure(&args, &out)),
+            0 => Ok(config_overrides_from(&out.stdout)),
+            1 => Ok(Vec::new()),
+            _ => Err(failure(&args, &out)),
         }
-        let mut overrides = BTreeMap::new();
-        for key in out.stdout.split(|b| *b == 0) {
-            // `<section>.<subsection>.<variable>`; the subsection may contain dots.
-            let Some(dot) = key.iter().rposition(|b| *b == b'.') else {
-                continue;
-            };
-            let (name, var) = (&key[..dot], &key[dot + 1..]);
-            let (var, value) = if name.starts_with(b"hook.") {
-                ("enabled", "false")
-            } else if name.starts_with(b"merge.") && var == b"driver" {
-                ("driver", MERGE_DRIVER_OFF)
-            } else {
-                continue;
-            };
-            let mut key = OsStr::from_bytes(name).to_owned();
-            key.push(".");
-            key.push(var);
-            overrides.insert(key, OsString::from(value));
-        }
-        Ok(overrides.into_iter().collect())
     }
 
     /// The inherited environment plus `extra_env`, scrubbed, then the forced variables and
@@ -890,7 +924,14 @@ impl Git {
         let mut env: BTreeMap<OsString, OsString> = std::env::vars_os()
             .chain(self.extra_env.iter().cloned())
             .collect();
-        env.retain(|key, _| !key.to_str().is_some_and(is_scrubbed_git_var));
+        // Nor the API keys or a parent Claude Code session's variables, and `NODE_OPTIONS`
+        // as the user had it before cmux (spec §7.2): git runs filters and helpers from the
+        // repository's configuration.
+        crate::claude::scrub_host_env(&mut env);
+        env.retain(|key, _| {
+            !key.to_str()
+                .is_some_and(|k| is_scrubbed_git_var(k) || crate::claude::API_KEY_VARS.contains(&k))
+        });
         let mut forced = vec![
             ("PATH".to_owned(), self.path_var.clone()),
             ("LC_ALL".to_owned(), "C".into()),
@@ -898,6 +939,9 @@ impl Git {
             ("GIT_TERMINAL_PROMPT".to_owned(), "0".into()),
             ("GIT_EDITOR".to_owned(), "true".into()),
             ("GIT_PAGER".to_owned(), "cat".into()),
+            // The app never fetches: a partial clone's missing object is an error, not a
+            // fetch from the promisor remote that the repository's configuration describes.
+            ("GIT_NO_LAZY_FETCH".to_owned(), "1".into()),
         ];
         if opts.read_only {
             forced.push(("GIT_OPTIONAL_LOCKS".to_owned(), "0".into()));
@@ -981,6 +1025,175 @@ impl Git {
     }
 }
 
+/// Longest header line of `cat-file --batch` read (`<id> <type> <size>`, or the request and
+/// `missing`).
+const MAX_CAT_HEADER: u64 = 4096;
+/// [`Git::commit_config_snapshot`] as a whole: past the walk's own deadline and the reader's.
+pub const COMMIT_CONFIG_TIMEOUT: Duration = Duration::from_secs(70);
+
+/// `git cat-file --batch` in a repository (spec §8.9, the approval of a commit): objects read
+/// one at a time through stdin and stdout, all within one [`DEFAULT_TIMEOUT`]; killed when
+/// dropped.
+pub struct CatFile {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    deadline: tokio::time::Instant,
+    /// An object was left unread (too large) or a read failed: the stream is out of step.
+    broken: bool,
+}
+
+/// One answer of [`CatFile::get`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CatObject {
+    /// No such object (or an ambiguous name).
+    Missing,
+    /// Larger than the limit asked for: not read, and the reader cannot be used any more.
+    TooLarge(u64),
+    Found {
+        /// Hex id.
+        oid: String,
+        /// `blob`, `tree`, `commit`, `tag`.
+        kind: String,
+        data: Vec<u8>,
+    },
+}
+
+impl Git {
+    /// Starts `git cat-file --batch` in `repo` with the runner's flags and environment (spec
+    /// §8.1), read only, and without the lazy fetch of a partial clone (`GIT_NO_LAZY_FETCH`,
+    /// as every call). Errors: `Git` on spawn failure or a git too old ([`Git::gated`]).
+    pub async fn cat_file(&self, repo: &Path) -> Result<CatFile, AppError> {
+        self.check_version()?;
+        let env = self.env(&RunOpts::read(), &[]);
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(HARDENING)
+            .arg("-C")
+            .arg(repo)
+            .args(["cat-file", "--batch"])
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            AppError::git(format!("impossibile avviare {}: {e}", self.bin.display()))
+        })?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return Err(AppError::internal("git cat-file: pipe non disponibili"));
+        };
+        Ok(CatFile {
+            _child: child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            deadline: tokio::time::Instant::now() + DEFAULT_TIMEOUT,
+            broken: false,
+        })
+    }
+
+    /// M6 (spec §8.9): the Claude configuration of `commit` in `repo`, as a checkout of it
+    /// has it on disk (same records, same fingerprint as [`config_snapshot`] of a clean
+    /// worktree of it), read from the object database: what the Trusted approval approves.
+    /// Errors: `Invalid` (a bad revision, a limit, a link out of the tree, a name another
+    /// filesystem could fold into a configuration file's), `NotFound` (no such commit), `Io`
+    /// (the walk passed [`MAX_WALK_TIME`]), `Git` (the reader failed or did not answer within
+    /// [`COMMIT_CONFIG_TIMEOUT`]).
+    pub async fn commit_config_snapshot(
+        &self,
+        repo: &Path,
+        commit: &str,
+    ) -> Result<ConfigSnapshot, AppError> {
+        check_rev(commit)?;
+        let mut cat = self.cat_file(repo).await?;
+        let rt = tokio::runtime::Handle::current();
+        let commit = commit.to_owned();
+        // The walk is blocking code (shared with the checkout's); its reads run on `rt`. The
+        // reader comes back to be dropped (killed) here, in the runtime. The walk ends on its
+        // own within its deadline and the reader's; this bounds the wait even so.
+        let walk = tokio::task::spawn_blocking(move || {
+            let snapshot = commit_snapshot_blocking(&rt, &mut cat, &commit);
+            (snapshot, cat)
+        });
+        let (snapshot, _cat) = tokio::time::timeout(COMMIT_CONFIG_TIMEOUT, walk)
+            .await
+            .map_err(|_| {
+                AppError::git(format!(
+                    "configurazione del commit: nessuna risposta entro {COMMIT_CONFIG_TIMEOUT:?}"
+                ))
+            })?
+            .map_err(|e| AppError::internal(format!("configurazione del commit: {e}")))?;
+        snapshot
+    }
+}
+
+impl CatFile {
+    /// The object `spec` names (an id, `<commit>^{tree}`, …), read if at most `max` bytes.
+    /// Errors: `Invalid` (a name with a line break), `Git` (the reader failed, was out of step
+    /// or passed the deadline).
+    pub async fn get(&mut self, spec: &str, max: u64) -> Result<CatObject, AppError> {
+        if spec.is_empty() || spec.contains(['\n', '\r', '\0']) {
+            return Err(AppError::invalid(format!(
+                "Nome di oggetto non valido: {spec:?}"
+            )));
+        }
+        if self.broken {
+            return Err(AppError::git("git cat-file: lettore non più utilizzabile"));
+        }
+        self.broken = true;
+        let read = tokio::time::timeout_at(self.deadline, self.read_object(spec, max)).await;
+        let object = match read {
+            Ok(Ok(object)) => object,
+            Ok(Err(e)) => return Err(AppError::git(format!("git cat-file: {e}"))),
+            Err(_) => {
+                return Err(AppError::git(format!(
+                    "git cat-file: nessuna risposta entro {DEFAULT_TIMEOUT:?}"
+                )));
+            }
+        };
+        self.broken = matches!(object, CatObject::TooLarge(_));
+        Ok(object)
+    }
+
+    async fn read_object(&mut self, spec: &str, max: u64) -> io::Result<CatObject> {
+        self.stdin.write_all(format!("{spec}\n").as_bytes()).await?;
+        self.stdin.flush().await?;
+        let mut header = Vec::new();
+        (&mut self.stdout)
+            .take(MAX_CAT_HEADER)
+            .read_until(b'\n', &mut header)
+            .await?;
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "risposta non valida");
+        let header =
+            std::str::from_utf8(header.strip_suffix(b"\n").ok_or_else(bad)?).map_err(|_| bad())?;
+        if header.ends_with(" missing") || header.ends_with(" ambiguous") {
+            return Ok(CatObject::Missing);
+        }
+        let mut fields = header.split(' ');
+        let (Some(oid), Some(kind), Some(size), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(bad());
+        };
+        let size: u64 = size.parse().map_err(|_| bad())?;
+        if size > max {
+            return Ok(CatObject::TooLarge(size));
+        }
+        let mut data = vec![0; usize::try_from(size).map_err(|_| bad())?];
+        self.stdout.read_exact(&mut data).await?;
+        let mut end = [0u8];
+        self.stdout.read_exact(&mut end).await?;
+        if end != *b"\n" {
+            return Err(bad());
+        }
+        Ok(CatObject::Found {
+            oid: oid.to_owned(),
+            kind: kind.to_owned(),
+            data,
+        })
+    }
+}
+
 /// `FileTooLarge` past `limit` bytes.
 async fn read_capped(r: &mut (impl AsyncRead + Unpin), limit: usize) -> io::Result<Vec<u8>> {
     let mut buf = Vec::new();
@@ -1003,6 +1216,74 @@ async fn read_stderr(r: &mut (impl AsyncRead + Unpin)) -> io::Result<Vec<u8>> {
 }
 
 /// The git command in `args`, skipping global options (`-c <value>`, `--literal-pathspecs`).
+/// Filter commands that `git lfs install --local` writes: kept, like any filter of the user's
+/// global or system configuration.
+const LFS_FILTERS: &[&str] = &[
+    "git-lfs clean -- %f",
+    "git-lfs smudge -- %f",
+    "git-lfs smudge --skip -- %f",
+    "git-lfs filter-process",
+    "git-lfs filter-process --skip",
+];
+
+/// `-c` overrides (as `GIT_CONFIG_*`) for the output of `git config --show-scope --null
+/// --get-regexp '^(hook|merge|filter|gpg)\.'` (`scope\0key\nvalue\0` records), sorted by key:
+/// - `hook.<name>.enabled=false` for every configured hook;
+/// - [`MERGE_DRIVER_OFF`] for every merge driver;
+/// - a filter driver with a `clean`, `smudge` or `process` command in the repository's own
+///   configuration (`local`, `worktree` scope: what an agent can write, e.g. with `git config`
+///   from its worktree), other than [`LFS_FILTERS`], is neutralized: `clean`/`smudge` `cat`,
+///   `process` empty, `required=false`. Otherwise every `git add`, autocommit and `merge
+///   --ff-only` would run it outside any turn. The user's global filters (Git LFS) are kept;
+/// - a `gpg.*` program in that same configuration turns signing off (`commit.gpgSign=false`,
+///   `tag.gpgSign=false`): with the user's `commit.gpgSign` it would run on every commit.
+pub fn config_overrides_from(stdout: &[u8]) -> Vec<(OsString, OsString)> {
+    let mut overrides = BTreeMap::new();
+    let mut set = |key: &[u8], value: &str| {
+        overrides.insert(OsStr::from_bytes(key).to_owned(), OsString::from(value));
+    };
+    let mut fields = stdout.split(|b| *b == 0);
+    while let (Some(scope), Some(entry)) = (fields.next(), fields.next()) {
+        let (key, value) = match entry.iter().position(|b| *b == b'\n') {
+            Some(i) => (&entry[..i], Some(&entry[i + 1..])),
+            None => (entry, None),
+        };
+        let repo_scope = matches!(scope, b"local" | b"worktree");
+        // `<section>.<subsection>.<variable>`; the subsection may contain dots.
+        let Some(dot) = key.iter().rposition(|b| *b == b'.') else {
+            continue;
+        };
+        let (name, var) = (&key[..dot], &key[dot + 1..]);
+        let lower = var.to_ascii_lowercase();
+        if name.starts_with(b"hook.") {
+            set(&[name, b".enabled"].concat(), "false");
+        } else if name.starts_with(b"merge.") && lower == b"driver" {
+            set(key, MERGE_DRIVER_OFF);
+        } else if name.starts_with(b"filter.")
+            && matches!(&lower[..], b"clean" | b"smudge" | b"process")
+            && repo_scope
+            && !value.is_some_and(|v| LFS_FILTERS.iter().any(|l| l.as_bytes() == v))
+        {
+            for (var, value) in [
+                ("clean", "cat"),
+                ("smudge", "cat"),
+                ("process", ""),
+                ("required", "false"),
+            ] {
+                set(&[name, b".", var.as_bytes()].concat(), value);
+            }
+        } else if name.starts_with(b"gpg") && repo_scope {
+            set(b"commit.gpgSign", "false");
+            set(b"tag.gpgSign", "false");
+        }
+    }
+    overrides.into_iter().collect()
+}
+
+fn too_old(version: &str) -> String {
+    format!("git {version} è troppo vecchio: serve almeno la versione {MIN_GIT_VERSION}")
+}
+
 fn subcommand<'a>(args: &[&'a str]) -> &'a str {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -1175,11 +1456,22 @@ pub fn turn_commit_message(seq: u32, prompt: &str) -> String {
     }
 }
 
-/// M6 (spec §8.9): SHA-256 hex over `path\0len\0content` of the sorted files under
-/// `.claude/**` plus `.mcp.json` (≤ 2000 files, symlinks hashed by target, paths confined
-/// to `root`). Walks and hashes on the blocking pool (`spawn_blocking`): it runs before
-/// every turn, from async code.
-#[allow(unused_variables)] // M6 stub
+/// M6 (spec §8.9): SHA-256 hex over the sorted records of `.claude/**`, `.mcp.json` and the
+/// files inside `root` their commands run (`path\0kind\0len\0content`, ≤ 2000 records,
+/// symlinks recorded by target and followed only inside `root`; details in
+/// [`config_snapshot_blocking`]). Walks and hashes on the blocking pool (`spawn_blocking`): it
+/// runs before every turn, from async code. The same configuration gives the same value in
+/// the main checkout and in a worktree. Errors: `Invalid` (limits, a link out of `root`, the
+/// tree changed meanwhile), `Io`.
 pub async fn config_fingerprint(root: &Path) -> Result<String, AppError> {
-    Err(AppError::not_implemented("git::config_fingerprint"))
+    config_snapshot(root).await.map(|s| s.fingerprint)
+}
+
+/// [`config_fingerprint`] with the digest of every record and what the settings allow
+/// ([`ConfigSnapshot`]).
+pub async fn config_snapshot(root: &Path) -> Result<ConfigSnapshot, AppError> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || config_snapshot_blocking(&root))
+        .await
+        .map_err(|e| AppError::internal(format!("fingerprint della configurazione: {e}")))?
 }

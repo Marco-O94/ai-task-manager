@@ -3,6 +3,163 @@
 App desktop per macOS: una kanban di task affidati al Claude Code CLI installato sul Mac, un git worktree per ogni tentativo.
 Stack: Tauri 2 + Leptos 0.8 (CSR, WASM) + componenti Rust/UI. Piano completo: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
+## Usa il Claude Code installato sul tuo Mac
+
+L'app non contiene un modello né un client dell'API: guida il `claude` già installato sul Mac, non modificato, con il
+suo login. Per conto suo esegue solo `claude --version` e `claude auth status`; gli agenti sono turni
+`claude -p … --output-format stream-json` lanciati quando avvii un task, uno per worktree (2 in parallelo di default).
+
+- **Login con l'abbonamento, nel Terminale.** Se `auth status` dice che non sei collegato, l'app mostra il gate
+  iniziale: "Accedi" apre Terminal.app con `claude auth login` (account claude.ai; anche Console o SSO), poi
+  "Ricontrolla". Il login avviene solo lì: l'app non legge mai il Portachiavi, `~/.claude/.credentials.json` o
+  `~/.claude/projects`, non salva token, email od organizzazione e non fa da proxy.
+- **Nessuna chiave API di default.** `ANTHROPIC_API_KEY` e `ANTHROPIC_AUTH_TOKEN` vengono tolti dall'ambiente degli
+  agenti, che usano quindi il login dell'abbonamento. Impostazioni → Generali → «Passa agli agenti la chiave API
+  dell'ambiente» li lascia passare dopo una conferma nativa; finché è attivo e una chiave è presente, un banner nella
+  topbar dice che l'uso è fatturato via API. Lo stesso banner compare con un login diverso da claude.ai e con
+  `CLAUDE_CODE_USE_BEDROCK/_VERTEX/_FOUNDRY` nell'ambiente. `ANTHROPIC_BASE_URL` nell'ambiente dell'app (o l'endpoint
+  di un provider cloud) resta, perché è una tua scelta, ma un banner nella topbar dice che gli agenti mandano le
+  richieste, con le credenziali dell'abbonamento, a quell'endpoint invece che ad Anthropic, e che lì l'uso può essere
+  fatturato: `apiKeySource` resta `none`, quindi lo stop qui sotto non lo vede. Il costo mostrato nei turni è la
+  stima del CLI.
+- **Solo abbonamento, anche se una chiave arriva da altrove.** Con il passthrough spento, un turno il cui `system/init`
+  dice che Claude Code usa una chiave API (`apiKeySource` diverso da `none`: una variabile, un `apiKeyHelper` o un
+  `env` nelle impostazioni dell'utente, che l'app non legge) viene fermato subito: gruppo di processi congelato e
+  ucciso, turno `failed` con una Notice che nomina la fonte. È una reazione: il CLI manda `system/init` appena prima
+  della sua prima richiesta, quindi quella viene fermata prima di partire solo se il kill vince la corsa, altrimenti
+  viene interrotta a metà. La configurazione del repository non può spostare la fatturazione (sotto, Attendibile).
+- **Dove cerca `claude` e git.** Impostazione "Percorso di claude" (cambiarla chiede una conferma nativa: l'app esegue
+  subito quel programma; deve essere un percorso assoluto fuori dai progetti e dai worktree), poi `ATM_CLAUDE_PATH`, poi `~/.local/bin/claude`,
+  `~/.claude/local/claude`, Homebrew e il `PATH` della login shell, importato una volta con `$SHELL -ilc` (un'app
+  aperta dal Finder ha il `PATH` minimo di launchd, non quello del Terminale); git è il primo sul `PATH` importato,
+  altrimenti `/usr/bin/git`. Impostazioni → Generali dice quali sta usando, per esempio "In uso: Claude Code 2.1.284
+  (/Users/…/.local/bin/claude); git 2.54.0.", e lo stderr dell'app (anche in release, `open --stderr <file>`) ha una
+  riga per ogni `get_env`, senza email né organizzazione:
+  `get_env: claude /Users/…/.local/bin/claude version 2.1.284 supported=true auth loggedIn (authMethod claude.ai, subscription max) git /opt/homebrew/bin/git version 2.54.0`.
+- **Avviare l'app da dentro una sessione di Claude Code**, o da un terminale cmux o di un IDE (per esempio
+  `cargo tauri dev` nel terminale della sessione): le variabili della sessione padre (`CLAUDECODE`,
+  `CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`,
+  `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID`, `CLAUDE_EFFORT`, `CLAUDE_CODE_MESSAGING_*`) e del suo host (`CMUX_*`,
+  `CLAUDE_CODE_SSE_PORT`, `ENABLE_IDE_INTEGRATION`) non arrivano agli agenti né a git, e l'app all'avvio si
+  ri-esegue senza di esse, così nemmeno `ps -E` dell'app le mostra. Lo stesso vale per il `NODE_OPTIONS` con cui un
+  terminale cmux fa caricare il suo modulo (`--require=…`) a ogni programma node, compreso `claude`: con
+  `CMUX_ORIGINAL_NODE_OPTIONS_PRESENT=0` (l'utente non ne aveva) viene tolto, con `=1` torna al valore salvato in
+  `CMUX_ORIGINAL_NODE_OPTIONS`, senza il marker resta com'è. Però la shell o la sessione che ha lanciato l'app,
+  finché restano aperte, le hanno ancora nel loro ambiente, e ogni processo dello stesso utente (quindi anche un
+  agente, con `ps -E`) può leggerle, compreso il socket e il token del canale di messaggi della sessione padre: per
+  lavorare davvero con agenti, lancia l'app da un terminale pulito o dal Finder. Restano `CLAUDE_CONFIG_DIR`, gli
+  altri `CLAUDE_CODE_*` e il token OAuth. `CLAUDE_CODE_USE_BEDROCK/_VERTEX/_FOUNDRY` restano anche loro e fanno
+  comparire il banner di fatturazione. Le chiavi API, se presenti, restano nell'ambiente dell'app (servono al
+  passthrough opzionale) e sono quindi leggibili allo stesso modo: non arrivano agli agenti se non le abiliti.
+
+### Modalità di permesso
+
+Si scelgono nel dialog Avvia (default per progetto nelle Impostazioni). Dati di M5, CLI 2.1.283:
+
+| Modalità | CLI | Cosa chiede |
+|---|---|---|
+| Supervisionato | `--permission-mode=default` | Chiede per ogni modifica e comando; passano da sole solo le letture, per esempio `ls` |
+| **Auto-edit** (default) | `acceptEdits` | Approva da solo le modifiche ai file e i comandi shell che leggono o scrivono file nel worktree (per esempio `printf … >> README.md`) e chiede per il resto |
+| Autonomo | `bypassPermissions` + `--allow-dangerously-skip-permissions` | Non chiede mai. Si abilita per progetto (Impostazioni → Progetto) con una conferma nativa; toglierlo riporta a Auto-edit la modalità predefinita |
+
+Le richieste compaiono come card nel transcript: "Consenti", "Consenti sempre (attempt)" quando il CLI propone una
+regola, "Nega", "Nega e ferma". In ogni modalità l'app passa via `--settings` regole deny per `git push`, `~/.ssh`,
+`~/.aws` e i file di credenziali: una chiamata negata da una regola compare come Negato.
+
+### Configurazione Claude del repository: Isolata o Attendibile
+
+Isolata (default) passa `--setting-sources=user --strict-mcp-config`, quindi `.claude/`, `.mcp.json`, hook, `env`,
+`apiKeyHelper`, server MCP e regole di permesso del repo non vengono caricati (le impostazioni e gli hook
+dell'**utente** sì; `CLAUDE.md` l'agente lo legge perché il prompt dell'app glielo chiede). Attendibile si attiva da
+Impostazioni → Progetto → Applica, dopo una conferma nativa che nomina il repository per percorso, il branch e il
+commit approvati, e avvisa se le sue regole `permissions.allow` consentono un tool intero (per esempio `Bash(*)`:
+comandi senza chiedere in ogni modalità, di fatto un Autonomo per Bash senza l'opt-in).
+
+**Cosa si approva: il commit, non la cartella.** L'approvazione è lo SHA-256 di `.claude/**`, `.mcp.json` e dei file
+del repository che i loro comandi eseguono (lo script di un hook, il `tools/mcp.js` di un server MCP) **com'erano
+committati nell'ultimo commit del branch target predefinito** del progetto, quello da cui partono i worktree, letti
+dal database di git (`git cat-file` con il runner irrobustito dell'app), così com'erano quando la conferma è comparsa:
+se il branch cambia configurazione mentre il dialog è aperto, l'approvazione viene rifiutata. I file locali del
+checkout principale (un `.claude/settings.local.json` non committato, modifiche non committate, file ignorati) non
+contano e non bloccano più i worktree. Un repository senza configurazione si può approvare (hash vuoto).
+
+**A ogni turno** l'app ricontrolla i file del worktree, e di nuovo quando Claude Code si è avviato: se sono diversi da
+quelli approvati il turno gira Isolato (o viene fermato) con una Notice che dice perché. Se è il worktree a essere
+cambiato, nomina i file diversi; se è il commit da cui l'attempt è partito a non avere la configurazione approvata
+(il branch target è andato avanti con una configurazione nuova dopo l'approvazione), chiede di riapprovare: finché
+non lo fai il progetto non risulta più Attendibile nelle Impostazioni e gli attempt nuovi girano Isolati. Un commit
+che non tocca la configurazione non cambia nulla.
+
+**Mai fatturazione via API.** Una configurazione committata che farebbe fatturare gli agenti via API o da un altro
+provider invece che con l'abbonamento non si può approvare: `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport`
+in `.claude/settings.json` o `.claude/settings.local.json`, oppure nel loro `env` `ANTHROPIC_API_KEY`,
+`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`,
+`CLAUDE_CODE_USE_FOUNDRY` (con qualunque valore), o un file di impostazioni che non è JSON valido. "Applica" risponde
+con un errore che nomina la chiave, per esempio "Configurazione Claude non approvabile (branch main, commit abc1234):
+.claude/settings.json imposta apiKeyHelper. …". Conta il file che Claude Code apre davvero: sul disco del Mac (APFS,
+che non distingue maiuscole, minuscole e forme Unicode) `.claude/Settings.json` è `.claude/settings.json`, quindi nel
+worktree viene controllato come tale, e un commit con un nome del genere (anche `.Claude/` o `.MCP.json`) non si può
+approvare. Un worktree che acquista una di queste chiavi gira Isolato con una Notice che la nomina, anche se il
+progetto era stato approvato prima di questo controllo; se le acquista mentre Claude Code si avvia (un hook), il turno
+viene congelato al `system/init`, ricontrollato e ucciso (`failed`, con la Notice); e in ogni caso un turno che
+riporta una chiave API viene fermato (sopra).
+
+Revocare Attendibile o l'Autonomo ferma i turni in corso che li usano; annullare la conferma di un aumento applica
+comunque la parte che toglie permessi. Mai Attendibile un repo che è la home. Aggiungendo un repo con `.mcp.json` o
+`.claude/` l'app lo segnala.
+
+Limiti di Attendibile:
+- l'esecuzione indiretta non è coperta: ciò che eseguono `npm run …`, `npx pkg@latest`, `bash -c "cd tools && …"` o
+  un hook che lancia strumenti del repository, e i file che questi caricano;
+- i link vengono seguiti solo se restano dentro il repository; nel worktree un file eseguito che un link porta fuori
+  (il `python` di un virtualenv) conta per il suo percorso, non per il contenuto, e un commit che ne contiene uno non
+  si può approvare;
+- un file di configurazione che git cambia al checkout (conversione di fine riga, attributo `ident`, filtro smudge
+  come Git LFS) è diverso in ogni worktree: i turni girano Isolati con la Notice che lo nomina;
+- un attempt con un branch target diverso da quello predefinito è Attendibile solo se il suo commit di partenza ha la
+  stessa configurazione approvata.
+
+### Il worktree non è una sandbox
+
+Il worktree NON è una sandbox: agenti, hook e server MCP girano sul Mac con i permessi dell'utente e possono toccare
+file e servizi fuori dal worktree. Le regole deny di `--settings` (git push, `~/.ssh`, `~/.aws`, credenziali) sono una
+difesa in profondità: `sh -c 'git push'` le aggira. Il worktree separa il lavoro dei task tra loro e dal checkout
+principale, non protegge il Mac: per questo il default è Auto-edit, Autonomo è un opt-in per progetto e la
+configurazione del repo è Isolata finché non la approvi.
+
+## Installazione
+
+Servono macOS su Apple Silicon, Claude Code installato (`claude`, per esempio in `~/.local/bin`) con un login
+dell'abbonamento, e git ≥ 2.44 (Xcode Command Line Tools o Homebrew): con un git più vecchio l'app lo segnala e non
+esegue nessun comando git, perché non potrebbe impedire il fetch pigro di un partial clone. Per compilare vedi Setup
+qui sotto.
+
+```bash
+scripts/release.sh     # cargo tauri build + controlli; stampa i percorsi di .app e .dmg
+```
+
+- `target/release/bundle/macos/AI Task Manager.app` e `target/release/bundle/dmg/AI Task Manager_0.1.0_aarch64.dmg`.
+  Si installa trascinando l'app in Applicazioni (dal .dmg o dalla cartella). Il .dmg ha la finestra standard del
+  Finder: impaginarla (icone e link ad Applicazioni in posizione) richiede che il terminale possa controllare il Finder
+  (permesso Automazione), senza il quale l'AppleScript del bundler va in timeout e la build fallisce; lo script la
+  salta (`CI=true`), `ATM_DMG_LAYOUT=1 scripts/release.sh` la chiede.
+- **Non firmata né notarizzata.** Un'app compilata sul tuo Mac non ha l'attributo di quarantena e si apre con un doppio
+  clic. Se il .app o il .dmg arrivano da un altro Mac (download, AirDrop), Gatekeeper la blocca la prima volta:
+  fino a macOS 14 clic destro (o Ctrl-clic) sull'app → Apri → Apri; da macOS 15 il clic destro non basta più: dopo il
+  primo tentativo, Impostazioni di Sistema → Privacy e sicurezza → «Apri comunque». In alternativa, per un'app di cui
+  ti fidi: `xattr -dr com.apple.quarantine "/Applications/AI Task Manager.app"`.
+- **Dati**: DB e log in `~/Library/Application Support/dev.aitaskmanager.desktop` (`atm.sqlite3`, `logs/`), cache
+  (script di login) in `~/Library/Caches/dev.aitaskmanager.desktop`, worktree in `~/.ai-task-manager/worktrees`
+  (configurabile). Niente sta dentro il bundle: reinstallare (un .app nuovo copiato sopra il vecchio) li lascia
+  intatti. Per disinstallare si tolgono l'app e queste tre cartelle (i branch `atm/…` restano nei repository).
+- **Nessun socket di rete.** L'unico socket in ascolto è quello Unix del plugin single-instance,
+  `/tmp/dev_aitaskmanager_desktop_si.sock`: un secondo avvio gli passa cartella e argomenti e porta avanti la finestra
+  già aperta. `/tmp` è condiviso tra gli account del Mac: se a quel percorso c'è un socket di un altro utente l'app non
+  lo usa (niente controllo di istanza singola, una riga sullo stderr) invece di passargli l'avvio e uscire.
+- `scripts/release.sh` verifica che il WASM di release e il binario non contengano i driver di selftest ed E2E (vedi
+  Build), l'identificatore del bundle, l'icona e il checksum del .dmg (`hdiutil verify`). `--no-build` ripete solo i
+  controlli sull'ultima build.
+
 ## Setup (una volta)
 
 Servono macOS con Xcode Command Line Tools e `rustup`. Il toolchain `1.97.1` (con clippy, rustfmt e il target
@@ -22,32 +179,27 @@ Niente Node: alla prima build Trunk scarica da solo Tailwind standalone `4.3.3`,
 ## Sviluppo
 
 ```bash
-cargo tauri dev          # avvia `trunk serve` in ui/ (porta 1420) e apre l'app
-scripts/check.sh         # fmt, clippy host + wasm32 (anche --features mock), test, grep di sicurezza: va tenuto verde
+cargo tauri dev          # avvia `trunk serve --features testkit` in ui/ (porta 1420) e apre l'app
+scripts/check.sh         # fmt, clippy host + wasm32 (release, --features testkit, --features mock), test, grep di sicurezza: va tenuto verde
 (cd ui && trunk serve --features mock)   # solo UI nel browser (porta 1420), backend finto in ui/src/ipc/mock
 ```
 
 Nel mock, `http://localhost:1420/?task=<id>` apre subito il pannello di quel task. Con la baseline di M1 in
 `ui/src/ipc/mock/board.rs` (loggato, un progetto, un task per colonna) gli id sono `task-todo`, `task-inprogress`,
-`task-inreview` e `task-done`.
+`task-inreview` e `task-done`. Le task di Zed (`.zed/tasks.json`) lanciano l'app, l'app con fake-claude e il mock.
 
-## Avvio dell'app
+## Avvio dell'app in sviluppo
 
-**Con il Claude Code reale.** L'app cerca `claude` da sola (impostazione "Percorso di claude", poi `ATM_CLAUDE_PATH`,
-poi `~/.local/bin/claude`, `~/.claude/local/claude`, Homebrew e il `PATH` della login shell) e legge solo
-`claude --version` e `claude auth status`. L'accesso avviene nel Terminale con `claude auth login`, dal pulsante
-"Accedi" del gate iniziale. Dati in `~/Library/Application Support/dev.aitaskmanager.desktop`, worktree in
-`~/.ai-task-manager/worktrees`.
+**Con il Claude Code reale.** `cargo tauri dev` usa il `claude` installato (e il tuo abbonamento quando lanci un
+agente), la cartella dati normale e il login descritto sopra.
 
 ```bash
-cargo tauri dev                                                          # con trunk serve (CSP non applicata)
-cargo tauri build --debug --no-bundle && ./target/debug/ai-task-manager  # asset incorporati, CSP attiva
+cargo tauri dev                                                  # con trunk serve (CSP non applicata)
+cargo tauri build --debug --no-bundle && ./target/debug/ai-task-manager   # asset incorporati, CSP attiva, senza driver di test
 ```
 
-In debug l'app scrive su stderr una riga per ogni `get_env`, senza email né organizzazione, per esempio
-`get_env: claude /Users/…/.local/bin/claude version 2.1.283 supported=true auth loggedIn (authMethod claude.ai, subscription max)`,
-e all'uscita il ramo che ferma gli agenti (`exit: RunEvent::ExitRequested` per `app.exit` e la chiusura della finestra,
-`exit: RunEvent::Exit` per Cmd+Q, Esci dal Dock e logout).
+All'uscita le build di debug scrivono anche il ramo che ferma gli agenti (`exit: RunEvent::ExitRequested` per
+`app.exit` e la chiusura della finestra, `exit: RunEvent::Exit` per Cmd+Q, Esci dal Dock e logout).
 
 **Con fake-claude (nessuna chiamata API).** `ATM_CLAUDE_PATH` fa usare il doppio del CLI (spec §12.1). Quando è
 impostata è vincolante: se il binario indicato non risponde come Claude Code (manca, o `--version` supera i 5 s),
@@ -69,8 +221,175 @@ con l'agente" gioca da solo `resolve_merge`, sul target che il prompt dell'app n
 variabile e che `auth_fail` porta a `out` con una scrittura atomica, come il CLI vero dopo un login scaduto),
 `FAKE_CLAUDE_SCENARIO` (scenario di default),
 `FAKE_CLAUDE_TARGET` (branch di `resolve_merge`, altrimenti quello del prompt), `FAKE_CLAUDE_DELTA_MS` (pausa tra i
-delta di un testo in streaming, default 0), `FAKE_CLAUDE_RECORD` (una riga JSON per chiamata: argv, cwd, pid,
-variabili presenti; poi una per ogni messaggio utente con lo scenario giocato, e le risposte dell'host).
+delta di un testo in streaming, default 0), `FAKE_CLAUDE_FLOOD_EVENTS` (testi di `flood`, default 10000),
+`FAKE_CLAUDE_FLOOD_PAUSE_MS` (pausa ogni 100 testi di `flood`, default 0), `FAKE_CLAUDE_RECORD` (una riga JSON per
+chiamata: argv, cwd, pid, variabili presenti; poi una per ogni messaggio utente con lo scenario giocato, e le risposte
+dell'host). Con `FAKE_CLAUDE_PROJECT_CONFIG=1` fake-claude esegue la configurazione del repo come il CLI reale (hook
+`SessionStart`, `apiKeyHelper`, server di `.mcp.json`) salvo `--setting-sources=user` o `--strict-mcp-config`. Lo usa
+il test di accettazione M6 `tests/flow.rs::malicious_repo_config_runs_only_when_trusted_and_unchanged`. Il suo
+`system/init` dice `apiKeySource: "ANTHROPIC_API_KEY"` quando quella variabile gli arriva, `"apiKeyHelper"` dopo un
+helper del repo, altrimenti `"none"`; `FAKE_CLAUDE_API_KEY_SOURCE` impone un valore (i test dello stop del turno).
+
+## Build
+
+```bash
+scripts/release.sh                     # release: .app + .dmg, poi i controlli (sopra)
+(cd ui && trunk build --release)       # solo frontend di release → ui/dist
+cargo tauri build --debug --no-bundle --config src-tauri/tauri.testkit.conf.json   # debug con i driver di test
+```
+
+I driver di selftest ed E2E della UI (`ui/src/selftest.rs`, `ui/src/e2e.rs`) esistono solo con la feature `testkit` di
+`atm-ui`; i comandi di debug che guidano, solo nelle build di debug (`cfg(debug_assertions)`). `cargo tauri build` usa
+il `beforeBuildCommand` di `tauri.conf.json` (`trunk build --release`, senza `testkit`): nel WASM di release non ci
+sono (M6: 1,73 MB contro 2,02 MB, e `strings` non trova nessuno dei loro nomi). Le build di debug che devono
+guidarsi da sole li aggiungono con `--config src-tauri/tauri.testkit.conf.json`, che sostituisce il comando con
+`trunk build --release --features testkit` (e toglie la sospensione della pagina quando la finestra è nascosta,
+`backgroundThrottling: disabled`); `cargo tauri dev` li ha sempre (`trunk serve --features testkit`).
+`scripts/check.sh` passa clippy su tutte e tre le varianti e fallisce se `tauri.conf.json` compila la release con
+`testkit` o se i due moduli non sono dichiarati sotto la feature. Passare da una variante all'altra ricompila una
+parte di Tauri (circa 10 s).
+
+## Icona
+
+`src-tauri/icons/icon.svg` è il sorgente (kanban su griglia delle icone macOS: 824 px, raggio 185). Per rigenerare
+il set di `src-tauri/icons/`:
+
+```bash
+swift scripts/render-icon.swift src-tauri/icons/icon.svg target/icon-1024.png   # PNG 1024×1024 con trasparenza (AppKit)
+cargo tauri icon target/icon-1024.png && rm -rf src-tauri/icons/android src-tauri/icons/ios
+```
+
+## Selftest (solo build di debug)
+
+```bash
+cargo build -p atm-core --bin fake-claude   # il selftest usa fake-claude, mai il claude reale
+cargo tauri build --debug --no-bundle --config src-tauri/tauri.testkit.conf.json
+out=$(ATM_SELFTEST=1 ./target/debug/ai-task-manager) && echo "$out" && grep -qF '"csp_violations":0' <<<"$out"
+```
+
+La UI esegue da sola le prove IPC (`debug_ping`, errore tipizzato, 50 messaggi su `Channel` di cui tre da 20 KiB),
+guida il dialog portato, prova `subscribe_transcript`/unsubscribe e un reload della pagina (`transcript_subscribe_ok`,
+`forwarder_unsub_ok`, `forwarder_reload_ok`, `reload_ok`) e conta le violazioni CSP; l'app stampa il report JSON su stdout ed esce con 0 se tutto passa,
+altrimenti con 1 (anche se la UI non risponde entro 90 s: succede anche con una UI compilata senza `testkit`, e il
+messaggio lo dice). Funziona anche con `ATM_SELFTEST=1 cargo tauri dev`,
+ma lì `csp_enforced` vale `null`: Tauri applica la CSP solo agli asset incorporati, non alla pagina di `trunk serve`.
+In selftest il plugin single-instance non viene registrato, così la prova gira anche con un'altra istanza aperta;
+per lo stesso motivo il Core usa una cartella dati privata (`$TMPDIR/atm-selftest-<pid>`, cancellata all'uscita)
+e non tocca mai il DB né gli agenti dell'app aperta. Il controllo su stdout esclude le uscite con 0 senza report
+(per esempio la finestra chiusa a mano).
+
+## E2E in-app (solo build di debug, M4 e M6)
+
+```bash
+scripts/e2e.sh                  # build (--locked) di fake-claude e del bundle di debug con testkit, poi le tre fasi (max 15 min)
+scripts/e2e.sh --no-build       # riusa target/debug (bundle e fake-claude)
+scripts/e2e.sh --keep           # conserva log e dati anche se passa
+scripts/e2e.sh --perf           # solo la fase 3 (prestazioni), su dati nuovi
+scripts/e2e.sh --gatekeeper     # solo la verifica Gatekeeper dello script di login: apre UNA finestra del Terminale
+```
+
+Con `ATM_E2E=1` la UI guida il DOM reale del WKWebView (click, `input`/`change`, tasti, eventi HTML5 di drag con
+`DataTransfer`) ed esegue in ordine tutto il percorso del §12.2 su fake-claude. Lo script compila il bundle
+`target/debug/bundle/macos/AI Task Manager.app` (con `--config src-tauri/tauri.testkit.conf.json`), ne installa una
+copia nella cartella temporanea del giro (`Applications/`, come in `/Applications`) e lancia quella, con una copia di
+fake-claude tutta sua (`bin/fake-claude`), così `pgrep -f` vede solo gli agenti del giro. Tutto sta nella cartella
+temporanea (`ATM_E2E_DIR`): DB, cache, `HOME` (quindi i worktree), i repository di prova creati dal backend (uno con un
+commit, una cartella non git, un repo bare, uno vuoto, uno con `.mcp.json`), il record e lo stato di login di
+fake-claude. Il selettore nativo di cartelle non è automatizzabile: il backend restituisce il percorso messo in coda
+dalla prova (`debug_e2e_queue_pick`), mentre il click su "Aggiungi repository", i toast e la sidebar sono quelli veri.
+Allo stesso modo le conferme native ricevono la risposta che il giro mette in coda con `debug_e2e_queue_confirm`, e il
+giro legge i testi chiesti con `debug_e2e_confirms` (solo build di debug con `ATM_E2E=1`). "Accedi" scrive davvero
+`claude-login.command`, ma nel giro normale l'`open -a Terminal` viene solo registrato (`CoreConfig::open_log`,
+ignorato nelle build di release) e la prova esegue lo script con `/bin/sh`: il Terminale vero lo apre solo
+`--gatekeeper` (sotto).
+
+- **Fase 1:** passi 1–7 (il passo 2 si svolge dentro il gate del passo 1), con due reload nativi della pagina
+  (`-[WKWebView reload]`, come "Ricarica" nel menu contestuale del WebView di debug: l'app non ha una scorciatoia
+  Cmd+R): l'ordine del passo 4 riletto dal DB e la verifica che il reload faccia ripartire la subscription del
+  transcript (1 forwarder prima del reload, 0 dopo, 1 alla riapertura, vista ripristinata). Il passo 4 trascina quattro
+  card fino a `[T3, T6, T2, T1]` (create T1, T2, T3, T6); ogni `dragover` deve essere annullato (senza, WebKit non
+  darebbe il `drop`) e vede un `DataTransfer` senza dati, come nella modalità protetta di un drag vero. Il passo 7
+  ferma anche un `[fake:hang_ignore]`: lo Stop percorre tutta la sequenza del §7.9 (interrupt 5 s, EOF 3 s, SIGTERM
+  3 s, SIGKILL del gruppo) e deve chiudersi tra 10 e 13 s senza lasciare processi; il `TurnEnd` del turno fermato
+  dice "Interrotto dall'utente" senza `[ede_diagnostic]`. Poi un task `[fake:hang_ignore]`
+  (ignora interrupt, EOF e SIGTERM e ha un nipote `sleep 300`: solo il SIGKILL di gruppo dello shutdown lo ferma), il
+  follow-up `[fake:hang]` di T1 e l'uscita con Cmd+Q con questi due agenti attivi: un ⌘Q (key-down e key-up, sorgente
+  HID) mandato al pid dell'app attraverso il window server con `CGEventPostToPid` → finestra, poi voce Esci del menu
+  di Tauri → `NSApp terminate:` → `applicationWillTerminate:` → `RunEvent::Exit` → `Core::shutdown` sul main thread.
+  Serve che il terminale che lancia lo script abbia l'accesso Accessibilità (per inviare eventi); senza, il ⌘Q è un
+  `NSEvent` dato a `-[NSApplication sendEvent:]` dentro l'app, e `details.cmd_q` del report dice quale via è stata
+  usata. Se l'app non esce entro 30 s la fase fallisce (con ⌘X al posto di ⌘Q fallisce davvero: il test non passa
+  per caso).
+- **Tra le fasi 1 e 2:** lo script verifica dal log che l'uscita sia passata solo da `RunEvent::Exit`, che non resti
+  nessun processo del giro (`pgrep -f` della copia di fake-claude vuoto, M6 #2) e che nel DB lo Stop del passo 7 sia
+  `killed/user_stop` e i due turni dell'uscita `killed/app_shutdown`. Poi **reinstalla** l'app (M6 #5): una copia nuova
+  del bundle al posto di quella installata, con DB, log dei processi e worktree ancora tutti lì; la fase 2 gira sulla
+  copia nuova.
+- **Fase 2:** l'app riparte sugli stessi dati: l'ordine `[T3, T6, T2]` del passo 4 dopo il riavvio vero (DOM e DB,
+  posizioni invariate), "Interrotto – Continua" su entrambe le card con la Notice dello shutdown, e Continua su tutte e
+  due (`--resume` della sessione di ciascuna, turno completato), passi 9–12, i messaggi `Channel` oltre 8 KiB
+  (`debug_channel_probe` e un turno `[fake:big]`) e la CSP applicata (`eval` bloccato). Al passo 10 T6 e T3 aggiungono
+  righe diverse a `hello.txt` (`[fake:append]`); T6 viene mergiato, così T3 va in conflitto con `main` e "Risolvi con
+  l'agente" manda il prompt dell'app (che non ha tag): fake-claude registra di aver giocato `resolve_merge`. Il
+  controllo `security_confirmations` (M6) prova le conferme native: Attendibile + Annulla resta Isolato, + OK è Trusted
+  e `trusted`; bypass + OK consentito; abbassare entrambi non chiede nulla; il passthrough della chiave API + OK mostra
+  il banner nella topbar e disattivarlo non chiede nulla. Infine un altro turno `[fake:hang_ignore]` e l'uscita del
+  report con `app.exit` (l'altro ramo: `ExitRequested` → `Core::shutdown`); lo script ricontrolla ramo di uscita,
+  processi e DB.
+- **Fase 3 (prestazioni, M6):** di nuovo sugli stessi dati, Agenti in parallelo = 3 dalle Impostazioni e tre task
+  `[fake:flood]` avviati dalla UI (10 000 testi dell'assistente per turno, una pausa di 100 ms ogni 100: i tre turni
+  corrono insieme per una decina di secondi), l'ultimo aperto nel pannello. Mentre scorrono, un timer da 20 ms non
+  deve mai arrivare più di 1 s in ritardo (il main thread della pagina resta libero), passare a Modifiche e tornare ad
+  Agente deve mostrarsi entro 1,5 s e il transcript non deve mai avere più di 300 righe nel DOM; alla fine i tre turni
+  si sono sovrapposti, sono completati con tutti i testi salvati e il pannello termina sul `TurnEnd`. Lo script
+  controlla che non resti nessun processo e che i tre turni siano `completed/success` nel DB. I due tempi valgono solo
+  con la pagina visibile: WebKit fa scattare i timer di una pagina nascosta (schermo bloccato o spento, finestra
+  coperta, app nascosta) una volta al secondo. Per questo durante la fase la finestra resta sopra le altre, il
+  campione del timer conta solo a pagina visibile e il report dice `"perf_responsiveness":"measured"`; con la pagina
+  nascosta dice `"not measured (page hidden)"`: il giro completo stampa un avviso e passa se il resto della fase
+  passa, `--perf` da solo fallisce. La finestra dei bundle `testkit` ha `backgroundThrottling: disabled`
+  (`src-tauri/tauri.testkit.conf.json`, che ripete la finestra di `tauri.conf.json`: `scripts/check.sh` controlla che
+  non divergano), così una pagina nascosta non viene sospesa e il giro non si blocca.
+
+L'app gira con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
+`CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, `GIT_DIR`, le variabili di cmux e il suo
+`NODE_OPTIONS=--require=…` con `CMUX_ORIGINAL_NODE_OPTIONS_PRESENT=0` impostati (valori finti):
+`child_env_scrubbed` verifica nel record di fake-claude che nessun agente dei giri li abbia avuti, e lo script che
+`ps -E` dell'app non mostri né il socket di cmux né il suo `NODE_OPTIONS`.
+
+I processi del giro sono i pid che fake-claude scrive nel proprio record (chiamate `-p` e nipoti `sleep`),
+ricontrollati con `ps`, più qualunque processo della macchina, registrato o no, che lavora dentro la cartella del giro
+(trovato con `lsof`: gli agenti girano nei suoi worktree). Dentro l'app contano solo fake-claude `-p` e `sleep 300`; tra le fasi e
+alla fine lo script conta qualunque programma, più `pgrep -f` della copia di fake-claude del giro (e riporta, senza
+farli contare, gli altri fake-claude della macchina). Processi fake-claude di altri test o di un'altra istanza non
+contano e non vengono mai uccisi; con Ctrl-C lo script chiude app e processi del giro. Il backend conta i comandi IPC
+falliti: sono ammessi solo i tre `add_project` rifiutati del passo 3 e il `set_project_security` annullato della fase
+2 (per esempio nessun `get_diff` su un tentativo appena mergiato).
+
+I report JSON delle fasi 2 e 3 (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
+`security_confirmations`, `command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
+`perf_flood`, `csp_violations` sommate su tutti i caricamenti di pagina, `details` con cosa è stato verificato, con le
+misure della fase 3, o perché è fallito) sono l'unica cosa su stdout (i log di build vanno su stderr); lo script esce
+con 0 solo se tutto è vero, `csp_violations` è 0 e i controlli su processi e DB passano. Se fallisce, la cartella
+temporanea resta con log (`1.err`, `2.err`, `3.err`) e dati. L'E2E non registra il plugin single-instance, quindi gira
+anche con un'altra istanza aperta, e non esegue mai il claude reale: il binario indicato (`ATM_CLAUDE_PATH`, risolto nei
+symlink) deve chiamarsi `fake-claude` e contenere il messaggio di login di fake-claude (letto, mai eseguito),
+altrimenti si ferma subito. `debug_e2e_git` accetta solo i controlli di sola lettura della UI (`show`, `log`, `status`,
+`branch --list`, `worktree list`, nessuna opzione prima del sottocomando) e i comandi sui file rifiutano i symlink
+pendenti. `ATM_E2E=1` è ignorato insieme a `ATM_SELFTEST=1`.
+
+Restano fuori dall'automazione: il selettore nativo di cartelle (sopra), il drag nativo col mouse (il DnD usa
+`DragEvent` sintetici con `DataTransfer` sul DOM vero: una sessione di drag nativa segue il cursore reale e
+spostarlo disturberebbe chi usa il Mac; `effectAllowed` non si può verificare perché WebKit lo ignora su un
+`DataTransfer` costruito), il Cmd+R (non esiste) e, nel giro normale, l'apertura del Terminale (coperta da
+`--gatekeeper`, da lanciare a parte perché apre una finestra).
+
+`--gatekeeper` usa il codice del login sulla vera `app_cache_dir` (`~/Library/Caches/dev.aitaskmanager.desktop`, in una
+sottocartella `e2e-gatekeeper`, così uno script di login vero non viene toccato): `write_login_script` scrive
+`claude-login.command` e `open_login_terminal` lo apre con `open -a Terminal`. Il suo `claude` è un wrapper nella
+cartella temporanea che scrive i propri argomenti in un marker e poi esegue fake-claude: la prova passa se il marker
+dice `auth login` (Gatekeeper ha lasciato girare lo script) e lo script non ha l'attributo di quarantena; poi cancella
+la sottocartella.
 
 ## Validazione con il CLI reale (M5, opt-in)
 
@@ -118,113 +437,25 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   temporaneo (anche nella forma con i trattini del CLI), una chiave `sk-ant-` o un valore di `email`/`organization`
   diverso da `<redacted>`.
 
-## Build
+## Limiti noti
 
-```bash
-(cd ui && trunk build --release)             # solo frontend → ui/dist
-cargo tauri build --debug --no-bundle        # → target/debug/ai-task-manager (asset incorporati, CSP attiva)
-```
-
-## Selftest (solo build di debug)
-
-```bash
-cargo build -p atm-core --bin fake-claude   # il selftest usa fake-claude, mai il claude reale
-cargo tauri build --debug --no-bundle
-out=$(ATM_SELFTEST=1 ./target/debug/ai-task-manager) && echo "$out" && grep -qF '"csp_violations":0' <<<"$out"
-```
-
-La UI esegue da sola le prove IPC (`debug_ping`, errore tipizzato, 50 messaggi su `Channel` di cui tre da 20 KiB),
-guida il dialog portato, prova `subscribe_transcript`/unsubscribe e un reload della pagina (`transcript_subscribe_ok`,
-`forwarder_unsub_ok`, `forwarder_reload_ok`, `reload_ok`) e conta le violazioni CSP; l'app stampa il report JSON su stdout ed esce con 0 se tutto passa,
-altrimenti con 1 (anche se la UI non risponde entro 90 s). Funziona anche con `ATM_SELFTEST=1 cargo tauri dev`,
-ma lì `csp_enforced` vale `null`: Tauri applica la CSP solo agli asset incorporati, non alla pagina di `trunk serve`.
-In selftest il plugin single-instance non viene registrato, così la prova gira anche con un'altra istanza aperta;
-per lo stesso motivo il Core usa una cartella dati privata (`$TMPDIR/atm-selftest-<pid>`, cancellata all'uscita)
-e non tocca mai il DB né gli agenti dell'app aperta. Il controllo su stdout esclude le uscite con 0 senza report
-(per esempio la finestra chiusa a mano).
-
-## E2E in-app (solo build di debug, M4)
-
-```bash
-scripts/e2e.sh                  # build (--locked) di fake-claude e del bundle di debug, poi le due fasi (max 10 min)
-scripts/e2e.sh --no-build       # riusa target/debug
-scripts/e2e.sh --keep           # conserva log e dati anche se passa
-scripts/e2e.sh --gatekeeper     # solo la verifica Gatekeeper dello script di login: apre UNA finestra del Terminale
-```
-
-Con `ATM_E2E=1` la UI guida il DOM reale del WKWebView (click, `input`/`change`, tasti, eventi HTML5 di drag con
-`DataTransfer`) ed esegue in ordine tutto il percorso del §12.2 su fake-claude. Tutto sta in una cartella temporanea
-(`ATM_E2E_DIR`): DB, cache, `HOME` (quindi i worktree), i repository di prova creati dal backend (uno con un commit,
-una cartella non git, un repo bare, uno vuoto, uno con `.mcp.json`), il record e lo stato di login di fake-claude. Il
-selettore nativo di cartelle non è automatizzabile: il backend restituisce il percorso messo in coda dalla prova
-(`debug_e2e_queue_pick`), mentre il click su "Aggiungi repository", i toast e la sidebar sono quelli veri. "Accedi"
-scrive davvero `claude-login.command`, ma nel giro normale l'`open -a Terminal` viene solo registrato
-(`CoreConfig::open_log`, ignorato nelle build di release) e la prova esegue lo script con `/bin/sh`: il Terminale vero
-lo apre solo `--gatekeeper` (sotto).
-
-- **Fase 1:** passi 1–7 (il passo 2 si svolge dentro il gate del passo 1), con due reload nativi della pagina
-  (`-[WKWebView reload]`, come "Ricarica" nel menu contestuale del WebView di debug: l'app non ha una scorciatoia
-  Cmd+R): l'ordine del passo 4 riletto dal DB e la verifica che il reload faccia ripartire la subscription del
-  transcript (1 forwarder prima del reload, 0 dopo, 1 alla riapertura, vista ripristinata). Il passo 4 trascina quattro
-  card fino a `[T3, T6, T2, T1]` (create T1, T2, T3, T6); ogni `dragover` deve essere annullato (senza, WebKit non
-  darebbe il `drop`) e vede un `DataTransfer` senza dati, come nella modalità protetta di un drag vero. Il passo 7
-  ferma anche un `[fake:hang_ignore]`: lo Stop percorre tutta la sequenza del §7.9 (interrupt 5 s, EOF 3 s, SIGTERM
-  3 s, SIGKILL del gruppo) e deve chiudersi tra 10 e 13 s senza lasciare processi. Poi un task `[fake:hang_ignore]`
-  (ignora interrupt, EOF e SIGTERM e ha un nipote `sleep 300`: solo il SIGKILL di gruppo dello shutdown lo ferma), il
-  follow-up `[fake:hang]` di T1 e l'uscita con Cmd+Q: un ⌘Q (key-down e key-up, sorgente HID) mandato al pid dell'app
-  attraverso il window server con `CGEventPostToPid` → finestra, poi voce Esci del menu di Tauri → `NSApp terminate:`
-  → `applicationWillTerminate:` → `RunEvent::Exit` → `Core::shutdown` sul main thread. Serve che il terminale che
-  lancia lo script abbia l'accesso Accessibilità (per inviare eventi); senza, il ⌘Q è un `NSEvent` dato a
-  `-[NSApplication sendEvent:]` dentro l'app, e `details.cmd_q` del report dice quale via è stata usata. Se l'app non
-  esce entro 30 s la fase fallisce (con ⌘X al posto di ⌘Q fallisce davvero: il test non passa per caso).
-- **Tra le fasi:** lo script verifica dal log che l'uscita sia passata solo da `RunEvent::Exit`, che non resti
-  nessun processo del giro e che nel DB lo Stop del passo 7 sia `killed/user_stop` e i due turni dell'uscita
-  `killed/app_shutdown`.
-- **Fase 2:** l'app riparte sugli stessi dati: l'ordine `[T3, T6, T2]` del passo 4 dopo il riavvio vero (DOM e DB,
-  posizioni invariate), "Interrotto – Continua" su entrambe le card con la Notice dello shutdown, e Continua su tutte e
-  due (`--resume` della sessione di ciascuna, turno completato), passi 9–12, i messaggi `Channel` oltre 8 KiB
-  (`debug_channel_probe` e un turno `[fake:big]`) e la CSP applicata (`eval` bloccato). Al passo 10 T6 e T3 aggiungono
-  righe diverse a `hello.txt` (`[fake:append]`); T6 viene mergiato, così T3 va in conflitto con `main` e "Risolvi con
-  l'agente" manda il prompt dell'app (che non ha tag): fake-claude registra di aver giocato `resolve_merge`. Infine un
-  altro turno `[fake:hang_ignore]` e l'uscita del report con `app.exit` (l'altro ramo: `ExitRequested` →
-  `Core::shutdown`); lo script ricontrolla ramo di uscita, processi e DB.
-
-L'app gira con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` e `GIT_DIR` impostati
-(valori finti): `child_env_scrubbed` verifica nel record di fake-claude che nessun agente dei due giri li abbia avuti.
-
-I processi del giro sono i pid che fake-claude scrive nel proprio record (chiamate `-p` e nipoti `sleep`),
-ricontrollati con `ps`, più qualunque processo della macchina, registrato o no, che lavora dentro la cartella del giro
-(trovato con `lsof`: gli agenti girano nei suoi worktree). Dentro l'app contano solo fake-claude `-p` e `sleep 300`; tra le fasi e
-alla fine lo script conta qualunque programma. Processi fake-claude di altri test o di un'altra istanza non contano e
-non vengono mai uccisi; con Ctrl-C lo script chiude app e processi del giro. Il backend conta i comandi IPC falliti: sono
-ammessi solo i tre `add_project` rifiutati del passo 3 (per esempio nessun `get_diff` su un tentativo appena mergiato).
-
-Il report JSON finale (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
-`command_failures_phase1`/`_phase2`, `exit_requested_armed`, `csp_violations` sommate su tutti i caricamenti di pagina,
-`child_env_scrubbed`, `details` con cosa è stato verificato o perché è fallito) è l'unica cosa su stdout (i log di build
-vanno su stderr); lo script esce con 0 solo se tutto è vero,
-`csp_violations` è 0 e i controlli su processi e DB passano. Se fallisce, la cartella temporanea resta con log
-(`1.err`, `2.err`) e dati. L'E2E non registra il plugin single-instance, quindi gira anche con un'altra istanza aperta,
-e non esegue mai il claude reale: il binario indicato (`ATM_CLAUDE_PATH`, risolto nei symlink) deve chiamarsi
-`fake-claude` e contenere il messaggio di login di fake-claude (letto, mai eseguito), altrimenti si ferma subito.
-`debug_e2e_git` accetta solo i controlli di sola lettura della UI (`show`, `log`, `status`, `branch --list`,
-`worktree list`, nessuna opzione prima del sottocomando) e i comandi sui file rifiutano i symlink pendenti.
-`ATM_E2E=1` è ignorato insieme a `ATM_SELFTEST=1`.
-
-Restano fuori dall'automazione: il selettore nativo di cartelle (sopra), il drag nativo col mouse (il DnD usa
-`DragEvent` sintetici con `DataTransfer` sul DOM vero: una sessione di drag nativa segue il cursore reale e
-spostarlo disturberebbe chi usa il Mac; `effectAllowed` non si può verificare perché WebKit lo ignora su un
-`DataTransfer` costruito), il Cmd+R (non esiste) e, nel giro normale, l'apertura del Terminale (coperta da
-`--gatekeeper`, da lanciare a parte perché apre una finestra). Il driver della UI (`ui/src/e2e.rs`) è compilato anche
-nel WASM di release, come quello del selftest: all'avvio chiede `debug_e2e_setup`, che in release non esiste, e non fa
-altro (i comandi di debug esistono solo nelle build di debug); toglierli dal WASM di release è rimandato a M6.
-
-`--gatekeeper` usa il codice del login sulla vera `app_cache_dir` (`~/Library/Caches/dev.aitaskmanager.desktop`, in una
-sottocartella `e2e-gatekeeper`, così uno script di login vero non viene toccato): `write_login_script` scrive
-`claude-login.command` e `open_login_terminal` lo apre con `open -a Terminal`. Il suo `claude` è un wrapper nella
-cartella temporanea che scrive i propri argomenti in un marker e poi esegue fake-claude: la prova passa se il marker
-dice `auth login` (Gatekeeper ha lasciato girare lo script) e lo script non ha l'attributo di quarantena; poi cancella
-la sottocartella.
+- Il worktree non è una sandbox (sopra); le regole deny sono aggirabili; in Attendibile hook e server MCP del repo
+  girano con i permessi dell'utente.
+- Attendibile approva la configurazione committata sul branch target, non i file locali del checkout principale; un
+  branch che cambia configurazione va riapprovato (sopra).
+- Alla fine di ogni turno l'app chiude lo stdin del CLI: il lavoro lasciato in background da un agente (dev server,
+  `run_in_background`) viene chiuso con il turno (spec R7).
+- I worktree non hanno `node_modules`, `.env` e cache del checkout principale: i primi turni possono spendere tempo a
+  fare bootstrap (R11). Script di setup e `copy_files` sono rimandati.
+- I discendenti di un agente morto da solo senza `result`, o insieme all'app, non sono coperti dalla chiusura dei
+  processi (§7.9).
+- Il CLI salva i suoi transcript in `~/.claude/projects/<worktree>`: l'app non li legge e non li cancella (R12).
+- Il modello può rifiutare un follow-up che ritiene estraneo a un task già finito (M5); il prompt dell'app lo mitiga
+  per gli attempt nuovi.
+- Solo macOS su Apple Silicon; app non firmata né notarizzata (Gatekeeper sopra); nessun aggiornamento automatico.
+- Niente push, fetch, PR, plan mode, immagini nei prompt, rewind (spec §13.2).
+- L'E2E non automatizza il selettore di cartelle nativo né il drag nativo col mouse; i tempi della sua fase 3 si
+  misurano solo con lo schermo sbloccato e la finestra visibile (altrimenti il report li dà come non misurati).
 
 ## Fallback di wasm-opt
 
@@ -273,3 +504,25 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | "Consenti sempre" con le suggestion reali | fix: il CLI aggiunge sempre `addDirectories` e `setMode`; `can_remember` ora considera (e inoltra) solo le `addRules`/`allow` | M5 |
 | Processi dei comandi Bash | fix: il CLI li mette in process group propri; il Core registra i discendenti del leader mentre vive (al `result` e a ogni gradino dello stop) e a fine turno chiude quelli rimasti, anche quando il CLI esce da solo; sui percorsi con SIGKILL li uccide con il leader | M5 |
 | `acceptEdits` e Bash | il CLI approva da solo i comandi che leggono o scrivono file nel cwd (non "Bash chiede sempre"); in Supervisionato `ls` passa, `touch` e `python3` chiedono, un `sleep N` isolato è bloccato dal CLI | M5 |
+| Fingerprint della configurazione Claude (accettazione #1) | confermato con fake-claude che esegue la configurazione del repo (`FAKE_CLAUDE_PROJECT_CONFIG=1`): in Isolated nessun marker; in Trusted invariato sì; dopo una modifica nel worktree turno Isolated con Notice; dal 2026-09-29 senza `apiKeyHelper` (non più approvabile) e con il branch target che cambia configurazione (riapprovare) | M6 |
+| Conferme native per Trusted, bypass e chiave API | confermate dall'E2E (`security_confirmations`) con risposte in coda | M6 |
+| `TurnEnd` dopo uno Stop | mostra "Interrotto dall'utente" (non l'`[ede_diagnostic]` interno) | M6 |
+| Deny di una regola dei permessi | mostrato come Negato, non Fallito | M6 |
+| Variabili di una sessione Claude Code padre | tolte dall'ambiente degli agenti (`tests/claude.rs`, `tests/flow.rs`, E2E `child_env_scrubbed`) | M6 |
+| Solo abbonamento: Trusted rifiutato per una configurazione che fattura via API (2026-09-29) | confermato: `apiKeyHelper`, `awsAuthRefresh`, `env.ANTHROPIC_BASE_URL` (in `settings.local.json` committato), `env.ANTHROPIC_API_KEY`, `env.CLAUDE_CODE_USE_VERTEX`, un JSON non valido → `Invalid` che nomina la chiave, nulla salvato; un'approvazione precedente che la conteneva lascia il progetto non attendibile e il turno Isolato, helper mai eseguito (`tests/flow.rs::trusted_is_refused_when_the_config_bills_outside_the_subscription`); un worktree che aggiunge `env.ANTHROPIC_API_KEY` gira Isolato con la Notice e torna Attendibile quando la toglie (`a_worktree_config_that_bills_outside_the_subscription_runs_isolated`); ogni nome delle due liste è controllato (`tests/git.rs::billing_keys_of_the_settings`) | M6+ |
+| Solo abbonamento: turno fermato su `apiKeySource` (2026-09-29) | confermato con fake-claude (`FAKE_CLAUDE_API_KEY_SOURCE`): `[fake:slow]` fermato al `system/init` in meno di 5 s, `failed` senza `stop_reason`, Notice ed `error` "Turno fermato: … (apiKeySource: ANTHROPIC_API_KEY)", nessun testo del modello né `TurnEnd`, processo sparito; col passthrough attivo lo stesso turno completa (`tests/flow.rs::an_api_key_source_stops_the_turn_unless_the_passthrough_is_on`) | M6+ |
+| Approvazione del commit di punta del branch target (2026-09-29) | confermato: la configurazione di un commit letta con `git cat-file --batch` è identica a quella di un suo worktree (directory, script eseguibili, link a file e a directory, link pendente, submodule, file eseguiti e marketplace) e non cambia con i file locali del checkout principale (`tests/git.rs::commit_config_is_the_config_of_a_checkout_of_it`); link fuori dal repo, file eseguiti portati fuori da un link, cicli, 2000 record, 64 MiB, commit sconosciuto → errore (`commit_config_limits_and_links`); `settings.local.json` non tracciato (anche con `apiKeyHelper`) e modifiche non committate non bloccano i turni Trusted, un commit che non tocca la configurazione mantiene l'approvazione, repo senza configurazione approvato con l'hash vuoto (`tests/flow.rs::trusted_approves_the_target_tip_not_the_working_tree`); branch andato avanti → progetto non attendibile, l'attempt dal tip nuovo gira Isolato con la Notice da riapprovare (`malicious_repo_config_runs_only_when_trusted_and_unchanged`) | M6+ |
+| `NODE_OPTIONS` di cmux (2026-09-29) | confermato: marker `0` → tolto, `1` con il valore salvato → ripristinato, senza marker → intatto, in ogni figlio (`tests/claude.rs::child_env_restores_the_users_node_options_under_cmux`, `tests/flow.rs::api_key_passthrough_is_opt_in_and_a_parent_session_never_leaks`) e nella ri-esecuzione dell'app (E2E: 16 chiamate di agenti senza `NODE_OPTIONS`, `ps -E` dell'app senza il `--require` di cmux) | M6+ |
+| Revisione del 2026-09-29: file di impostazioni sotto un altro nome (APFS) | confermato su questo Mac (volume che ignora maiuscole e forme Unicode): `.claude/Settings.json` e `.claude/ſettings.local.json` (U+017F) si aprono come i file di impostazioni; nel worktree sono analizzati come tali (chiavi di fatturazione, regola `Bash`, hook e `apiKeyHelper` eseguiti tracciati), nel commit rendono la configurazione non verificabile, come `.Claude/` e `.MCP.json` nella radice (`tests/git.rs::settings_under_another_name_are_what_the_cli_opens`); Trusted rifiutato per un commit con `.claude/Settings.json`, e con un'approvazione precedente il turno gira Isolato con la Notice di fatturazione, `apiKeyHelper` mai eseguito (`tests/flow.rs::a_settings_file_under_another_case_is_checked_like_the_settings`) | M6+ |
+| Revisione del 2026-09-29: fetch pigro di un partial clone | confermato con git 2.54: con `extensions.partialClone`, `remote.origin.promisor` e un `remote.origin.uploadpack` che crea un file, `git diff` semplice verso un commit con oggetti mancanti lo esegue (controllo); dal runner dell'app (`GIT_NO_LAZY_FETCH=1` su ogni chiamata) diff, `merge-tree`, `worktree add` e configurazione del commit falliscono senza eseguire nulla (`tests/git.rs::a_partial_clone_never_fetches_from_the_app`); un git 2.30 o 2.43 non esegue nient'altro che `--version` (`git_discovery_and_version_gate`) | M6+ |
+| Revisione del 2026-09-29: ricontrollo al `system/init` | confermato con fake-claude: un hook `SessionStart` che scrive `env.ANTHROPIC_BASE_URL` in `.claude/settings.local.json` → turno `[fake:slow]` congelato, ricontrollato e ucciso in meno di 5 s, `failed` senza `stop_reason`, Notice ed `error` "Turno fermato: … imposta env.ANTHROPIC_BASE_URL.", nessun testo del modello, processo sparito (`tests/flow.rs::a_billing_key_gained_during_the_cli_start_kills_the_turn_at_once`); un cambio qualsiasi all'avvio dà lo stesso esito e il turno dopo gira Isolato (`a_config_change_during_the_cli_start_stops_the_turn`) | M6+ |
+| Revisione del 2026-09-29: `ANTHROPIC_BASE_URL` nell'ambiente dell'app | confermato: resta nell'ambiente degli agenti come `CLAUDE_CODE_USE_*` (`tests/claude.rs::child_env_drops_a_parent_sessions_variables_only`), `EnvStatus.base_url_env` lo segnala (`tests/flow.rs::api_key_passthrough_is_opt_in_and_a_parent_session_never_leaks`, anche per gli endpoint dei provider: `tests/claude.rs::api_key_and_cloud_provider_detection`) e la topbar mostra il banner `base-url` (test di `ui/src/views/sidebar.rs`) | M6+ |
+| Revisione del 2026-09-29: link e limiti della visita | confermato: nel worktree un link fuori dal repository non viene seguito né toccato (niente `realpath`: un target in una cartella senza permessi dà il record `e` col percorso testuale, `tests/git.rs::a_link_out_of_the_root_is_never_looked_at`); una parola più lunga di `PATH_MAX` si salta, più di 4096 parole cercate come path, alberi letti oltre 16 MiB in tutto (due cartelle da 9 MiB; una sola passa), un albero con un nome ripetuto → errore (`commit_and_checkout_walks_are_bounded`); passi e tempo limitati (test unitari di `git/fingerprint.rs`); gli errori `Invalid` della configurazione di un commit restano in cache come i risultati | M6+ |
+| Revisione di sicurezza di M6 | fingerprint esteso ai file eseguiti dalla configurazione (`tests/flow.rs::trusted_config_covers_the_script_an_mcp_server_runs`), compare-and-set di approvazione e impostazioni, revoche che fermano i turni, ricontrollo al `system/init`, variabili cmux/IDE tolte e app ri-eseguita senza quelle della sessione padre (E2E: `ps -E` dell'app), filter driver del repo spenti nel git dell'app | M6 |
+| `claude auth status` e `--version` con cwd `/` | confermato (CLI 2.1.284, nessuna quota): da `/` `authMethod: claude.ai`; in una cartella con `apiKeyHelper` nel `.claude/settings.json` `auth status` riporta `api_key_helper` (legge le impostazioni del cwd senza eseguirle), per questo i probe girano sempre con cwd `/` | M6 |
+| Driver di selftest ed E2E fuori dal WASM di release | confermato: solo con la feature `testkit`; `strings` sul WASM e sul binario di release non trova nessuno dei loro nomi (`scripts/release.sh`), mentre il WASM `testkit` li contiene; selftest ed E2E passano con `--config src-tauri/tauri.testkit.conf.json` | M6 |
+| `cargo tauri build`: `.app` e `.dmg` | confermato (non firmati): `AI Task Manager.app` (9,9 MiB) e `AI Task Manager_0.1.0_aarch64.dmg` (5,5 MiB), icona nuova (`cargo tauri icon` da `icon.svg`); il .dmg con l'impaginazione del Finder richiede il permesso Automazione (senza, l'AppleScript del bundler va in timeout: `scripts/release.sh` la salta con `CI=true`) | M6 |
+| `.app` di release aperto con LaunchServices con l'ambiente del Finder trova `claude` e `git` | confermato (2026-09-28): `open` sotto `env -i` con il `PATH` di launchd (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`; `open` da solo passa all'app l'ambiente del Terminale); con il `claude` reale, solo `--version` e `auth status`: `claude ~/.local/bin/claude version 2.1.284 … auth loggedIn (authMethod claude.ai, subscription max) git /opt/homebrew/bin/git version 2.54.0`, board senza gate e "In uso" letti via Accessibilità | M6 |
+| Uscita con 2 agenti fake attivi (accettazione #2) | confermato dall'E2E: Cmd+Q con `[fake:hang]` e `[fake:hang_ignore]` in corso, poi `pgrep -f` di fake-claude vuoto | M6 |
+| Reinstallazione (accettazione #5) | confermato dall'E2E: copia nuova del bundle sopra quella installata (inode nuovo), la fase 2 la esegue sui dati della fase 1 e dopo ogni riga `processes` e ogni log della fase 1 sono ancora lì, invariati; e con il `.app` di release (dati di un giro `--perf`, `HOME` temporanea): stessi 3 task, 30 009 entry, 9 log e 3 worktree prima e dopo, board uguale | M6 |
+| Prestazioni con `flood` e 3 agenti | confermato dall'E2E (fase 3, schermo sbloccato): 3 × 10 000 testi in ~11 s con 10 s di sovrapposizione, timer da 20 ms mai più di 27–29 ms in ritardo, cambio tab visibile al primo controllo (51–54 ms, il polling è ogni 50 ms), al massimo 300 righe nel DOM | M6 |

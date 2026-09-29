@@ -144,12 +144,19 @@ pub struct Project {
     pub default_model: Option<String>,
     pub config_policy: ConfigPolicy,
     /// Trust in effect: `config_policy` is Trusted and the approved fingerprint still matches
-    /// the main checkout (spec §8.9). Trusted with a stale fingerprint → `false` (turns run
-    /// Isolated until the user approves again, with a native confirmation).
+    /// the configuration committed at the tip of the default target branch, where new
+    /// worktrees start (spec §8.9). Trusted with a stale fingerprint → `false` (new attempts
+    /// run Isolated until the user approves again, with a native confirmation).
     pub trusted: bool,
     pub allow_bypass: bool,
     pub created_at: Millis,
     pub updated_at: Millis,
+    /// Policy Trusted and the target branch's configuration cannot be fingerprinted or
+    /// approved (a limit, a link out of the repository, the home directory, a branch that
+    /// cannot be read, settings that would bill outside the subscription): why, for the
+    /// settings (M6). `None` otherwise, and absent from the JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,6 +318,9 @@ pub struct EnvStatus {
     pub api_key_in_env: bool,
     /// A third-party provider (Bedrock, Vertex, ...) is selected by the environment.
     pub cloud_provider_env: bool,
+    /// `ANTHROPIC_BASE_URL` (or a provider's base URL) is set in the app's environment: the
+    /// agents' requests, with the subscription's credentials, go to that endpoint.
+    pub base_url_env: bool,
     /// Usage-limit text while new turns are paused (spec §7.9).
     pub paused: Option<String>,
     /// Turns running now across all projects, and `settings.max_running`: the topbar's

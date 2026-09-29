@@ -1,6 +1,7 @@
 //! IPC and CSP selftest (spec §11.2 M0, M3-TAURI). Runs only when the debug backend reports
-//! `ATM_SELFTEST=1`; in release the probe commands do not exist and this is a no-op.
-//! Not compiled with `--features mock` (there is no backend to probe).
+//! `ATM_SELFTEST=1`. Compiled only with `--features testkit` (debug bundles: `cargo tauri dev`,
+//! `--config src-tauri/tauri.testkit.conf.json`), so the release WASM does not contain it (M6),
+//! and not with `--features mock` (there is no backend to probe).
 //!
 //! Two page loads: the first runs the checks, leaves a transcript subscription open, keeps
 //! its partial report in `sessionStorage` and reloads; the second checks that the reload

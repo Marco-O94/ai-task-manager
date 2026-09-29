@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use atm_types::{
-    ApprovalDecision, Entry, EntryBody, Id, Level, LimitKind, Millis, NoticeAction, ToolOutput,
-    ToolStatus,
+    ApprovalDecision, Entry, EntryBody, Id, Level, LimitKind, Millis, NoticeAction, StopReason,
+    ToolOutput, ToolStatus,
 };
 use serde_json::Value;
 
@@ -55,6 +55,21 @@ pub const NO_API_KEY_SOURCES: &[&str] = &["none"];
 
 /// Notice texts (Italian, shown as is).
 pub const COMPACTED_NOTICE: &str = "Contesto compattato";
+
+/// Start and middle of the `tool_result` of a call a settings rule denied (M5, spec §13.4: the
+/// deny list of `--settings` on `git push` gives "Permission to use Bash with command git push
+/// has been denied."): the call is `Denied`, not `Failed`. The CLI 2.1.283 also marks it with
+/// `system/permission_denied` and `tool_result_meta[].non_execution_kind` = [`RULE_DENIED_KIND`].
+pub const RULE_DENIAL_PREFIX: &str = "Permission to use ";
+pub const RULE_DENIAL_MARK: &str = " has been denied";
+/// `tool_result_meta[].non_execution_kind` of a call denied by a permission rule.
+pub const RULE_DENIED_KIND: &str = "permission-rule";
+/// `tool_result_meta[].non_execution_kind` of the call the CLI rejects when it is interrupted
+/// (M5: an approved Bash call running when the user pressed Stop): after a stop requested by
+/// the app it is `Cancelled`, not `Failed`.
+pub const USER_REJECTED_KIND: &str = "user-rejected";
+/// `Denied.message` of a call listed in `result.permission_denials` without any text.
+pub const RULE_DENIED_MESSAGE: &str = "Negato dalle regole dei permessi";
 
 const ELLIPSIS: &str = "…";
 const OUTPUT_SEPARATOR: &str = "\n…\n";
@@ -193,6 +208,36 @@ pub fn init_session_id(line: &Value) -> Option<&str> {
     }
 }
 
+/// The `apiKeySource` of a `system/init` line when it names an API key: present and not one
+/// of [`NO_API_KEY_SOURCES`] (case-insensitive). The runner stops such a turn unless the
+/// passthrough of the environment's key is on (spec §7.6); a missing value only warns.
+pub fn api_key_billing(line: &Value) -> Option<&str> {
+    if line["type"] != "system" || line["subtype"] != "init" {
+        return None;
+    }
+    str_of(line, "apiKeySource").filter(|source| {
+        !NO_API_KEY_SOURCES
+            .iter()
+            .any(|none| source.eq_ignore_ascii_case(none))
+    })
+}
+
+/// `text` is the CLI's answer to a call a permission rule denied ([`RULE_DENIAL_PREFIX`]).
+pub fn is_rule_denial(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with(RULE_DENIAL_PREFIX) && text.contains(RULE_DENIAL_MARK)
+}
+
+/// `tool_result_meta` of a `user` line: `non_execution_kind` by tool use id.
+fn non_execution_kinds(line: &Value) -> HashMap<&str, &str> {
+    line["tool_result_meta"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| Some((str_of(m, "id")?, str_of(m, "non_execution_kind")?)))
+        .collect()
+}
+
 fn classify_limit(subtype: &str, text: Option<&str>) -> Option<LimitKind> {
     let haystack = format!("{subtype}\n{}", text.unwrap_or_default()).to_lowercase();
     LIMIT_PATTERNS
@@ -203,6 +248,22 @@ fn classify_limit(subtype: &str, text: Option<&str>) -> Option<LimitKind> {
 
 /// Parses a `{"type":"result",…}` line, classifying `limit` with [`LIMIT_PATTERNS`] when
 /// `is_error`. `None` for any other line. `text` is `result`, else the `errors` joined.
+/// Prefix of the CLI's internal text in the `result` that answers an interrupt (M5).
+pub const EDE_DIAGNOSTIC: &str = "[ede_diagnostic]";
+
+/// An error `result` shaped like the answer to an interrupt (M5, CLI 2.1.283):
+/// `terminal_reason: "aborted_streaming"`, or no text but the CLI's internal
+/// [`EDE_DIAGNOSTIC`] lines.
+pub fn is_interrupt_result(line: &Value, text: Option<&str>) -> bool {
+    line["terminal_reason"] == "aborted_streaming"
+        || text.is_none_or(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .all(|l| l.starts_with(EDE_DIAGNOSTIC))
+        })
+}
+
 pub fn parse_result(line: &Value) -> Option<TurnResult> {
     if line["type"] != "result" {
         return None;
@@ -360,6 +421,8 @@ pub struct Normalizer {
     stderr: Option<OpenStderr>,
     typing: String,
     typing_at: Option<Millis>,
+    /// The app asked this turn to stop ([`Normalizer::on_stop_requested`]).
+    stopped: Option<StopReason>,
 }
 
 impl Normalizer {
@@ -376,7 +439,16 @@ impl Normalizer {
             stderr: None,
             typing: String::new(),
             typing_at: None,
+            stopped: None,
         }
+    }
+
+    /// The app is stopping this turn (the user's Stop, "Nega e ferma", the app's shutdown);
+    /// the first reason wins. From then on an error `result` becomes a `TurnEnd` with
+    /// `stopped` and no CLI text (M5: an internal `[ede_diagnostic] …`), and the call the CLI
+    /// rejects because of the interrupt ([`USER_REJECTED_KIND`]) becomes `Cancelled`.
+    pub fn on_stop_requested(&mut self, reason: StopReason) {
+        self.stopped.get_or_insert(reason);
     }
 
     fn alloc_idx(&mut self) -> u32 {
@@ -450,6 +522,7 @@ impl Normalizer {
             ("system", "compact_boundary") => {
                 self.on_notice(Level::Info, COMPACTED_NOTICE, None, ts)
             }
+            ("system", "permission_denied") => self.rule_denied(line).into_iter().collect(),
             ("result", _) => self.result(line, ts),
             _ => Vec::new(),
         }
@@ -548,36 +621,73 @@ impl Normalizer {
     }
 
     /// `user` lines: each `tool_result` completes its `ToolCall`; string content is ignored.
+    /// An error result of a call a permission rule denied makes it `Denied`; after a stop, the
+    /// call the CLI rejected because of the interrupt is `Cancelled` (without that canned text).
     fn tool_results(&mut self, line: &Value) -> Vec<EntryOp> {
+        let kinds = non_execution_kinds(line);
         let blocks = line["message"]["content"].as_array().into_iter().flatten();
         let mut ops = Vec::new();
         for block in blocks.filter(|b| b["type"] == "tool_result") {
             let Some(id) = str_of(block, "tool_use_id") else {
                 continue;
             };
+            let stopped = self.stopped.is_some();
             let Some(t) = self.tools.get_mut(id) else {
                 continue;
             };
             let is_error = block["is_error"].as_bool().unwrap_or(false);
-            let (text, truncated_bytes) =
-                head_tail(&tool_result_text(&block["content"]), MAX_OUTPUT);
-            // A denied call keeps `Denied`: its error result is the deny message.
-            if !matches!(t.status, ToolStatus::Denied { .. }) {
-                t.status = if is_error {
-                    ToolStatus::Failed
-                } else {
-                    ToolStatus::Succeeded
-                };
-            }
-            t.output = Some(ToolOutput {
+            let full = tool_result_text(&block["content"]);
+            let kind = kinds.get(id).copied();
+            let rule_denied = is_error && (kind == Some(RULE_DENIED_KIND) || is_rule_denial(&full));
+            let interrupted = is_error && stopped && kind == Some(USER_REJECTED_KIND);
+            let (text, truncated_bytes) = head_tail(&full, MAX_OUTPUT);
+            let output = Some(ToolOutput {
                 text,
                 truncated_bytes,
                 is_error,
             });
+            match t.status {
+                // A denied call keeps `Denied`: its error result is the deny message.
+                ToolStatus::Denied { .. } => t.output = output,
+                _ if rule_denied => {
+                    t.status = ToolStatus::Denied {
+                        message: cap(&one_line(full.trim()), MAX_TEXT),
+                    };
+                    t.output = output;
+                }
+                _ if interrupted => {
+                    t.status = ToolStatus::Cancelled;
+                    t.output = None;
+                }
+                _ => {
+                    t.status = if is_error {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Succeeded
+                    };
+                    t.output = output;
+                }
+            }
             t.rev += 1;
             ops.push(self.tool_op(id));
         }
         ops
+    }
+
+    /// `system/permission_denied` (M5: a settings rule denied the call, before its
+    /// `tool_result`): the known call becomes `Denied` with the CLI's `message`.
+    fn rule_denied(&mut self, line: &Value) -> Option<EntryOp> {
+        let id = str_of(line, "tool_use_id")?;
+        let t = self.tools.get_mut(id)?;
+        if matches!(t.status, ToolStatus::Denied { .. }) {
+            return None;
+        }
+        let message = str_of(line, "message").unwrap_or(RULE_DENIED_MESSAGE);
+        t.status = ToolStatus::Denied {
+            message: cap(&one_line(message.trim()), MAX_TEXT),
+        };
+        t.rev += 1;
+        Some(self.tool_op(id))
     }
 
     fn session_init(&mut self, line: &Value, ts: Millis) -> EntryOp {
@@ -653,10 +763,20 @@ impl Normalizer {
         EntryOp::Upsert(entry)
     }
 
+    /// `TurnEnd`, after the calls of `permission_denials` that still look failed or open are
+    /// made `Denied` (the list names every denied call, the user's included). After a stop the
+    /// app requested, the error `result` that answers the interrupt ([`is_interrupt_result`])
+    /// carries `stopped` and none of the CLI's text; any other error keeps its text and no
+    /// `stopped` (it may have been queued before the interrupt was sent: a real API error or
+    /// turn limit must not read "Interrotto dall'utente").
     fn result(&mut self, line: &Value, ts: Millis) -> Vec<EntryOp> {
         let Some(r) = parse_result(line) else {
             return Vec::new();
         };
+        let mut ops = self.denials(line);
+        let stopped = self
+            .stopped
+            .filter(|_| r.is_error && is_interrupt_result(line, r.text.as_deref()));
         let body = EntryBody::TurnEnd {
             subtype: r.subtype,
             is_error: r.is_error,
@@ -664,10 +784,45 @@ impl Normalizer {
             num_turns: r.num_turns,
             cost_usd_estimate: r.cost_usd_estimate,
             permission_denials: r.permission_denials,
-            text: r.text,
+            text: if stopped.is_some() { None } else { r.text },
             limit: r.limit,
+            stopped,
         };
-        vec![self.push(ts, None, body), self.clear_typing()]
+        ops.push(self.push(ts, None, body));
+        ops.push(self.clear_typing());
+        ops
+    }
+
+    /// `result.permission_denials[].tool_use_id` whose call is `Failed` or `Running` →
+    /// `Denied` (message: the call's output, else [`RULE_DENIED_MESSAGE`]).
+    fn denials(&mut self, line: &Value) -> Vec<EntryOp> {
+        let ids: Vec<String> = line["permission_denials"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| str_of(d, "tool_use_id").map(str::to_owned))
+            .collect();
+        let mut ops = Vec::new();
+        for id in ids {
+            let Some(t) = self.tools.get_mut(&id) else {
+                continue;
+            };
+            if !matches!(t.status, ToolStatus::Failed | ToolStatus::Running) {
+                continue;
+            }
+            let message = t
+                .output
+                .as_ref()
+                .map(|o| one_line(o.text.trim()))
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| RULE_DENIED_MESSAGE.into());
+            t.status = ToolStatus::Denied {
+                message: cap(&message, MAX_TEXT),
+            };
+            t.rev += 1;
+            ops.push(self.tool_op(&id));
+        }
+        ops
     }
 
     /// One stderr line (ANSI stripped, merged with the previous one if < 2 s apart).

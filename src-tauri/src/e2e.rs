@@ -4,7 +4,9 @@
 //! ([`debug_e2e_quit`]: a ⌘Q key event posted through the window server → the menu's Quit →
 //! `NSApp terminate:` → `RunEvent::Exit`); `ATM_E2E_PHASE=2` relaunches on the same data, runs
 //! the rest and exits through `app.exit` (`RunEvent::ExitRequested`) during another turn;
-//! `gatekeeper` only opens the real login script in Terminal (spec §7.10, `--gatekeeper`).
+//! `ATM_E2E_PHASE=3` (M6) measures `[fake:flood]` on three concurrent attempts, after phase 2 on
+//! the same data or alone on a fresh directory (`--perf`); `gatekeeper` only opens the real
+//! login script in Terminal (spec §7.10, `--gatekeeper`).
 //!
 //! Everything lives under `ATM_E2E_DIR`: data and cache dirs, `HOME` (hence the worktree
 //! root), the temporary repositories, fake-claude's record and login state. Agents always run
@@ -12,7 +14,7 @@
 //! [`verify_fake`] without running it); `open` is recorded instead of run, the native folder
 //! picker returns queued paths.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -23,8 +25,8 @@ use std::time::{Duration, Instant};
 use atm_core::claude::{self, ATM_CLAUDE_PATH_ENV};
 use atm_core::{CoreConfig, git::is_scrubbed_git_var};
 use atm_types::debug::{
-    E2eAuthReq, E2eGatekeeper, E2eGitOut, E2eGitReq, E2eLoginScript, E2ePathReq, E2eSetup,
-    E2eWriteReq, ReportReq,
+    E2eAuthReq, E2eConfirmReq, E2eGatekeeper, E2eGitOut, E2eGitReq, E2eLoginScript, E2ePathReq,
+    E2eSetup, E2eWriteReq, ReportReq,
 };
 use atm_types::{AppError, LoginMethod};
 use serde_json::Value;
@@ -39,6 +41,11 @@ const WATCHDOG: Duration = Duration::from_secs(240);
 const SLOW_EVENTS: &str = "30";
 /// Pause between the text deltas of a streamed text: the UI's progressive rendering is seen.
 const DELTA_MS: &str = "300";
+/// Assistant texts of one `[fake:flood]` turn (phase 3; fake-claude's default, made explicit),
+/// with a pause after every 100: ~1000 texts per second per agent, so that the three floods,
+/// started one after the other from the UI, stream together for several seconds.
+const FLOOD_EVENTS: &str = "10000";
+const FLOOD_PAUSE_MS: &str = "100";
 /// Folder of `app_cache_dir` for the Gatekeeper check: a real login script is never touched.
 const GATEKEEPER_DIR: &str = "e2e-gatekeeper";
 const GATEKEEPER_WAIT: Duration = Duration::from_secs(30);
@@ -48,13 +55,28 @@ const QUIT_WAIT: Duration = Duration::from_secs(30);
 /// Only fake-claude's binary contains it (its `auth login` line): a real CLI renamed or linked
 /// as `fake-claude` does not.
 const FAKE_MARKER: &[u8] = b"fake-claude: login simulato";
-/// The variables fake-claude records the presence of (`RECORDED_VARS` in fake-claude.rs).
-const RECORDED_VARS: [&str; 5] = [
+/// The variables fake-claude records the presence of (`RECORDED_VARS` in fake-claude.rs) that
+/// no agent may get, a parent Claude Code session's and its host's included (M6), with cmux's
+/// `NODE_OPTIONS` (its marker says the user had none).
+const RECORDED_VARS: [&str; 18] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "GIT_DIR",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_SSE_PORT",
+    "ENABLE_IDE_INTEGRATION",
+    "CMUX_SOCKET_PATH",
+    "CMUX_CUA_AUTH_TOKEN_FILE",
+    "CMUX_ORIGINAL_NODE_OPTIONS_PRESENT",
+    "NODE_OPTIONS",
 ];
 /// What `debug_e2e_git` may run: the UI's read-only checks.
 const GIT_SUBCOMMANDS: [&str; 5] = ["show", "log", "status", "branch", "worktree"];
@@ -65,6 +87,10 @@ const GIT_OPTIONS: [&str; 5] = ["-1", "--name-only", "--porcelain", "--list", "-
 static FAKE: OnceLock<PathBuf> = OnceLock::new();
 /// Path returned by the next `pick_repo_folder` (queued by `debug_e2e_queue_pick`).
 static PICK: Mutex<Option<String>> = Mutex::new(None);
+/// Answers of the next native confirmations (queued by `debug_e2e_queue_confirm`), in order.
+static CONFIRM: Mutex<VecDeque<bool>> = Mutex::new(VecDeque::new());
+/// `"<title>: <text>"` of every confirmation asked ([`take_confirm`]).
+static CONFIRMS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// `"<command>: <code>"` of every failed IPC command ([`note_failure`]).
 static FAILURES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -206,17 +232,19 @@ fn check_git_args(args: &[String]) -> Result<(), AppError> {
 }
 
 /// Data dir, cache dir, fake-claude and the child environment of a run. Phase 1 first creates
-/// the repositories and logs fake-claude out (step 1 starts at the login gate).
+/// the repositories and logs fake-claude out (step 1 starts at the login gate); phase 3 alone
+/// (`--perf`, no login state yet) creates them and logs it in.
 pub fn core_config() -> CoreConfig {
     let p = Paths::get();
     for dir in [&p.home, &p.repos] {
         std::fs::create_dir_all(dir).unwrap_or_else(|e| fail(&format!("{}: {e}", dir.display())));
     }
-    if phase() == "1" {
+    let fresh_perf = phase() == "3" && !p.auth.exists();
+    if phase() == "1" || fresh_perf {
         if let Err(e) = create_repos(&p) {
             fail(&format!("repositories not created: {e}"));
         }
-        write_auth(&p, false).unwrap_or_else(|e| fail(&e.message));
+        write_auth(&p, fresh_perf).unwrap_or_else(|e| fail(&e.message));
     }
     CoreConfig {
         data_dir: p.dir.join("data"),
@@ -231,6 +259,8 @@ pub fn core_config() -> CoreConfig {
             // No `FAKE_CLAUDE_TARGET`: `resolve_merge` takes the target from the app's prompt.
             ("FAKE_CLAUDE_SLOW_EVENTS".into(), SLOW_EVENTS.into()),
             ("FAKE_CLAUDE_DELTA_MS".into(), DELTA_MS.into()),
+            ("FAKE_CLAUDE_FLOOD_EVENTS".into(), FLOOD_EVENTS.into()),
+            ("FAKE_CLAUDE_FLOOD_PAUSE_MS".into(), FLOOD_PAUSE_MS.into()),
         ],
         open_log: Some(p.open_log.clone()),
     }
@@ -242,7 +272,9 @@ pub fn start_watchdog() {
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
             fail(&format!(
-                "phase {} did not report within {WATCHDOG:?}",
+                "phase {} did not report within {WATCHDOG:?} (a UI built without \
+                 `--features testkit` has no E2E driver: build with \
+                 `--config src-tauri/tauri.testkit.conf.json`)",
                 phase()
             ));
         });
@@ -252,6 +284,25 @@ pub fn start_watchdog() {
 /// `Some(queued path)` in a run: `pick_repo_folder` must not open the native picker.
 pub fn take_pick() -> Option<Option<String>> {
     enabled().then(|| PICK.lock().unwrap_or_else(|e| e.into_inner()).take())
+}
+
+/// In an E2E run, the queued answer of a native confirmation instead of the dialog, which the
+/// run cannot click (like the folder picker): recorded with its text, and Annulla when nothing
+/// is queued, so a confirmation the run did not expect never waits for a click. `None` outside
+/// an E2E run.
+pub fn take_confirm(title: &str, message: &str) -> Option<bool> {
+    if !enabled() {
+        return None;
+    }
+    CONFIRMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(format!("{title}: {message}"));
+    let answer = CONFIRM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .pop_front();
+    Some(answer.unwrap_or(false))
 }
 
 /// Called by every command wrapper on failure: a run checks that only the failures it
@@ -394,10 +445,19 @@ fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
 
+/// The run's setup. Phase 3 also floats the window above the others, so that its
+/// responsiveness measure includes painting: a covered window's page is "hidden" and not
+/// painted (its timers still run: the testkit window has `backgroundThrottling: disabled`).
 #[tauri::command]
-pub async fn debug_e2e_setup() -> Result<Option<E2eSetup>, AppError> {
+pub async fn debug_e2e_setup(app: AppHandle) -> Result<Option<E2eSetup>, AppError> {
     if !enabled() {
         return Ok(None);
+    }
+    if phase() == "3"
+        && let Some(window) = app.get_webview_window("main")
+        && let Err(e) = window.set_always_on_top(true)
+    {
+        eprintln!("e2e: always on top: {e}");
     }
     let p = Paths::get();
     let path = |name: &str| p.repo(name).display().to_string();
@@ -419,6 +479,12 @@ pub async fn debug_e2e_setup() -> Result<Option<E2eSetup>, AppError> {
             .filter(|k| std::env::var_os(k).is_some())
             .map(|k| (*k).to_owned())
             .collect(),
+        scrubbed_at_start: std::env::var(crate::SCRUBBED_AT_START_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .filter(|k| !k.is_empty())
+            .map(str::to_owned)
+            .collect(),
         phase1,
     }))
 }
@@ -436,6 +502,22 @@ pub async fn debug_e2e_queue_pick(req: E2ePathReq) -> Result<(), AppError> {
     paths()?;
     *PICK.lock().unwrap_or_else(|e| e.into_inner()) = Some(req.path);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn debug_e2e_queue_confirm(req: E2eConfirmReq) -> Result<(), AppError> {
+    paths()?;
+    CONFIRM
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push_back(req.accept);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn debug_e2e_confirms() -> Result<Vec<String>, AppError> {
+    paths()?;
+    Ok(CONFIRMS.lock().unwrap_or_else(|e| e.into_inner()).clone())
 }
 
 /// The login script as `open_login_terminal` left it, the recorded `open` calls, and the
@@ -869,14 +951,16 @@ pub async fn debug_e2e_reload(app: AppHandle) -> Result<(), AppError> {
         .map_err(|e| AppError::internal(e.to_string()))
 }
 
-/// Phase 2: `step_1`..`step_12` all true; the gatekeeper phase: `gatekeeper_ok` true. Every
-/// other boolean must be true as well, and `csp_violations` must be 0.
+/// Phase 2: `step_1`..`step_12` all true; phase 3: `perf_flood` true; the gatekeeper phase:
+/// `gatekeeper_ok` true. Every other boolean must be true as well, and `csp_violations` must
+/// be 0.
 fn report_passed(report: &Value, phase: &str) -> bool {
     let Some(fields) = report.as_object() else {
         return false;
     };
     let required: Vec<String> = match phase {
         "gatekeeper" => vec!["gatekeeper_ok".into()],
+        "3" => vec!["perf_flood".into()],
         _ => (1..=12).map(|n| format!("step_{n}")).collect(),
     };
     report.get("csp_violations").and_then(Value::as_u64) == Some(0)
@@ -995,6 +1079,15 @@ mod tests {
             "gatekeeper"
         ));
         assert!(!report_passed(&json!({"csp_violations": 0}), "gatekeeper"));
+        assert!(report_passed(
+            &json!({"perf_flood": true, "command_failures_phase3": true, "csp_violations": 0}),
+            "3"
+        ));
+        assert!(!report_passed(&json!({"csp_violations": 0}), "3"));
+        assert!(!report_passed(
+            &json!({"perf_flood": false, "csp_violations": 0}),
+            "3"
+        ));
     }
 
     #[test]
@@ -1116,6 +1209,8 @@ mod tests {
             debug_e2e_setup,
             debug_e2e_set_auth,
             debug_e2e_queue_pick,
+            debug_e2e_queue_confirm,
+            debug_e2e_confirms,
             debug_e2e_login_script,
             debug_e2e_record,
             debug_e2e_git,
@@ -1132,6 +1227,8 @@ mod tests {
             ("debug_e2e_setup", DebugE2eSetup::NAME),
             ("debug_e2e_set_auth", DebugE2eSetAuth::NAME),
             ("debug_e2e_queue_pick", DebugE2eQueuePick::NAME),
+            ("debug_e2e_queue_confirm", DebugE2eQueueConfirm::NAME),
+            ("debug_e2e_confirms", DebugE2eConfirms::NAME),
             ("debug_e2e_login_script", DebugE2eLoginScript::NAME),
             ("debug_e2e_record", DebugE2eRecord::NAME),
             ("debug_e2e_git", DebugE2eGit::NAME),

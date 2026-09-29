@@ -6,6 +6,8 @@
 
 mod turn;
 
+pub use turn::{API_KEY_STOP_NOTICE, CHANGED_AT_START_NOTICE};
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -21,8 +23,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 
 use crate::claude::{self, ChildEnv, Discovered, TurnArgs};
-use crate::db::{AttemptCtx, ProcessFinish, ProcessRow};
-use crate::git::{self, Git};
+use crate::db::{AttemptCtx, AttemptRow, ProcessFinish, ProcessRow};
+use crate::git::{self, ConfigSnapshot, Git};
 use crate::live::LiveMsg;
 use crate::normalize::{EntryOp, Normalizer, TurnResult};
 use crate::wire::Pending;
@@ -42,6 +44,39 @@ pub const MAX_STDERR_LOG: u64 = 8 << 20;
 const ORPHAN_TERM: Duration = Duration::from_secs(3);
 const ORPHAN_POLL: Duration = Duration::from_millis(50);
 const INTERRUPTED_NOTICE: &str = "Esecuzione interrotta dal riavvio dell'app";
+/// Policy Trusted, but the worktree's `.claude/**`/`.mcp.json` (or a file they run) differ
+/// from the approved ones while the commit the attempt started from still has them (spec
+/// §8.9): the turn runs Isolated. The Notice goes on with ` File diversi: <paths>.`
+pub const UNTRUSTED_WORKTREE_NOTICE: &str = "La configurazione Claude di questo worktree \
+    (.claude/, .mcp.json e i file che esegue) è diversa da quella approvata: il turno gira \
+    Isolato, senza hook, server MCP e impostazioni del repository.";
+/// Policy Trusted, but the worktree's configuration cannot be fingerprinted (a limit, a link
+/// out of the worktree, a change during the check): Isolated. Goes on with ` Motivo: <error>`.
+pub const UNVERIFIABLE_WORKTREE_NOTICE: &str = "La configurazione Claude di questo worktree \
+    non si può verificare: il turno gira Isolato, senza hook, server MCP e impostazioni del \
+    repository.";
+/// Policy Trusted, but the commit the attempt started from (its target branch's tip then) has
+/// a configuration other than the approved one: the branch moved on since the approval, or
+/// the attempt targets another branch. Goes on with ` Commit di partenza: <sha> (<branch>).`
+pub const UNTRUSTED_BASE_NOTICE: &str = "La configurazione Claude del commit da cui è partito \
+    questo attempt (.claude/, .mcp.json e i file che esegue) non è quella approvata, per \
+    esempio perché il branch target è andato avanti dopo l'approvazione: il turno gira \
+    Isolato. Per fidarti della nuova, approvala di nuovo nella sicurezza del progetto.";
+/// Policy Trusted, but the configuration of the commit the attempt started from cannot be
+/// fingerprinted. Goes on with ` Motivo: <error>`.
+pub const UNVERIFIABLE_BASE_NOTICE: &str = "La configurazione Claude del commit da cui è \
+    partito questo attempt non si può verificare: il turno gira Isolato.";
+/// Policy Trusted, but the worktree's settings would bill the agents outside the subscription
+/// (`git::BILLING_SETTINGS_KEYS`, `git::BILLING_ENV_VARS`): Isolated, whatever the
+/// fingerprint (an approval older than the check included). Goes on with ` <what sets it>.`
+pub const BILLING_WORKTREE_NOTICE: &str = "La configurazione Claude di questo worktree farebbe \
+    fatturare l'agente via API o da un altro provider invece che con l'abbonamento: il turno \
+    gira Isolato, senza hook, server MCP e impostazioni del repository.";
+/// Paths named at most by [`UNTRUSTED_WORKTREE_NOTICE`].
+const MAX_NOTICE_PATHS: usize = 5;
+/// A running turn stopped because the project's bypass opt-in or Trusted policy was revoked.
+pub const REVOKED_NOTICE: &str = "Turno fermato: la modalità Autonoma o la configurazione \
+    Attendibile del progetto è stata revocata.";
 
 /// Phases of the stop sequence (spec §7.9): interrupt → wait `interrupt`; close stdin →
 /// wait `eof`; SIGTERM the group → wait `term`; SIGKILL and reap.
@@ -104,15 +139,26 @@ pub struct TurnOutcome {
     pub init_timeout: bool,
     /// `result` arrived but the process did not exit within [`EXIT_AFTER_RESULT`].
     pub exit_timeout: bool,
+    /// Killed at `system/init`, which reported an API key while the passthrough is off
+    /// (`turn::API_KEY_STOP_NOTICE`).
+    pub api_key_stop: bool,
+    /// Killed at `system/init` of a Trusted turn whose configuration changed while the CLI
+    /// started (`turn::CHANGED_AT_START_NOTICE`).
+    pub config_stop: bool,
 }
 
 /// The classification table of spec §7.7 → final `(status, stop_reason)`. A classified
 /// usage or billing limit is `usage_limit`, a login failure `auth_failure`; a process that
-/// exits 0 without any `result` is failed without a reason.
+/// exits 0 without any `result` is failed without a reason, and so is one killed because it
+/// would bill through an API key or its configuration changed while it started
+/// (`processes.error` says why).
 pub fn classify(outcome: &TurnOutcome) -> (ProcessStatus, Option<StopReason>) {
     use atm_types::LimitKind;
     if outcome.spawn_error {
         return (ProcessStatus::Failed, Some(StopReason::SpawnError));
+    }
+    if outcome.api_key_stop || outcome.config_stop {
+        return (ProcessStatus::Failed, None);
     }
     if let Some(cause) = outcome.stop {
         return (ProcessStatus::Killed, Some(cause.stop_reason()));
@@ -206,12 +252,35 @@ pub(crate) struct TurnHandle {
     pub(crate) project_id: Id,
     /// Approvals waiting for the user, by `approval_id` (in memory only, spec §7.8).
     pending: Mutex<HashMap<Id, Pending>>,
+    /// What the turn's argv grants, set at launch (`None` while the slot is only reserved).
+    caps: Mutex<Option<TurnCaps>>,
     cmd: mpsc::UnboundedSender<Cmd>,
     done: watch::Receiver<bool>,
 }
 
+/// What a launched turn runs with (M6): what a revocation must stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TurnCaps {
+    /// `--allow-dangerously-skip-permissions`.
+    pub(crate) bypass: bool,
+    /// Without the isolation flags: the repository's configuration is loaded.
+    pub(crate) trusted: bool,
+}
+
+impl TurnCaps {
+    fn of(argv: &[String]) -> TurnCaps {
+        TurnCaps {
+            bypass: argv
+                .iter()
+                .any(|a| a == "--allow-dangerously-skip-permissions"),
+            trusted: !argv.iter().any(|a| a == "--strict-mcp-config"),
+        }
+    }
+}
+
 enum Cmd {
     Stop(StopCause, StopTimings),
+    Notice(Level, String),
     Respond {
         approval_id: Id,
         decision: ApprovalDecision,
@@ -235,6 +304,15 @@ impl TurnHandle {
     /// Starts (or compresses) the stop sequence; returns at once.
     pub(crate) fn stop(&self, cause: StopCause, timings: StopTimings) {
         let _ = self.cmd.send(Cmd::Stop(cause, timings));
+    }
+
+    /// Adds a Notice to the turn's transcript; returns at once.
+    pub(crate) fn notice(&self, level: Level, text: &str) {
+        let _ = self.cmd.send(Cmd::Notice(level, text.to_owned()));
+    }
+
+    pub(crate) fn caps(&self) -> Option<TurnCaps> {
+        *guard(&self.caps)
     }
 
     /// Answers a pending `can_use_tool` through the turn. Errors: `NotFound`.
@@ -322,6 +400,45 @@ pub(crate) struct TurnPlan {
     notices: Vec<String>,
     git: Git,
     next_idx: u32,
+    /// `Settings::allow_env_api_key` when the turn was planned (its environment has the key
+    /// or not): an API key reported at `system/init` stops the turn unless it is on.
+    allow_api_key: bool,
+}
+
+/// The Notice of a Trusted turn whose worktree does not have the approved configuration: the
+/// commit the attempt started from (`base`) has another one or cannot be verified (then the
+/// approval is what must change), else the worktree differs from it (with the paths) or
+/// cannot be verified.
+fn untrusted_notice(
+    approved: Option<&str>,
+    worktree: &Result<ConfigSnapshot, AppError>,
+    base: &Result<ConfigSnapshot, AppError>,
+    attempt: &AttemptRow,
+) -> String {
+    let short = attempt.base_commit.get(..7).unwrap_or(&attempt.base_commit);
+    match (worktree, base) {
+        (_, Err(e)) => format!("{UNVERIFIABLE_BASE_NOTICE} Motivo: {}", e.message),
+        (_, Ok(b)) if approved != Some(b.fingerprint.as_str()) || !b.billing.is_empty() => {
+            format!(
+                "{UNTRUSTED_BASE_NOTICE} Commit di partenza: {short} ({}).",
+                attempt.target_branch
+            )
+        }
+        (Err(e), Ok(_)) => format!("{UNVERIFIABLE_WORKTREE_NOTICE} Motivo: {}", e.message),
+        (Ok(w), Ok(b)) => {
+            let paths = git::differing_paths(b, w);
+            let mut named = paths
+                .iter()
+                .take(MAX_NOTICE_PATHS)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            if paths.len() > MAX_NOTICE_PATHS {
+                named.push_str(&format!(" e altri {}", paths.len() - MAX_NOTICE_PATHS));
+            }
+            format!("{UNTRUSTED_WORKTREE_NOTICE} File diversi: {named}.")
+        }
+    }
 }
 
 impl Inner {
@@ -380,6 +497,7 @@ impl Inner {
             task_id: task_id.to_owned(),
             project_id: project_id.to_owned(),
             pending: Mutex::default(),
+            caps: Mutex::default(),
             cmd,
             done,
         });
@@ -423,25 +541,52 @@ impl Inner {
         }
     }
 
+    /// Why a Trusted turn of `ctx` must not load the repository's configuration (the Notice),
+    /// or `None` when its worktree has the approved one (M6, spec §8.9): settings that would
+    /// bill outside the subscription come first, whatever the fingerprint (an approval older
+    /// than that check included); the commit the attempt started from is read only when the
+    /// worktree does not match ([`untrusted_notice`]).
+    pub(crate) async fn untrusted_reason(&self, git: &Git, ctx: &AttemptCtx) -> Option<String> {
+        let (project, a) = (&ctx.project, &ctx.attempt);
+        let approved = project.trusted_fingerprint.as_deref();
+        let here = self.config_snapshot(Path::new(&a.worktree_path)).await;
+        if let Ok(w) = &here {
+            if !w.billing.is_empty() {
+                return Some(format!(
+                    "{BILLING_WORKTREE_NOTICE} {}.",
+                    w.billing.join("; ")
+                ));
+            }
+            if Some(w.fingerprint.as_str()) == approved {
+                return None;
+            }
+        }
+        let repo = Path::new(&project.repo_path);
+        let base = self.commit_config(git, repo, &a.base_commit).await;
+        Some(untrusted_notice(approved, &here, &base, a))
+    }
+
     /// Argv (spec §7.3), environment and process row of one turn. Policy Trusted with a
-    /// fingerprint that no longer matches the worktree runs Isolated, with a Notice (M6).
+    /// fingerprint that no longer matches the worktree (or cannot be computed), or a worktree
+    /// whose settings bill outside the subscription, runs Isolated, with a Notice that says
+    /// why: what differs, whether the commit the attempt started from is not the approved
+    /// configuration, or the error (M6, spec §8.9).
     pub(crate) async fn plan_turn(&self, r: TurnRequest<'_>) -> TurnPlan {
         let a = &r.ctx.attempt;
         let worktree = Path::new(&a.worktree_path);
         let mut notices = r.preflight.notices.clone();
-        let isolated = match r.ctx.project.config_policy {
+        let project = &r.ctx.project;
+        let tools = self.tools(false).await;
+        let isolated = match project.config_policy {
             ConfigPolicy::Isolated => true,
-            ConfigPolicy::Trusted => {
-                let trusted = self.fingerprint_matches(&r.ctx.project, worktree).await;
-                if !trusted {
-                    notices.push(
-                        "La configurazione Claude del worktree non corrisponde a quella \
-                         approvata: questo turno gira Isolato"
-                            .into(),
-                    );
+            ConfigPolicy::Trusted => match self.untrusted_reason(&tools.git, r.ctx).await {
+                None => false,
+                Some(notice) => {
+                    eprintln!("attempt {}: runs Isolated: {notice}", a.id);
+                    notices.push(notice);
+                    true
                 }
-                !trusted
-            }
+            },
         };
         let argv = claude::build_argv(&TurnArgs {
             claude: r.preflight.claude.path.clone(),
@@ -455,7 +600,6 @@ impl Inner {
             effort: a.effort,
             append_prompt: claude::append_prompt(worktree, &a.branch, &a.target_branch),
         });
-        let tools = self.tools(false).await;
         let env = self
             .child_env(&tools, r.settings)
             .for_attempt(worktree, &a.id);
@@ -494,6 +638,7 @@ impl Inner {
             notices,
             git: tools.git.clone(),
             next_idx: r.next_idx,
+            allow_api_key: r.settings.allow_env_api_key,
         }
     }
 
@@ -510,6 +655,17 @@ impl Inner {
         else {
             return;
         };
+        let caps = TurnCaps::of(&plan.argv);
+        *guard(&handle.caps) = Some(caps);
+        // A revocation committed since the project was read (before the slot existed) is seen
+        // here; one committed after this read sees the caps set above and stops the turn.
+        if let Ok(row) = self.db.project(&plan.ctx.project.id)
+            && ((caps.bypass && !row.allow_bypass)
+                || (caps.trusted && row.config_policy == ConfigPolicy::Isolated))
+        {
+            handle.notice(Level::Warn, REVOKED_NOTICE);
+            handle.stop(StopCause::User, StopTimings::NORMAL);
+        }
         let (attempt_id, process_id) = (plan.ctx.attempt.id.clone(), plan.process.id.clone());
         let task = tokio::spawn(turn::run_turn(
             Arc::clone(self),

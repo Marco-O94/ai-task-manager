@@ -449,6 +449,7 @@ impl Mock {
             git_version: Some("2.50.1".into()),
             api_key_in_env: false,
             cloud_provider_env: false,
+            base_url_env: false,
             paused: None,
             running: 0,
             max_running: Settings::default().max_running,
@@ -487,7 +488,7 @@ impl Mock {
         }
         if flags.has("problems") {
             env.problems
-                .push("git 2.37 è più vecchio del minimo 2.38: il merge non funzionerà".into());
+                .push("git 2.43.0 è troppo vecchio: serve almeno la versione 2.44".into());
         }
         if flags.badges {
             env.running = 1;
@@ -588,6 +589,7 @@ fn project(id: &str, name: &str, repo_path: &str) -> Project {
         allow_bypass: false,
         created_at: now,
         updated_at: now,
+        trust_error: None,
     }
 }
 

@@ -8,11 +8,14 @@ cargo fmt --all --check
 # --locked: Cargo.toml and Cargo.lock are frozen after M1 (spec §11.1); a manifest edit that
 # would rewrite the lock fails here instead of passing silently.
 cargo clippy --locked --workspace --exclude atm-ui --all-targets -- -D warnings
+# The UI as the release WASM (no test drivers), as the debug bundles' (`testkit`: selftest and
+# E2E drivers, spec §11.2 M6) and as the in-browser mock.
 cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown -- -D warnings
+cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown --features testkit -- -D warnings
 cargo clippy --locked -p atm-ui --target wasm32-unknown-unknown --features mock -- -D warnings
 cargo check --locked -p atm-types --target wasm32-unknown-unknown
 cargo test --locked --workspace --exclude atm-ui
-cargo test --locked -p atm-ui # M0 confirmed that atm-ui also builds for the host
+cargo test --locked -p atm-ui --features testkit # M0 confirmed that atm-ui also builds for the host
 
 fail=0
 hits() { # hits <rule> <matches>
@@ -40,8 +43,10 @@ hits "ui/src" "$m"
 m=$(scan -rnF -e '"--bare"' -e '"--dangerously-skip-permissions"' crates/*/src src-tauri/src)
 hits "crates/*/src, src-tauri/src" "$m"
 
+# The project's own code never listens (the single-instance plugin's Unix socket is a dependency's,
+# declared in spec §10.2).
 m=$(scan -rnF -e 'find-generic-password' -e 'SecKeychain' -e 'TcpListener' -e 'UdpSocket' \
-    -e '0.0.0.0' crates src-tauri/src)
+    -e 'UnixListener' -e '0.0.0.0' crates src-tauri/src)
 hits "crates, src-tauri/src" "$m"
 
 # credentials.json may appear only inside the `DENY_RULES` constant (up to its closing `];`).
@@ -76,6 +81,28 @@ hits "$fixtures: account values" "$m"
 m=$(scan -nE '"csp"[[:space:]]*:[[:space:]]*null|"devtools"[[:space:]]*:[[:space:]]*true' \
     src-tauri/tauri.conf.json)
 hits "tauri.conf.json" "$m"
+
+# The selftest and E2E drivers stay out of the release WASM (M6): the release build command does
+# not enable `testkit`, and their modules are declared only under it (`scripts/release.sh` also
+# checks the built WASM with `strings`).
+m=$(scan -nE '"beforeBuildCommand".*testkit' src-tauri/tauri.conf.json)
+hits "tauri.conf.json: release build with testkit" "$m"
+m=$(awk '/^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+(e2e|selftest)[[:space:]]*[;{]/ &&
+        prev !~ /^#\[cfg\(all\(feature = "testkit", not\(feature = "mock"\)\)\)\]$/ {
+            print FILENAME ":" FNR ": " $0 }
+        { prev = $0 }' ui/src/main.rs) || exit 2
+hits "ui/src/main.rs: test driver outside testkit" "$m"
+# The testkit overlay repeats the main window (a config merge replaces arrays) only to add
+# `backgroundThrottling: disabled` (the E2E must not stall in a hidden window): no other drift.
+m=$(/usr/bin/python3 - <<'EOF'
+import json
+main = json.load(open("src-tauri/tauri.conf.json"))["app"]["windows"]
+kit = json.load(open("src-tauri/tauri.testkit.conf.json"))["app"]["windows"]
+if len(kit) != 1 or kit[0].pop("backgroundThrottling", None) != "disabled" or kit != main:
+    print("src-tauri/tauri.testkit.conf.json: app.windows differs from tauri.conf.json")
+EOF
+) || exit 2
+hits "testkit overlay" "$m"
 
 if [[ $fail -ne 0 ]]; then
     echo "check.sh: security greps FAILED" >&2

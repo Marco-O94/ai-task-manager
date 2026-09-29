@@ -823,6 +823,21 @@ async fn run_turn(attempt_id: Id, turn: u32) {
     if !cancelled.is_empty() {
         broadcast(&attempt_id, &TranscriptMsg::Upsert { entries: cancelled });
     }
+    if matches!(end, End::Stopped | End::DeniedAndStopped) {
+        // Like the core (M6): the CLI's error `result` after the interrupt, without its text.
+        let body = EntryBody::TurnEnd {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            duration_ms: Some(700),
+            num_turns: Some(1),
+            cost_usd_estimate: Some(0.01),
+            permission_denials: u32::from(end == End::DeniedAndStopped),
+            text: None,
+            limit: None,
+            stopped: Some(StopReason::UserStop),
+        };
+        let _ = push(&attempt_id, None, body);
+    }
     let notice = match end {
         End::Stopped => Some("Esecuzione fermata dall'utente."),
         End::DeniedAndStopped => Some("Turno fermato con «Nega e ferma»."),
@@ -1040,6 +1055,7 @@ async fn flood(attempt_id: &str, turn: u32) -> Result<(), End> {
         permission_denials: 0,
         text: None,
         limit: None,
+        stopped: None,
     };
     push(attempt_id, None, body)?;
     Ok(())

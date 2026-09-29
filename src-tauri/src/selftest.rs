@@ -90,7 +90,11 @@ pub fn start_watchdog() {
     if selftest_enabled() {
         std::thread::spawn(|| {
             std::thread::sleep(WATCHDOG);
-            fail(&format!("no report from the UI within {WATCHDOG:?}"));
+            fail(&format!(
+                "no report from the UI within {WATCHDOG:?} (a UI built without \
+                 `--features testkit` has no selftest: build with \
+                 `--config src-tauri/tauri.testkit.conf.json`)"
+            ));
         });
     }
 }

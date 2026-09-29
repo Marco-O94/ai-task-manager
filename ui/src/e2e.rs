@@ -1,6 +1,6 @@
 //! In-app E2E of spec §12.2 (M4). Runs only when the debug backend reports `ATM_E2E=1`
-//! (`debug_e2e_setup`); in release the probe commands do not exist and this is a no-op. Not
-//! compiled with `--features mock`.
+//! (`debug_e2e_setup`). Compiled only with `--features testkit` (debug bundles), never in the
+//! release WASM (M6), and not with `--features mock`.
 //!
 //! It drives the real DOM of the running WKWebView with events (clicks, `input`/`change`,
 //! keys, HTML5 drag events carrying a `DataTransfer`) and checks the outcome in the DOM, over
@@ -14,7 +14,10 @@
 //!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
 //!   then the report on stdout; the app then exits through `app.exit` (`ExitRequested`)
-//!   during one more `[fake:hang_ignore]` turn, which the script checks afterwards.
+//!   during one more `[fake:hang_ignore]` turn, which the script checks afterwards;
+//! - phase 3 (M6, also alone with `scripts/e2e.sh --perf`): `[fake:flood]` on three concurrent
+//!   attempts, one of them open, with the page's responsiveness and the transcript's DOM window
+//!   measured ([`perf_flood`]).
 //!
 //! Step 2 runs inside step 1, at the login gate: "Accedi" is only on the gate. Every IPC
 //! command that fails is counted by the backend: only the three rejected folders of step 3 may.
@@ -24,16 +27,17 @@ use std::future::Future;
 use std::rc::Rc;
 
 use atm_types::debug::{
-    DebugE2eAgents, DebugE2eExists, DebugE2eFailures, DebugE2eGatekeeper, DebugE2eGit,
-    DebugE2eLoginScript, DebugE2eQueuePick, DebugE2eQuit, DebugE2eRecord, DebugE2eReload,
-    DebugE2eReport, DebugE2eSetAuth, DebugE2eSetup, DebugForwarderCount, E2eAuthReq, E2eGitOut,
-    E2eGitReq, E2ePathReq, E2eSetup, ReportReq,
+    DebugE2eAgents, DebugE2eConfirms, DebugE2eExists, DebugE2eFailures, DebugE2eGatekeeper,
+    DebugE2eGit, DebugE2eLoginScript, DebugE2eQueueConfirm, DebugE2eQueuePick, DebugE2eQuit,
+    DebugE2eRecord, DebugE2eReload, DebugE2eReport, DebugE2eSetAuth, DebugE2eSetup,
+    DebugForwarderCount, E2eAuthReq, E2eConfirmReq, E2eGitOut, E2eGitReq, E2ePathReq, E2eSetup,
+    ReportReq,
 };
 use atm_types::{
-    AttemptIdReq, AttemptState, CONTINUE_PROMPT, Empty, Entry, EntryBody, FileStatus, GetBoard,
-    GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq, GetTaskDetail, IdReq,
-    ListProjects, ProcessInfo, ProcessStatus, ProjectIdReq, StopReason, TaskCard, TaskDetail,
-    TaskStatus, ToolStatus, WorktreeState,
+    AttemptIdReq, AttemptState, CONTINUE_PROMPT, ConfigPolicy, Empty, Entry, EntryBody, FileStatus,
+    GetBoard, GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq,
+    GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, Project, ProjectIdReq,
+    StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, WorktreeState,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use leptos::prelude::*;
@@ -62,15 +66,34 @@ const T5_TITLE: &str = "Ignora lo stop [fake:hang_ignore]";
 const STREAMED: &str = "Creo hello.txt nel worktree.";
 /// The Notice of a turn stopped by the app's shutdown (`runner::turn::end_notice`).
 const SHUTDOWN_NOTICE: &str = "Esecuzione fermata alla chiusura dell'app";
-/// Variables every agent must be spared (spec §7.2), set in the app's environment by
+/// Variables every agent must be spared (spec §7.2), a parent Claude Code session's and its
+/// host's included (M6), with the `NODE_OPTIONS` a cmux terminal sets when the user has none
+/// (marker `CMUX_ORIGINAL_NODE_OPTIONS_PRESENT=0`), set in the app's environment by
 /// `scripts/e2e.sh`; fake-claude records their presence.
-const SCRUBBED: [&str; 5] = [
+const SCRUBBED: [&str; 18] = [
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDECODE",
     "CLAUDE_CODE_ENTRYPOINT",
     "GIT_DIR",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_EFFORT",
+    "CLAUDE_CODE_SSE_PORT",
+    "ENABLE_IDE_INTEGRATION",
+    "CMUX_SOCKET_PATH",
+    "CMUX_CUA_AUTH_TOKEN_FILE",
+    "CMUX_ORIGINAL_NODE_OPTIONS_PRESENT",
+    "NODE_OPTIONS",
 ];
+/// Of [`SCRUBBED`], those the app keeps in its own environment (the API keys, for the opt-in
+/// passthrough; `GIT_DIR`, removed per child): the others it removes from itself at startup by
+/// re-executing (M6), so `ps -E` of the app does not show them.
+const KEPT_BY_THE_APP: [&str; 3] = ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "GIT_DIR"];
 /// A user Stop of a turn that ignores the interrupt, EOF and SIGTERM ends with the SIGKILL of
 /// its group: interrupt 5 s + EOF 3 s + SIGTERM 3 s (spec §7.9), within the 13 s objective.
 const ESCALATION_MS: (f64, f64) = (10_000.0, 13_000.0);
@@ -80,6 +103,26 @@ const EXPECTED_FAILURES: [&str; 3] = ["add_project: Invalid"; 3];
 const UI: u32 = 10_000;
 /// Wait of a whole agent turn.
 const TURN: u32 = 30_000;
+/// Phase 3: three `[fake:flood]` tasks, each turn [`FLOOD_EVENTS`] assistant texts.
+const FLOOD_TITLES: [&str; 3] = [
+    "Flood A [fake:flood]",
+    "Flood B [fake:flood]",
+    "Flood C [fake:flood]",
+];
+/// `FAKE_CLAUDE_FLOOD_EVENTS` of the run (fake-claude's default, set by the backend).
+const FLOOD_EVENTS: u32 = 10_000;
+/// Rows the transcript may keep in the DOM (spec §9.4, `state::transcript::MAX_ROWS`).
+const MAX_DOM_ROWS: usize = 300;
+/// While the floods stream: the longest the page's event loop may stay busy (how late a 20 ms
+/// timer may fire), and the slowest a tab switch of the open panel may show.
+const MAX_STALL_MS: f64 = 1_000.0;
+const MAX_INTERACTION_MS: f64 = 1_500.0;
+/// Samples of the 20 ms timer taken with the page visible (about 2 s) below which the phase
+/// fails as not measured: WebKit fires the timers of a hidden page (window covered, app hidden,
+/// display off) once a second.
+const MIN_VISIBLE_SAMPLES: u32 = 100;
+/// Wait of the three flood turns.
+const FLOOD_WAIT: u32 = 150_000;
 
 type R<T = ()> = Result<T, String>;
 
@@ -144,6 +187,7 @@ pub async fn run_if_enabled() {
     let next = match run.setup.phase.as_str() {
         "1" => phase1(&mut run).await,
         "2" => phase2(&mut run).await,
+        "3" => phase3(&mut run).await,
         "gatekeeper" => gatekeeper(&mut run).await,
         other => Err(format!("unknown phase {other}")),
     };
@@ -205,7 +249,7 @@ impl Run {
     /// false), the other checks, the details and the CSP violations of every page load.
     async fn report(&mut self) {
         let mut report = Map::new();
-        if self.setup.phase != "gatekeeper" {
+        if matches!(self.setup.phase.as_str(), "1" | "2") {
             for n in 1..=12 {
                 let key = format!("step_{n}");
                 let ok = self.st.report.get(&key).cloned().unwrap_or(false.into());
@@ -277,6 +321,8 @@ async fn phase2(run: &mut Run) -> R<Next> {
     run.check("step_11", r)?;
     let r = step_12(run).await;
     run.check("step_12", r)?;
+    let r = security_confirmations().await;
+    run.check("security_confirmations", r)?;
     // The bundle's CSP is in force (so 0 violations means something): a constant `eval` must
     // be blocked. Its own violation event is not counted.
     let enforced = js_sys::eval("1").is_err();
@@ -286,13 +332,465 @@ async fn phase2(run: &mut Run) -> R<Next> {
         Err("eval allowed: the CSP is not applied".into())
     };
     run.check("csp_enforced", r)?;
-    let r = only_expected_failures(&[]).await;
+    let r = only_expected_failures(&["set_project_security: Invalid"]).await;
     run.check("command_failures_phase2", r)?;
     let r = exit_during_turn(run).await;
     run.check("exit_requested_armed", r)?;
     let r = child_env_scrubbed(run).await;
     run.check("child_env_scrubbed", r)?;
     Ok(Next::Report)
+}
+
+/// M6 perf (spec §11.2 M6): after phase 2 on the same data, or alone on fresh data
+/// (`scripts/e2e.sh --perf`).
+async fn phase3(run: &mut Run) -> R<Next> {
+    let r = perf_flood(run).await;
+    let measured = match &r {
+        Ok((_, true)) => "measured",
+        Ok((_, false)) => "not measured (page hidden)",
+        Err(_) => "failed",
+    };
+    run.st
+        .report
+        .insert("perf_responsiveness".into(), measured.into());
+    let r = r.map(|(summary, _)| summary);
+    run.check("perf_flood", r)?;
+    let r = only_expected_failures(&[]).await;
+    run.check("command_failures_phase3", r)?;
+    Ok(Next::Report)
+}
+
+/// `[fake:flood]` on three attempts at once (Agenti in parallelo = 3, set in the settings),
+/// the last one open in the panel. While they stream, a 20 ms timer never fires more than
+/// [`MAX_STALL_MS`] late (the page's event loop stays free), switching the open panel to
+/// Modifiche and back to Agente shows within [`MAX_INTERACTION_MS`] each, and the transcript
+/// never has more than [`MAX_DOM_ROWS`] rows in the DOM. Afterwards the three turns overlapped
+/// in time and completed, each with its last text among the newest stored entries and an
+/// index past [`FLOOD_EVENTS`] (every text being stored is counted in the DB by
+/// `scripts/e2e.sh`), and the open transcript ends on its TurnEnd with at most
+/// [`MAX_DOM_ROWS`] rows.
+///
+/// The two timings need the page visible: WebKit fires a hidden page's timers (screen locked,
+/// window covered, app hidden) once a second. Then they are not measured (`false` with the
+/// summary: the report says so and `scripts/e2e.sh` warns, `--perf` alone fails) while every
+/// other check still applies.
+async fn perf_flood(run: &Run) -> R<(String, bool)> {
+    perf_board(run).await?;
+    set_max_running(3).await?;
+    let env = ipc::call::<GetEnv>(&GetEnvReq { force: false })
+        .await
+        .map_err(|e| e.to_string())?;
+    if env.max_running != 3 {
+        return Err(format!(
+            "max_running {} after the settings",
+            env.max_running
+        ));
+    }
+    let mut tasks = Vec::new();
+    for title in FLOOD_TITLES {
+        tasks.push(create_task("Da fare", title, "").await?);
+    }
+
+    // The probe, until `done`: how late a 20 ms timer fires, over the samples taken with the
+    // page visible (a hidden page's timers fire once a second: the backend floats the window
+    // above the others in this phase, and the testkit window is never suspended,
+    // `backgroundThrottling: disabled`), and the DOM rows.
+    let visible_now = || {
+        Reflect::get(&document(), &"visibilityState".into())
+            .ok()
+            .and_then(|v| v.as_string())
+            .is_some_and(|v| v == "visible")
+    };
+    let stall = Rc::new(Cell::new(0.0_f64));
+    let rows = Rc::new(Cell::new(0_usize));
+    let ticks = Rc::new(Cell::new(0_u32));
+    let visible = Rc::new(Cell::new(0_u32));
+    let done = Rc::new(Cell::new(false));
+    {
+        let (stall, rows, ticks, visible, done) = (
+            stall.clone(),
+            rows.clone(),
+            ticks.clone(),
+            visible.clone(),
+            done.clone(),
+        );
+        leptos::task::spawn_local(async move {
+            while !done.get() {
+                let (t0, shown) = (js_sys::Date::now(), visible_now());
+                sleep(20).await;
+                if shown && visible_now() {
+                    stall.set(stall.get().max(js_sys::Date::now() - t0 - 20.0));
+                    visible.set(visible.get() + 1);
+                }
+                rows.set(rows.get().max(entries().len()));
+                ticks.set(ticks.get() + 1);
+            }
+        });
+    }
+    let started = js_sys::Date::now();
+    let measured = async {
+        for task in &tasks {
+            start_attempt(task, "acceptEdits").await?;
+        }
+        let open = tasks.last().cloned().unwrap_or_default();
+        // Rows of the flood are streaming into the open panel.
+        until("flood rows in the panel", TURN, || {
+            (entries().len() > 20 && badge(&open, "running").is_some()).then_some(())
+        })
+        .await?;
+        let mut switches = Vec::new();
+        for label in ["Modifiche", "Agente"] {
+            let (t0, shown) = (js_sys::Date::now(), visible_now());
+            tab(label).await?;
+            let sel = if label == "Agente" {
+                "[data-view=task-panel] [data-entry]"
+            } else {
+                "[data-view=task-panel] [data-view=diff]"
+            };
+            wait_q(sel).await?;
+            // Measured only with the page visible (the wait polls a timer).
+            switches.push((shown && visible_now()).then(|| js_sys::Date::now() - t0));
+        }
+        let mut finished = Vec::new();
+        for task in &tasks {
+            let task = task.clone();
+            let p = until_async(&format!("flood turn of {task}"), FLOOD_WAIT, || {
+                let task = task.clone();
+                async move {
+                    let d = detail(&task).await.ok()?;
+                    let last = d.processes.last()?.clone();
+                    (last.status != ProcessStatus::Running).then_some(last)
+                }
+            })
+            .await?;
+            finished.push(p);
+        }
+        until("TurnEnd in the open panel", TURN, || {
+            q("[data-view=task-panel] [data-turn-end]")
+        })
+        .await?;
+        R::Ok((switches, finished))
+    }
+    .await;
+    let elapsed = js_sys::Date::now() - started;
+    sleep(500).await; // the last rows of the open transcript
+    done.set(true);
+    let (switches, finished) = measured?;
+    let (stall, rows, ticks) = (stall.get(), rows.get().max(entries().len()), ticks.get());
+    let visible = visible.get();
+
+    let mut problems = Vec::new();
+    for p in &finished {
+        if p.status != ProcessStatus::Completed {
+            problems.push(format!("turn {} ended {:?}", p.id, p.status));
+        }
+    }
+    let first_end = finished
+        .iter()
+        .filter_map(|p| p.finished_at)
+        .min()
+        .unwrap_or_default();
+    let last_start = finished
+        .iter()
+        .map(|p| p.started_at)
+        .max()
+        .unwrap_or_default();
+    if last_start >= first_end {
+        problems.push(format!(
+            "the turns did not overlap (last start {last_start}, first end {first_end})"
+        ));
+    }
+    for task in &tasks {
+        let (attempt, _, _) = active_attempt(task).await?;
+        let newest = attempt_entries(&attempt).await?;
+        let last_text = format!("Evento {}", FLOOD_EVENTS - 1);
+        let stored = newest
+            .iter()
+            .any(|e| matches!(&e.body, EntryBody::AssistantText { text } if *text == last_text));
+        let max_idx = newest.iter().map(|e| e.idx).max().unwrap_or_default();
+        if !stored || max_idx < FLOOD_EVENTS {
+            problems.push(format!(
+                "{task}: {last_text:?} stored {stored}, newest idx {max_idx}"
+            ));
+        }
+    }
+    let measured = visible >= MIN_VISIBLE_SAMPLES && switches.iter().all(Option::is_some);
+    if stall > MAX_STALL_MS {
+        problems.push(format!("event loop stalled {stall:.0} ms"));
+    }
+    if let Some(slow) = switches
+        .iter()
+        .flatten()
+        .find(|ms| **ms > MAX_INTERACTION_MS)
+    {
+        problems.push(format!("tab switch took {slow:.0} ms"));
+    }
+    if rows > MAX_DOM_ROWS {
+        problems.push(format!("{rows} transcript rows in the DOM"));
+    }
+    let summary = format!(
+        "{}3 concurrent turns × {FLOOD_EVENTS} texts in {:.1} s (overlap {:.1} s); longest \
+         event-loop stall {stall:.0} ms over the {visible} samples of a 20 ms timer taken with \
+         the page visible ({ticks} in all), tab switches Modifiche/Agente {} ms, at most \
+         {rows} transcript rows in the DOM",
+        if measured {
+            ""
+        } else {
+            "RESPONSIVENESS NOT MEASURED (the page was hidden: screen locked, window covered or \
+             app hidden; WebKit fires a hidden page's timers once a second). "
+        },
+        elapsed / 1000.0,
+        (first_end - last_start) as f64 / 1000.0,
+        switches
+            .iter()
+            .map(|ms| ms.map_or_else(|| "hidden".to_owned(), |ms| format!("{ms:.0}")))
+            .collect::<Vec<_>>()
+            .join("/")
+    );
+    if problems.is_empty() {
+        Ok((summary, measured))
+    } else {
+        Err(format!("{problems:?} ({summary})"))
+    }
+}
+
+/// The board of main: after phase 2 it exists; alone (`--perf`, fresh data, fake-claude logged
+/// in by the backend) the run adds it first.
+async fn perf_board(run: &Run) -> R {
+    until("board", 20_000, || q("[data-view=sidebar]")).await?;
+    if main_project().await.is_err() {
+        let since = last_toast();
+        add_repository(&run.setup.repo).await?;
+        toast_after(since, "main added", |t| {
+            t.contains("Progetto «main» aggiunto")
+        })
+        .await?;
+    }
+    select_main().await
+}
+
+/// Agenti in parallelo = `n` from the app settings; the dialog closes on success.
+async fn set_max_running(n: u32) -> R {
+    let dialog = open_settings("Generali").await?;
+    let save = until("settings loaded", UI, || {
+        find_in(&dialog, "[data-action=save-settings]").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    let select = find_in(&dialog, "#settings-max-running").ok_or("no Agenti in parallelo")?;
+    set_select(&select, &n.to_string())?;
+    let since = last_toast();
+    click(&save);
+    toast_after(since, "Impostazioni salvate", |t| {
+        t.contains("Impostazioni salvate")
+    })
+    .await?;
+    until("settings closed", UI, || {
+        open_dialog("Settings").is_none().then_some(())
+    })
+    .await
+}
+
+/// M6: the native confirmations guard every raise of trust and nothing else. They are answered
+/// by the run (`debug_e2e_queue_confirm`: a native dialog cannot be clicked from the page),
+/// which still sees each one asked and its text. On main: Attendibile with Annulla leaves it
+/// Isolated (the refused command is the phase's one expected failure); with OK it is Trusted
+/// and in effect, as the project settings say; the bypass opt-in with OK is allowed; lowering
+/// both asks nothing. In the app settings the API key passthrough with OK shows the topbar
+/// banner (`scripts/e2e.sh` gives the app a dummy key), turning it off asks nothing and hides
+/// it: no agent runs meanwhile, and `child_env_scrubbed` sees no key in any agent.
+async fn security_confirmations() -> R<String> {
+    select_main().await?;
+    let before = main_project().await?;
+    if before.config_policy != ConfigPolicy::Isolated || before.allow_bypass {
+        return Err(format!("main before: {before:?}"));
+    }
+    let settings = open_settings("Progetto").await?;
+    let policy = find_in(&settings, "#project-policy").ok_or("no policy select")?;
+    let bypass = find_in(&settings, "#project-bypass").ok_or("no bypass checkbox")?;
+    let apply = find_in(&settings, "[data-action=apply-security]").ok_or("no Applica")?;
+    let asked = confirms().await?.len();
+
+    set_select(&policy, "trusted")?;
+    queue_confirm(false).await?;
+    let since = last_toast();
+    click(&apply);
+    toast_after(since, "Operazione annullata", |t| t.contains("annullata")).await?;
+    let p = main_project().await?;
+    if confirms().await?.len() != asked + 1 || p.config_policy != ConfigPolicy::Isolated {
+        return Err(format!("after Annulla: {p:?}"));
+    }
+
+    queue_confirm(true).await?;
+    let since = last_toast();
+    click(&apply);
+    toast_after(since, "sicurezza aggiornata", |t| {
+        t.contains("Sicurezza del progetto")
+    })
+    .await?;
+    let p = main_project().await?;
+    if (p.config_policy, p.trusted) != (ConfigPolicy::Trusted, true) {
+        return Err(format!("after OK: {p:?}"));
+    }
+    until("approved configuration noted", UI, || {
+        find_in(&settings, "[data-trust=trusted]")
+    })
+    .await?;
+    let texts = confirms().await?;
+    let trusted_text = texts.last().cloned().unwrap_or_default();
+    if texts.len() != asked + 2
+        || !trusted_text.contains(&format!("«{}»", p.repo_path))
+        || !trusted_text.contains("hook")
+        || !trusted_text.contains("non è una sandbox")
+    {
+        return Err(format!("Trusted confirmation {texts:?}"));
+    }
+
+    click(&bypass);
+    queue_confirm(true).await?;
+    let since = last_toast();
+    click(&apply);
+    toast_after(since, "bypass consentito", |t| {
+        t.contains("Sicurezza del progetto")
+    })
+    .await?;
+    let p = main_project().await?;
+    let texts = confirms().await?;
+    let bypass_text = texts.last().cloned().unwrap_or_default();
+    if !p.allow_bypass
+        || texts.len() != asked + 3
+        || !bypass_text.contains("Autonoma")
+        || bypass_text.contains("hook")
+    {
+        return Err(format!("bypass: {p:?}, confirmation {texts:?}"));
+    }
+
+    click(&bypass);
+    set_select(&policy, "isolated")?;
+    let since = last_toast();
+    click(&apply);
+    toast_after(since, "sicurezza abbassata", |t| {
+        t.contains("Sicurezza del progetto")
+    })
+    .await?;
+    let p = main_project().await?;
+    if p.config_policy != ConfigPolicy::Isolated
+        || p.allow_bypass
+        || confirms().await?.len() != asked + 3
+    {
+        return Err(format!("lowering asked or failed: {p:?}"));
+    }
+
+    let banner = || q("[data-banner=api-key]");
+    if banner().is_some() {
+        return Err("API key banner before the opt-in".into());
+    }
+    api_key_passthrough(true).await?;
+    until("API key banner", UI, banner).await?;
+    let texts = confirms().await?;
+    let key_text = texts.last().cloned().unwrap_or_default();
+    if texts.len() != asked + 4 || !key_text.contains("fatturato") {
+        return Err(format!("API key confirmation {texts:?}"));
+    }
+    api_key_passthrough(false).await?;
+    until("no API key banner", UI, || banner().is_none().then_some(())).await?;
+    if confirms().await?.len() != asked + 4 {
+        return Err("turning the passthrough off asked for a confirmation".into());
+    }
+    Ok(format!(
+        "main: Attendibile + Annulla → still Isolated (set_project_security: Invalid); + OK → \
+         Trusted, trusted, noted in the settings; bypass + OK → allowed; both lowered without \
+         asking. API key passthrough + OK → topbar banner, off without asking → no banner. \
+         {} confirmations asked, each naming what it grants and that the worktree is not a \
+         sandbox (or the API billing)",
+        asked + 4
+    ))
+}
+
+/// Opens the settings dialog on its `tab` ("Generali", "Progetto"); returns the dialog.
+async fn open_settings(tab: &str) -> R<Element> {
+    if open_dialog("Settings").is_none() {
+        let button = q_all("nav button")
+            .into_iter()
+            .find(|b| text(b).contains("Impostazioni"))
+            .ok_or("no Impostazioni")?;
+        click(&button);
+    }
+    let dialog = until("settings dialog", UI, || open_dialog("Settings")).await?;
+    let trigger = find_all(&dialog, "[data-name=TabsTrigger]")
+        .into_iter()
+        .find(|t| text(t).trim() == tab)
+        .ok_or(format!("no settings tab {tab}"))?;
+    if trigger.get_attribute("data-state").as_deref() != Some("Active") {
+        click(&trigger);
+    }
+    until(&format!("settings tab {tab}"), UI, || {
+        (trigger.get_attribute("data-state")? == "Active").then_some(())
+    })
+    .await?;
+    let testid = if tab == "Progetto" {
+        "project-settings"
+    } else {
+        "app-settings"
+    };
+    until(&format!("{testid} loaded"), UI, || {
+        find_in(&dialog, &format!("[data-testid={testid}]"))
+    })
+    .await?;
+    Ok(dialog)
+}
+
+/// Sets `allow_env_api_key` from the app settings (answering OK to the confirmation it may
+/// ask) and saves; the dialog closes on success.
+async fn api_key_passthrough(on: bool) -> R {
+    let dialog = open_settings("Generali").await?;
+    // The form is filled once the settings are loaded (the Salva button is enabled).
+    let save = until("settings loaded", UI, || {
+        find_in(&dialog, "[data-action=save-settings]").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    let checkbox = find_in(&dialog, "#settings-api-key").ok_or("no API key checkbox")?;
+    if Reflect::get(&checkbox, &"checked".into())
+        .ok()
+        .and_then(|v| v.as_bool())
+        != Some(on)
+    {
+        click(&checkbox);
+    }
+    if on {
+        queue_confirm(true).await?;
+    }
+    let since = last_toast();
+    click(&save);
+    toast_after(since, "Impostazioni salvate", |t| {
+        t.contains("Impostazioni salvate")
+    })
+    .await?;
+    until("settings closed", UI, || {
+        open_dialog("Settings").is_none().then_some(())
+    })
+    .await
+}
+
+async fn main_project() -> R<Project> {
+    let projects = ipc::call::<ListProjects>(&Empty {})
+        .await
+        .map_err(|e| e.to_string())?;
+    projects
+        .into_iter()
+        .find(|p| p.name == "main")
+        .ok_or_else(|| "no project main".into())
+}
+
+async fn queue_confirm(accept: bool) -> R {
+    ipc::call::<DebugE2eQueueConfirm>(&E2eConfirmReq { accept })
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn confirms() -> R<Vec<String>> {
+    ipc::call::<DebugE2eConfirms>(&Empty {})
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// Every IPC command that failed in this process is one of `expected`, in that order.
@@ -337,13 +835,23 @@ async fn exit_during_turn(run: &mut Run) -> R<String> {
 /// Every agent of both phases ran without the credentials, nesting and git variables the app
 /// itself has (spec §7.2): `scripts/e2e.sh` sets them all, fake-claude records their presence.
 async fn child_env_scrubbed(run: &Run) -> R<String> {
-    let missing: Vec<&str> = SCRUBBED
+    let has = |list: &[String], k: &str| list.iter().any(|a| a == k);
+    let (kept, scrubbed) = (&run.setup.app_env, &run.setup.scrubbed_at_start);
+    let wrong: Vec<&str> = SCRUBBED
         .into_iter()
-        .filter(|k| !run.setup.app_env.iter().any(|a| a == k))
+        .filter(|k| {
+            if KEPT_BY_THE_APP.contains(k) {
+                !has(kept, k)
+            } else {
+                has(kept, k) || !has(scrubbed, k)
+            }
+        })
         .collect();
-    if !missing.is_empty() {
+    if !wrong.is_empty() {
         return Err(format!(
-            "{missing:?} not set in the app's environment (scripts/e2e.sh sets them)"
+            "{wrong:?}: not set in the app's environment (scripts/e2e.sh sets them all), or a \
+             parent session's variable the app did not remove from itself at startup \
+             (app env {kept:?}, removed at startup {scrubbed:?})"
         ));
     }
     let calls = records("call").await?;
@@ -358,8 +866,9 @@ async fn child_env_scrubbed(run: &Run) -> R<String> {
     }
     Ok(format!(
         "{} agent calls over both phases got none of {SCRUBBED:?}, all set in the app's \
-         environment",
-        calls.len()
+         environment; the app removed {} of them from its own environment at startup",
+        calls.len(),
+        scrubbed.len()
     ))
 }
 
@@ -853,11 +1362,23 @@ async fn step_7(run: &mut Run) -> R<String> {
         return Err(format!("stop took {elapsed} ms, agents left {agents:?}"));
     }
     wait_idle(&t1, "inreview").await?;
+    // M6: the turn's end reads "Interrotto dall'utente", not the CLI's internal diagnostic.
+    let end = until("TurnEnd of the stopped turn", UI, || {
+        q_all("[data-view=task-panel] [data-turn-end]")
+            .into_iter()
+            .last()
+            .filter(|e| e.get_attribute("data-stopped").as_deref() == Some("user_stop"))
+    })
+    .await?;
+    let shown = panel().map(|p| text(&p)).unwrap_or_default();
+    if !text(&end).contains("Interrotto dall'utente") || shown.contains("ede_diagnostic") {
+        return Err(format!("stopped TurnEnd {:?}", text(&end)));
+    }
     let escalated = stop_escalates(run).await?;
     Ok(format!(
         "follow-up [fake:simple] completed with {resume} and the remembered rule; [fake:slow] \
-         killed/user_stop {elapsed:.0} ms after Stop (card updated after {seen:.0} ms), no \
-         agent left; {escalated}"
+         killed/user_stop {elapsed:.0} ms after Stop (card updated after {seen:.0} ms), its end \
+         «Interrotto dall'utente» without the CLI's diagnostic, no agent left; {escalated}"
     ))
 }
 

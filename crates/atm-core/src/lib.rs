@@ -35,10 +35,11 @@ use tokio::sync::OwnedMutexGuard;
 
 use crate::claude::{ChildEnv, Discovered};
 use crate::db::{AttemptCtx, AttemptRow, Db, ProjectRow};
-use crate::git::Git;
+use crate::git::{ConfigSnapshot, Git};
 use crate::live::Live;
 use crate::runner::{StopCause, StopTimings, TurnHandle};
 
+pub use db::SecurityState;
 pub use live::TranscriptSink;
 
 /// Global event for the UI (spec §6.4), emitted after the DB commit of every mutation.
@@ -121,14 +122,74 @@ struct Inner {
     closing: AtomicBool,
     tools: tokio::sync::Mutex<Option<Arc<Tools>>>,
     probe: tokio::sync::Mutex<Option<Arc<Probe>>>,
-    /// Per-attempt, per-task and per-repo mutexes (spec §8.1: always attempt → repo).
+    /// Per-attempt, per-task and per-repo mutexes (spec §8.1: always attempt → repo), plus
+    /// one per project for its security and one for the settings (M6).
     locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// `HOME` (the app's, or `extra_env`'s) and its canonical form, read once (never on a
+    /// tokio worker again).
+    home: PathBuf,
+    home_canonical: Option<PathBuf>,
+    /// Configurations of commits by `(repo, commit id)`: a commit never changes, and a
+    /// project's trust is computed on every read (at most [`MAX_COMMIT_CONFIGS`]). An
+    /// `Invalid` answer (a limit, a link, …) is as final as a snapshot and kept too: a crafted
+    /// tip is walked once, not on every read of a Trusted project.
+    commit_configs: Mutex<HashMap<(String, String), Result<ConfigSnapshot, AppError>>>,
 }
+
+/// Size of [`Inner::commit_configs`] past which it starts over.
+const MAX_COMMIT_CONFIGS: usize = 64;
 
 /// Login-shell `PATH` and the git found on it: imported once, re-read by `get_env{force}`.
 struct Tools {
     path: OsString,
     git: Git,
+}
+
+/// What the shell's security confirmation is built from, read once ([`Core::security_snapshot`]).
+#[derive(Debug, Clone)]
+pub struct SecuritySnapshot {
+    /// `trusted` and `trust_error` computed from `current`.
+    pub project: Project,
+    /// The state a change applies to ([`Core::apply_project_security`]'s `expected`).
+    pub stored: SecurityState,
+    /// The configuration committed at the tip of the project's default target branch (what a
+    /// Trusted approval approves, spec §8.9); `Err` if it cannot be approved: it cannot be
+    /// fingerprinted, the branch cannot be read, the repository is the home directory, or it
+    /// would bill the agents outside the subscription.
+    pub current: Result<ConfigSnapshot, AppError>,
+    /// Where `current` was read; `None` if the branch could not be read.
+    pub base: Option<ConfigBase>,
+}
+
+/// A commit whose configuration is approved or compared: a branch and its tip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigBase {
+    pub branch: String,
+    /// Full hex id.
+    pub commit: String,
+}
+
+impl ConfigBase {
+    /// The first 7 hex digits of the commit.
+    pub fn short(&self) -> &str {
+        self.commit.get(..7).unwrap_or(&self.commit)
+    }
+}
+
+impl SecuritySnapshot {
+    /// The fingerprint `req` would approve: `Some` when it asks for Trusted while the project
+    /// is not trusted now (Isolated, or its approved configuration changed), `None` when there
+    /// is nothing to approve. Errors: the configuration cannot be fingerprinted (the reason
+    /// the approval is refused, before any dialog).
+    pub fn approval(&self, req: &SetProjectSecurityReq) -> Result<Option<String>, AppError> {
+        if req.config_policy != ConfigPolicy::Trusted || self.project.trusted {
+            return Ok(None);
+        }
+        self.current
+            .as_ref()
+            .map(|s| Some(s.fingerprint.clone()))
+            .map_err(Clone::clone)
+    }
 }
 
 /// The cached part of [`EnvStatus`].
@@ -150,6 +211,12 @@ impl Core {
             .create(&config.data_dir)
             .map_err(|e| AppError::io(format!("{}: {e}", config.data_dir.display())))?;
         let db = Db::open(&config.data_dir.join("atm.sqlite3"))?;
+        let home = std::env::vars_os()
+            .chain(config.extra_env.iter().cloned())
+            .filter(|(k, _)| k == "HOME")
+            .last()
+            .map_or_else(|| PathBuf::from("/"), |(_, v)| PathBuf::from(v));
+        let home_canonical = std::fs::canonicalize(&home).ok();
         Ok(Core {
             inner: Arc::new(Inner {
                 config,
@@ -163,6 +230,9 @@ impl Core {
                 tools: tokio::sync::Mutex::default(),
                 probe: tokio::sync::Mutex::default(),
                 locks: Mutex::default(),
+                home,
+                home_canonical,
+                commit_configs: Mutex::default(),
             }),
         })
     }
@@ -209,8 +279,8 @@ impl Core {
         self.inner.live.forwarder_count()
     }
 
-    /// One project, `trusted` computed from this project's fingerprint only (the shell's
-    /// confirmation check). Errors: `NotFound`.
+    /// One project, `trusted` and `trust_error` computed from this project's fingerprint only.
+    /// Errors: `NotFound`.
     pub async fn project(&self, id: &str) -> Result<Project, AppError> {
         let row = self.inner.db.project(id)?;
         Ok(self.inner.project_view(&row).await)
@@ -222,6 +292,13 @@ impl Core {
     /// count or `max_running` change.
     pub async fn get_env(&self, req: GetEnvReq) -> Result<EnvStatus, AppError> {
         Ok(self.inner.env_status(req.force).await)
+    }
+
+    /// The git every call runs: `git` on the imported `PATH`, else `/usr/bin/git` (spec §8.1).
+    /// The shell logs it next to the env status (an app launched from the Finder has launchd's
+    /// `PATH`, not the Terminal's).
+    pub async fn git_path(&self) -> PathBuf {
+        self.inner.tools(false).await.git.bin().to_path_buf()
     }
 
     /// Writes the login script and opens Terminal (spec §7.10). Errors: `ClaudeNotFound`.
@@ -255,10 +332,27 @@ impl Core {
         self.inner.db.settings()
     }
 
-    /// Validates (`max_running` 1..=6, …) and saves. The shell has already obtained the
-    /// native confirmation when `allow_env_api_key` is being enabled. Errors: `Invalid`.
+    /// [`Core::update_settings_checked`] against the settings stored now: for callers that
+    /// confirm nothing (tests).
     pub async fn update_settings(&self, req: Settings) -> Result<Settings, AppError> {
+        let current = self.inner.db.settings()?;
+        self.update_settings_checked(req, &current).await
+    }
+
+    /// Validates (`max_running` 1..=6, …) and saves, under the settings lock and only if
+    /// `allow_env_api_key` and `claude_path_override` are still those of `expected` (what the
+    /// shell read before its confirmation), else `Conflict`. The shell has already obtained
+    /// the native confirmation when `allow_env_api_key` is being enabled or the override
+    /// changed. A new override must be an absolute path to an existing file outside every
+    /// project and the worktree root (M6: a repository must not pick the CLI the app runs).
+    /// Errors: `Invalid`, `Conflict`.
+    pub async fn update_settings_checked(
+        &self,
+        req: Settings,
+        expected: &Settings,
+    ) -> Result<Settings, AppError> {
         let s = &self.inner;
+        let _settings = s.lock("settings".to_owned()).await;
         if !(1..=6).contains(&req.max_running) {
             return Err(AppError::invalid("Gli agenti in parallelo vanno da 1 a 6"));
         }
@@ -274,8 +368,20 @@ impl Core {
                 "Cartella dei worktree ed editor sono obbligatori",
             ));
         }
+        let old = s.db.settings()?;
+        if (old.allow_env_api_key, &old.claude_path_override)
+            != (
+                expected.allow_env_api_key,
+                &non_empty(expected.claude_path_override.clone()),
+            )
+        {
+            return Err(AppError::conflict(
+                "Le impostazioni sono cambiate nel frattempo: riaprile e riprova",
+            ));
+        }
         let root = git::resolve_worktree_root(&req.worktree_root, &s.home())?;
-        for project in s.db.projects()? {
+        let projects = s.db.projects()?;
+        for project in &projects {
             let repo = Path::new(&project.repo_path);
             if root.starts_with(repo) || repo.starts_with(&root) {
                 return Err(AppError::invalid(format!(
@@ -284,7 +390,11 @@ impl Core {
                 )));
             }
         }
-        let old = s.db.settings()?;
+        if let Some(path) = &req.claude_path_override
+            && old.claude_path_override.as_ref() != Some(path)
+        {
+            check_claude_override(Path::new(path), &projects, &root).await?;
+        }
         s.db.save_settings(&req)?;
         let rediscover = old.claude_path_override != req.claude_path_override
             || old.allow_env_api_key != req.allow_env_api_key;
@@ -332,8 +442,14 @@ impl Core {
             .file_name()
             .map_or_else(|| repo_path.clone(), |n| n.to_string_lossy().into_owned())
             .chars()
+            .filter(|c| !is_hidden_char(*c))
             .take(200)
             .collect();
+        let name = if name.trim().is_empty() {
+            "progetto".to_owned()
+        } else {
+            name
+        };
         let now = now_ms();
         let row = ProjectRow {
             id: new_id(),
@@ -364,6 +480,12 @@ impl Core {
         if name.is_empty() || name.chars().count() > 200 {
             return Err(AppError::invalid("Il nome va da 1 a 200 caratteri"));
         }
+        // It is shown in native text (spec §10.2): no line breaks nor direction overrides.
+        if name.chars().any(is_hidden_char) {
+            return Err(AppError::invalid(
+                "Il nome non può contenere a capo, caratteri di controllo o di direzione",
+            ));
+        }
         check_bypass(req.default_permission_mode, &row)?;
         s.git()
             .await
@@ -383,45 +505,91 @@ impl Core {
         Ok(s.project_view(&row).await)
     }
 
-    /// M6: Trusted stores the fingerprint of the main checkout. The shell has already
-    /// obtained the native confirmation when raising the effective level (Trusted while not
-    /// `Project::trusted`, or enabling bypass).
+    /// What the shell builds its confirmation from, read once (M6): the project with `trusted`
+    /// computed from `current`, its stored security state and the configuration committed at
+    /// the tip of its default target branch now, the one worktrees are created from (spec
+    /// §8.9). Errors: `NotFound`.
+    pub async fn security_snapshot(&self, id: &str) -> Result<SecuritySnapshot, AppError> {
+        let s = &self.inner;
+        let row = s.db.project(id)?;
+        let (base, current) = s.target_config(&row).await;
+        Ok(SecuritySnapshot {
+            project: s.view_with(&row, &current),
+            stored: row.security(),
+            current,
+            base,
+        })
+    }
+
+    /// [`Core::security_snapshot`] then [`Core::apply_project_security`] at once: for callers
+    /// that confirm nothing (tests). The shell asks for its native confirmation in between.
     pub async fn set_project_security(
         &self,
         req: SetProjectSecurityReq,
     ) -> Result<Project, AppError> {
+        let snapshot = self.security_snapshot(&req.id).await?;
+        let approve = snapshot.approval(&req)?;
+        self.apply_project_security(req, &snapshot.stored, approve.as_deref())
+            .await
+    }
+
+    /// M6 (spec §8.9): stores policy and bypass opt-in, under the project's lock and only if
+    /// the stored state is still `expected` (what the user saw), else `Conflict`. Trusted
+    /// stores `approve`, the fingerprint the confirmation described
+    /// ([`SecuritySnapshot::approval`]), once a fresh computation on the target branch's tip
+    /// still gives it (else `Conflict`: the configuration changed while the dialog was open;
+    /// a new tip with the same configuration is the same approval); without `approve`
+    /// it keeps the approved fingerprint (the policy stays Trusted, nothing is re-approved);
+    /// Isolated clears it. Revoking `allow_bypass` resets a default mode of Autonomo to
+    /// Auto-edit in the same statement; revoking the bypass or Trusted stops the project's
+    /// running turns that use it, with a Notice. The shell has already obtained the native
+    /// confirmation when raising the effective level. Errors: `NotFound`, `Conflict`,
+    /// `Invalid` (Trusted without an approval to keep, the home directory, a configuration
+    /// that cannot be fingerprinted or that would bill outside the subscription, a target
+    /// branch that cannot be read), `Io`.
+    pub async fn apply_project_security(
+        &self,
+        req: SetProjectSecurityReq,
+        expected: &SecurityState,
+        approve: Option<&str>,
+    ) -> Result<Project, AppError> {
         let s = &self.inner;
+        let _project = s.lock(project_key(&req.id)).await;
         let row = s.db.project(&req.id)?;
-        let fingerprint = match req.config_policy {
-            ConfigPolicy::Trusted => {
-                // Its fingerprint would read `~/.claude`, which the app never reads (§10.1).
-                if s.is_home(Path::new(&row.repo_path)) {
-                    return Err(AppError::invalid(
-                        "Un repository nella cartella home non può essere considerato attendibile",
+        let fingerprint = match (req.config_policy, approve) {
+            (ConfigPolicy::Isolated, _) => None,
+            (ConfigPolicy::Trusted, Some(approved)) => {
+                let now = s.target_config(&row).await.1?;
+                if now.fingerprint != approved {
+                    return Err(AppError::conflict(
+                        "La configurazione Claude del repository è cambiata mentre confermavi: \
+                         riprova per vedere e approvare quella attuale",
                     ));
                 }
-                Some(git::config_fingerprint(Path::new(&row.repo_path)).await?)
+                Some(approved.to_owned())
             }
-            ConfigPolicy::Isolated => None,
+            (ConfigPolicy::Trusted, None) => match expected {
+                SecurityState {
+                    config_policy: ConfigPolicy::Trusted,
+                    trusted_fingerprint: Some(kept),
+                    ..
+                } => Some(kept.clone()),
+                _ => {
+                    return Err(AppError::invalid(
+                        "La configurazione Attendibile va approvata con una conferma",
+                    ));
+                }
+            },
         };
-        let now = now_ms();
-        let mut row = s.db.set_project_security(
+        let row = s.db.set_project_security(
             &req.id,
+            expected,
             req.config_policy,
             req.allow_bypass,
             fingerprint.as_deref(),
-            now,
+            now_ms(),
         )?;
-        if !row.allow_bypass && row.default_permission_mode == PermissionMode::BypassPermissions {
-            let update = UpdateProjectReq {
-                id: row.id.clone(),
-                name: row.name.clone(),
-                default_target_branch: row.default_target_branch.clone(),
-                default_permission_mode: PermissionMode::AcceptEdits,
-                default_model: row.default_model.clone(),
-            };
-            row = s.db.update_project(&update, now)?;
-        }
+        s.stop_revoked_turns(&req.id, expected, &row);
         s.emit_changed(None, None);
         Ok(s.project_view(&row).await)
     }
@@ -972,11 +1140,7 @@ impl Inner {
     }
 
     fn home(&self) -> PathBuf {
-        self.base_env()
-            .into_iter()
-            .rev()
-            .find(|(k, _)| k == "HOME")
-            .map_or_else(|| PathBuf::from("/"), |(_, v)| PathBuf::from(v))
+        self.home.clone()
     }
 
     fn child_env(&self, tools: &Tools, settings: &Settings) -> ChildEnv {
@@ -992,8 +1156,11 @@ impl Inner {
             Some(path) => path.clone(),
             None => claude::login_shell_path().await,
         };
-        let git =
-            Git::new(git::find_git(&path), path.clone()).with_env(self.config.extra_env.clone());
+        // A git too old for the runner's protections runs nothing (spec §8.1).
+        let git = Git::new(git::find_git(&path), path.clone())
+            .with_env(self.config.extra_env.clone())
+            .gated()
+            .await;
         let tools = Arc::new(Tools { path, git });
         *cache = Some(Arc::clone(&tools));
         tools
@@ -1053,6 +1220,7 @@ impl Inner {
             git_version: probe.git_version.clone().ok(),
             api_key_in_env: claude::api_key_in_env(&base),
             cloud_provider_env: claude::cloud_provider_env(&base),
+            base_url_env: claude::base_url_env(&base),
             paused: guard(&self.paused).clone(),
             running: guard(&self.turns).len() as u32,
             max_running: self.db.settings().unwrap_or_default().max_running,
@@ -1071,10 +1239,9 @@ impl Inner {
         mutex.lock_owned().await
     }
 
-    /// `dir` is the home directory (`HOME` as given or canonical).
+    /// `dir` is the home directory (`HOME` as given or canonical, both read at startup).
     fn is_home(&self, dir: &Path) -> bool {
-        let home = self.home();
-        dir == home || std::fs::canonicalize(&home).is_ok_and(|h| h == dir)
+        dir == self.home || self.home_canonical.as_deref() == Some(dir)
     }
 
     /// Removes the worktree and branch of an attempt whose rows were never written.
@@ -1119,14 +1286,12 @@ impl Inner {
         }
         let allow_api_key = self.db.settings()?.allow_env_api_key;
         let scrubbed = |k: &str| {
-            claude::CLAUDE_NESTING_VARS.contains(&k)
-                || git::is_scrubbed_git_var(k)
-                || (!allow_api_key && claude::API_KEY_VARS.contains(&k))
+            git::is_scrubbed_git_var(k) || (!allow_api_key && claude::API_KEY_VARS.contains(&k))
         };
-        let env = self
-            .base_env()
-            .into_iter()
-            .filter(|(k, _)| !k.to_str().is_some_and(scrubbed));
+        let mut env: std::collections::BTreeMap<OsString, OsString> =
+            self.base_env().into_iter().collect();
+        claude::scrub_host_env(&mut env);
+        env.retain(|k, _| !k.to_str().is_some_and(scrubbed));
         let status = tokio::process::Command::new("/usr/bin/open")
             .env_clear()
             .envs(env)
@@ -1175,19 +1340,138 @@ impl Inner {
         attempt.view(running, pending)
     }
 
-    /// `trusted` = policy Trusted and the approved fingerprint still matches the checkout.
+    /// `trusted` = policy Trusted and the approved fingerprint still matches the configuration
+    /// committed at the tip of the default target branch (new attempts start there, spec
+    /// §8.9); `trust_error` = why that could not be checked or approved.
     async fn project_view(&self, row: &ProjectRow) -> Project {
-        let trusted = row.config_policy == ConfigPolicy::Trusted
-            && self
-                .fingerprint_matches(row, Path::new(&row.repo_path))
-                .await;
-        row.to_project(trusted)
+        if row.config_policy != ConfigPolicy::Trusted {
+            return row.to_project(false);
+        }
+        self.view_with(row, &self.target_config(row).await.1)
     }
 
-    async fn fingerprint_matches(&self, row: &ProjectRow, dir: &Path) -> bool {
-        match (&row.trusted_fingerprint, git::config_fingerprint(dir).await) {
-            (Some(approved), Ok(current)) => *approved == current,
-            _ => false,
+    /// [`Inner::project_view`] from the target branch's configuration already read
+    /// ([`Inner::target_config`]).
+    fn view_with(&self, row: &ProjectRow, target: &Result<ConfigSnapshot, AppError>) -> Project {
+        let trusted = row.config_policy == ConfigPolicy::Trusted
+            && target
+                .as_ref()
+                .is_ok_and(|s| row.trusted_fingerprint.as_deref() == Some(s.fingerprint.as_str()));
+        let trust_error = target
+            .as_ref()
+            .err()
+            .filter(|_| row.config_policy == ConfigPolicy::Trusted)
+            .map(|e| e.message.clone());
+        Project {
+            trust_error,
+            ..row.to_project(trusted)
+        }
+    }
+
+    /// The configuration of the checkout at `dir` (spec §8.9): a worktree before its turns.
+    /// Never computed for the home directory, whose `.claude` is the user's own and never read
+    /// (spec §10.1). Errors: `Invalid` (home, a limit, a link out of `dir`, a change during
+    /// the walk), `Io`.
+    async fn config_snapshot(&self, dir: &Path) -> Result<ConfigSnapshot, AppError> {
+        if self.is_home(dir) {
+            return Err(home_refusal());
+        }
+        git::config_snapshot(dir).await
+    }
+
+    /// The configuration committed in `commit` of `repo` (spec §8.9), cached with its
+    /// `Invalid` errors (the others, a timeout or a reader that failed, may not happen again).
+    /// Never computed for a repository that is the home directory. Errors: those of
+    /// [`Git::commit_config_snapshot`], `Invalid` (home).
+    async fn commit_config(
+        &self,
+        git: &Git,
+        repo: &Path,
+        commit: &str,
+    ) -> Result<ConfigSnapshot, AppError> {
+        if self.is_home(repo) {
+            return Err(home_refusal());
+        }
+        let key = (repo.to_string_lossy().into_owned(), commit.to_owned());
+        if let Some(known) = guard(&self.commit_configs).get(&key) {
+            return known.clone();
+        }
+        let snapshot = git.commit_config_snapshot(repo, commit).await;
+        if snapshot
+            .as_ref()
+            .err()
+            .is_none_or(|e| e.code == ErrorCode::Invalid)
+        {
+            let mut cache = guard(&self.commit_configs);
+            if cache.len() >= MAX_COMMIT_CONFIGS {
+                cache.clear();
+            }
+            cache.insert(key, snapshot.clone());
+        }
+        snapshot
+    }
+
+    /// What a Trusted approval of `row` approves (spec §8.9): the configuration committed at
+    /// the tip of its default target branch, where new worktrees start, and that tip. `Err`
+    /// when it cannot be approved: home, branch unreadable, not fingerprintable, or a
+    /// configuration that would bill outside the subscription ([`billing_refusal`]).
+    async fn target_config(
+        &self,
+        row: &ProjectRow,
+    ) -> (Option<ConfigBase>, Result<ConfigSnapshot, AppError>) {
+        let repo = Path::new(&row.repo_path);
+        if self.is_home(repo) {
+            return (None, Err(home_refusal()));
+        }
+        let git = self.git().await;
+        let branch = &row.default_target_branch;
+        let commit = match git.branch_tip(repo, branch).await {
+            Ok(commit) => commit,
+            Err(e) => {
+                return (
+                    None,
+                    Err(AppError::invalid(format!(
+                        "Il branch target predefinito {branch} non si può leggere ({}): la \
+                         configurazione da approvare è quella del suo ultimo commit",
+                        e.message
+                    ))),
+                );
+            }
+        };
+        let base = ConfigBase {
+            branch: branch.clone(),
+            commit,
+        };
+        let snapshot = self
+            .commit_config(&git, repo, &base.commit)
+            .await
+            .and_then(|s| billing_refusal(&s, &base).map_or(Ok(s), Err));
+        (Some(base), snapshot)
+    }
+
+    /// Stops the running turns of `project_id` that use what the change from `before` to
+    /// `after` revoked (the bypass opt-in, the Trusted policy), with a Notice: a revocation
+    /// must not wait for the end of the turn. A turn not launched yet counts as using it.
+    fn stop_revoked_turns(&self, project_id: &str, before: &SecurityState, after: &ProjectRow) {
+        let bypass = before.allow_bypass && !after.allow_bypass;
+        let trust = before.config_policy == ConfigPolicy::Trusted
+            && after.config_policy == ConfigPolicy::Isolated;
+        if !bypass && !trust {
+            return;
+        }
+        let turns: Vec<Arc<TurnHandle>> = guard(&self.turns)
+            .values()
+            .filter(|t| t.project_id == project_id)
+            .cloned()
+            .collect();
+        for turn in turns {
+            let hit = turn
+                .caps()
+                .is_none_or(|c| (bypass && c.bypass) || (trust && c.trusted));
+            if hit {
+                turn.notice(atm_types::Level::Warn, runner::REVOKED_NOTICE);
+                turn.stop(StopCause::User, runner::StopTimings::NORMAL);
+            }
         }
     }
 
@@ -1322,6 +1606,78 @@ fn repo_key(repo_path: &str) -> String {
     format!("repo:{repo_path}")
 }
 
+fn project_key(project_id: &str) -> String {
+    format!("project:{project_id}")
+}
+
+/// The real user id of this process.
+pub fn current_uid() -> u32 {
+    // SAFETY: `getuid` has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// A character that changes how text reads without showing: line breaks and other controls,
+/// bidirectional embeddings, overrides and isolates (U+202A–U+202E, U+2066–U+2069), marks.
+pub fn is_hidden_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+        )
+}
+
+/// A new `claude_path_override`: absolute, an existing file (links followed, the CLI's own
+/// is one), neither it nor its target inside a project or the worktree root.
+async fn check_claude_override(
+    path: &Path,
+    projects: &[ProjectRow],
+    worktree_root: &Path,
+) -> Result<(), AppError> {
+    let shown = path.display();
+    if !path.is_absolute() {
+        return Err(AppError::invalid(format!(
+            "Il percorso di Claude Code deve essere assoluto: {shown}"
+        )));
+    }
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(AppError::invalid(format!(
+                "Il percorso di Claude Code non è un file: {shown}"
+            )));
+        }
+        Err(e) => {
+            return Err(AppError::invalid(format!(
+                "Il percorso di Claude Code non esiste: {shown} ({e})"
+            )));
+        }
+    }
+    let target = tokio::fs::canonicalize(path)
+        .await
+        .map_err(|e| AppError::invalid(format!("{shown}: {e}")))?;
+    let root = tokio::fs::canonicalize(worktree_root)
+        .await
+        .unwrap_or_else(|_| worktree_root.to_path_buf());
+    for p in [path, target.as_path()] {
+        if let Some(project) = projects
+            .iter()
+            .find(|project| p.starts_with(&project.repo_path))
+        {
+            return Err(AppError::invalid(format!(
+                "Il percorso di Claude Code non può stare dentro il progetto {}: un repository \
+                 non può scegliere il programma che l'app esegue",
+                project.name
+            )));
+        }
+        if p.starts_with(worktree_root) || p.starts_with(&root) {
+            return Err(AppError::invalid(
+                "Il percorso di Claude Code non può stare nella cartella dei worktree",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
@@ -1344,6 +1700,31 @@ fn claude_not_found() -> AppError {
 
 fn busy_turn() -> AppError {
     AppError::busy("Un turno dell'agente è già in esecuzione")
+}
+
+/// Never Trusted, never fingerprinted: a repository that is the home directory (its `.claude`
+/// is the user's own configuration, which the app never reads, spec §10.1).
+fn home_refusal() -> AppError {
+    AppError::invalid(
+        "Un repository nella cartella home non può essere considerato attendibile: la sua \
+         .claude è la configurazione dell'utente, che l'app non legge",
+    )
+}
+
+/// The approval of a configuration that would bill the agents outside the subscription
+/// (`ConfigSnapshot::billing`: `git::BILLING_SETTINGS_KEYS`, `git::BILLING_ENV_VARS`) is
+/// refused (spec §8.9, §10.2): `Invalid`, naming what sets it. `None` when there is nothing.
+fn billing_refusal(snapshot: &ConfigSnapshot, base: &ConfigBase) -> Option<AppError> {
+    (!snapshot.billing.is_empty()).then(|| {
+        AppError::invalid(format!(
+            "Configurazione Claude non approvabile (branch {}, commit {}): {}. Gli agenti \
+             usano solo l'abbonamento Claude, e queste impostazioni li farebbero fatturare via \
+             API o da un altro provider: toglile dal branch o lascia il progetto Isolato",
+            base.branch,
+            base.short(),
+            snapshot.billing.join("; ")
+        ))
+    })
 }
 
 fn worktree_missing(path: &str) -> AppError {

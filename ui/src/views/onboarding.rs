@@ -503,6 +503,7 @@ mod tests {
             git_version: None,
             api_key_in_env: false,
             cloud_provider_env: false,
+            base_url_env: false,
             paused: None,
             running: 0,
             max_running: 2,

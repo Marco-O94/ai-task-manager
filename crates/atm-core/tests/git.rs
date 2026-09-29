@@ -260,6 +260,11 @@ fn forbidden_operations_absent_from_the_source() {
         include_str!("../src/git/parse.rs"),
     ];
     for src in sources {
+        // `filter.<driver>.clean` is a configuration variable the runner neutralizes, not the
+        // `clean` subcommand.
+        let src = src
+            .replace("(\"clean\", \"cat\")", "")
+            .replace("b\"clean\"", "");
         for op in [
             "reset", "push", "fetch", "pull", "stash", "checkout", "switch", "restore", "prune",
             "clean", "gc", "rebase",
@@ -280,7 +285,7 @@ async fn runner_forces_hardening_and_environment() {
     common::script(
         &bin,
         &format!(
-            "case \"$*\" in *--get-regexp*) printf 'hook.evil.command\\0hook.b.x.event\\0merge.evil.driver\\0merge.ff\\0merge.x.name\\0'; exit 0;; esac\n\
+            "case \"$*\" in *--get-regexp*) printf 'local\\0hook.evil.command\\nx\\0global\\0hook.b.x.event\\nx\\0local\\0merge.evil.driver\\nx\\0global\\0merge.ff\\nonly\\0local\\0merge.x.name\\nx\\0'; exit 0;; esac\n\
              printf '%s\\n' \"$@\" > '{r}/argv'\n/usr/bin/env > '{r}/env'"
         ),
     );
@@ -310,10 +315,11 @@ async fn runner_forces_hardening_and_environment() {
             .collect()
     };
 
+    // A plain read: no configuration query, no override.
     let out = g
         .run(
             &fx.repo,
-            &["status", "--porcelain"],
+            &["log", "-1"],
             &RunOpts {
                 read_only: true,
                 ..RunOpts::default()
@@ -324,7 +330,7 @@ async fn runner_forces_hardening_and_environment() {
     assert_eq!(out.code, 0);
     let mut argv: Vec<String> = HARDENING.iter().map(|s| s.to_string()).collect();
     argv.extend(["-C".into(), fx.repo.display().to_string()]);
-    argv.extend(["status".into(), "--porcelain".into()]);
+    argv.extend(["log".into(), "-1".into()]);
     assert_eq!(read(&rec.join("argv")).lines().collect::<Vec<_>>(), argv);
     let e = env();
     for (k, v) in [
@@ -354,8 +360,8 @@ async fn runner_forces_hardening_and_environment() {
         assert!(!e.contains_key(k), "{k} leaked");
     }
 
-    // A call that may write, and `merge-tree`: the config-defined hooks and merge drivers are
-    // listed first and disabled.
+    // A call that may write, `merge-tree` and `status` (which runs clean filters): the
+    // config-defined hooks and merge drivers are listed first and disabled.
     let disabled = |e: &BTreeMap<String, String>| {
         assert_eq!(e.get("GIT_CONFIG_COUNT").map(String::as_str), Some("3"));
         let overrides: Vec<(&str, &str)> = (0..3)
@@ -403,6 +409,17 @@ async fn runner_forces_hardening_and_environment() {
     let e = env();
     assert_eq!(e.get("GIT_OPTIONAL_LOCKS").map(String::as_str), Some("0"));
     disabled(&e);
+    g.run(
+        &fx.repo,
+        &["status", "--porcelain"],
+        &RunOpts {
+            read_only: true,
+            ..RunOpts::default()
+        },
+    )
+    .await
+    .unwrap();
+    disabled(&env());
     fx.done();
 }
 
@@ -476,12 +493,62 @@ async fn git_discovery_and_version_gate() {
         let mut p = version.split('.').map(|n| n.parse::<u32>().unwrap());
         (p.next().unwrap(), p.next().unwrap())
     };
-    assert!((major, minor) >= (2, 38), "{version}");
+    assert!((major, minor) >= (2, 44), "{version}");
 
     let old = hardened(&fx.hostile, Some(good.join("git")));
     assert_eq!(old.version().await.unwrap_err().code, ErrorCode::Git);
     let missing = hardened(&fx.hostile, Some(fx.dir.join("nope/git")));
     assert_eq!(missing.version().await.unwrap_err().code, ErrorCode::Git);
+
+    // A git older than 2.44 ignores `GIT_NO_LAZY_FETCH`: once gated, it runs nothing but
+    // `--version` (spec §8.1). A current one, or one that does not answer, is left alone.
+    let last_too_old = fx.dir.join("path3");
+    common::script(&last_too_old.join("git"), "echo 'git version 2.43.7'");
+    for bin in [good.join("git"), last_too_old.join("git")] {
+        let gated = hardened(&fx.hostile, Some(bin.clone())).gated().await;
+        let err = gated
+            .run(
+                &fx.repo,
+                &["status"],
+                &RunOpts {
+                    read_only: true,
+                    ..RunOpts::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Git, "{bin:?}: {err}");
+        assert!(err.message.contains("troppo vecchio"), "{err}");
+        assert!(gated.cat_file(&fx.repo).await.is_err(), "{bin:?}");
+        assert!(gated.version().await.is_err());
+    }
+    let current = fx.git.clone().gated().await;
+    current
+        .run(
+            &fx.repo,
+            &["status"],
+            &RunOpts {
+                read_only: true,
+                ..RunOpts::default()
+            },
+        )
+        .await
+        .unwrap();
+    let silent = hardened(&fx.hostile, Some(fx.dir.join("nope/git")))
+        .gated()
+        .await;
+    let err = silent
+        .run(
+            &fx.repo,
+            &["status"],
+            &RunOpts {
+                read_only: true,
+                ..RunOpts::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(!err.message.contains("troppo vecchio"), "{err}");
     fx.done();
 }
 
@@ -1754,5 +1821,1125 @@ async fn merge_refused_by_git_itself_changes_no_byte() {
         assert_eq!(tree_bytes(&fx.repo), before, "{case}: a byte changed");
         std::fs::remove_file(fx.repo.join(mine)).unwrap();
     }
+    fx.done();
+}
+
+// ---- configuration fingerprint (spec §8.9, M6) ---------------------------------------------
+
+/// SHA-256 hex of the records, as `git/fingerprint.rs` documents them.
+fn expected_fingerprint(records: &[(&str, u8, &[u8])]) -> String {
+    let mut hash = Sha256::new();
+    for (path, kind, content) in records {
+        hash.update(path.as_bytes());
+        hash.update([0, *kind, 0]);
+        hash.update(content.len().to_string().as_bytes());
+        hash.update([0]);
+        hash.update(content);
+    }
+    hash.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn fingerprint(root: &Path) -> Result<String, atm_types::AppError> {
+    git::config_fingerprint_blocking(root)
+}
+
+/// The documented format (directories included); only `.claude/**` and `.mcp.json` count; no
+/// configuration at all is the hash of nothing; the async version agrees.
+#[tokio::test]
+async fn fingerprint_covers_exactly_the_claude_config() {
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    assert_eq!(fingerprint(root).unwrap(), expected_fingerprint(&[]));
+    write(&root.join("README.md"), "not config\n");
+    write(&root.join("CLAUDE.md"), "memory, not config\n");
+    write(&root.join("sub/.claude/settings.json"), "{}");
+    assert_eq!(fingerprint(root).unwrap(), expected_fingerprint(&[]));
+
+    write(&root.join(".claude/settings.json"), r#"{"hooks":{}}"#);
+    write(&root.join(".claude/hooks/start.sh"), "echo hi\n");
+    std::fs::set_permissions(
+        root.join(".claude/hooks/start.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    write(&root.join(".mcp.json"), r#"{"mcpServers":{}}"#);
+    let want = expected_fingerprint(&[
+        (".claude", b'd', b""),
+        (".claude/hooks", b'd', b""),
+        (".claude/hooks/start.sh", b'x', b"echo hi\n"),
+        (".claude/settings.json", b'f', br#"{"hooks":{}}"#),
+        (".mcp.json", b'f', br#"{"mcpServers":{}}"#),
+    ]);
+    assert_eq!(fingerprint(root).unwrap(), want);
+    assert_eq!(git::config_fingerprint(root).await.unwrap(), want);
+    assert_eq!(want.len(), 64);
+}
+
+/// Every change the CLI would see changes it: content, a new file, a rename, a removal, the
+/// executable bit; the rest of the repo does not.
+#[test]
+fn fingerprint_changes_with_the_config_only() {
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    write(&root.join(".claude/settings.json"), "{}");
+    write(&root.join(".claude/hooks/a.sh"), "true\n");
+    let base = fingerprint(root).unwrap();
+    let mut seen = BTreeSet::from([base.clone()]);
+    let mut changed = |what: &str| {
+        let now = fingerprint(root).unwrap();
+        assert!(seen.insert(now), "{what} did not change the fingerprint");
+    };
+    write(&root.join(".claude/settings.json"), r#"{"env":{"X":"1"}}"#);
+    changed("content");
+    write(&root.join(".claude/settings.local.json"), "{}");
+    changed("a new file");
+    std::fs::rename(
+        root.join(".claude/hooks/a.sh"),
+        root.join(".claude/hooks/b.sh"),
+    )
+    .unwrap();
+    changed("a rename");
+    std::fs::set_permissions(
+        root.join(".claude/hooks/b.sh"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    changed("the executable bit");
+    write(&root.join(".mcp.json"), "{}");
+    changed(".mcp.json");
+    std::fs::remove_file(root.join(".claude/settings.local.json")).unwrap();
+    changed("a removal");
+    std::fs::create_dir_all(root.join(".claude/empty")).unwrap();
+    changed("an empty directory");
+    let now = fingerprint(root).unwrap();
+    write(&root.join("src/main.rs"), "fn main() {}\n");
+    assert_eq!(fingerprint(root).unwrap(), now, "not configuration");
+}
+
+/// Symlinks count by their target string and are read through inside the root, as the CLI
+/// reads them: a settings file linked to a file elsewhere in the repo changes with it. A link
+/// out of the root cannot be fingerprinted (error, hence never trusted); a dangling link is
+/// just its target string.
+#[test]
+fn fingerprint_follows_links_inside_the_root_only() {
+    let tmp = common::tempdir();
+    let root = tmp.path().join("repo");
+    let outside = tmp.path().join("outside.json");
+    write(&outside, "{}");
+    write(&root.join("shared/claude.json"), r#"{"hooks":{}}"#);
+    std::fs::create_dir_all(root.join(".claude")).unwrap();
+    std::os::unix::fs::symlink("../shared/claude.json", root.join(".claude/settings.json"))
+        .unwrap();
+    assert_eq!(
+        fingerprint(&root).unwrap(),
+        expected_fingerprint(&[
+            (".claude", b'd', b""),
+            (".claude/settings.json", b'f', br#"{"hooks":{}}"#),
+            (".claude/settings.json", b'l', b"../shared/claude.json"),
+        ])
+    );
+    let before = fingerprint(&root).unwrap();
+    write(
+        &root.join("shared/claude.json"),
+        r#"{"hooks":{"SessionStart":[]}}"#,
+    );
+    assert_ne!(
+        fingerprint(&root).unwrap(),
+        before,
+        "edited through the link"
+    );
+
+    // `.claude` itself a link to a directory of the repo: walked under `.claude/`.
+    let linked = tmp.path().join("linked");
+    write(&linked.join("config/settings.json"), "{}");
+    std::os::unix::fs::symlink("config", linked.join(".claude")).unwrap();
+    assert_eq!(
+        fingerprint(&linked).unwrap(),
+        expected_fingerprint(&[
+            (".claude", b'd', b""),
+            (".claude", b'l', b"config"),
+            (".claude/settings.json", b'f', b"{}"),
+        ])
+    );
+
+    // Out of the root, by an absolute or a relative path: refused.
+    for target in [outside.clone(), PathBuf::from("../../outside.json")] {
+        let escaping = tmp
+            .path()
+            .join(format!("escaping-{}", target.is_absolute()));
+        std::fs::create_dir_all(escaping.join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&target, escaping.join(".claude/settings.json")).unwrap();
+        let err = fingerprint(&escaping).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{target:?}: {err}");
+        assert!(err.message.contains("esce dal repository"), "{err}");
+    }
+
+    let dangling = tmp.path().join("dangling");
+    std::fs::create_dir_all(dangling.join(".claude")).unwrap();
+    std::os::unix::fs::symlink("missing.json", dangling.join(".claude/settings.json")).unwrap();
+    let empty = fingerprint(&dangling).unwrap();
+    assert_eq!(
+        empty,
+        expected_fingerprint(&[
+            (".claude", b'd', b""),
+            (".claude/settings.json", b'l', b"missing.json")
+        ])
+    );
+    write(&dangling.join(".claude/missing.json"), "{}");
+    assert_ne!(
+        fingerprint(&dangling).unwrap(),
+        empty,
+        "the target appeared"
+    );
+}
+
+/// A FIFO is recorded, never opened (the check would hang: it runs on a thread, and a hang
+/// fails the test after 5 s instead of stalling the suite); a link cycle, more than 2000
+/// records (directories count, empty ones too) or more than 64 MiB are errors, never a
+/// partial hash.
+#[test]
+fn fingerprint_limits_and_special_files() {
+    let tmp = common::tempdir();
+    let fifo_root = tmp.path().join("fifo");
+    std::fs::create_dir_all(fifo_root.join(".claude")).unwrap();
+    let fifo = fifo_root.join(".claude/pipe");
+    let c_path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a NUL-terminated path; creates a FIFO, no memory is shared.
+    assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+    let (tx, rx) = std::sync::mpsc::channel();
+    // Also named by a server of `.mcp.json`: a word naming a FIFO adds nothing, never opened.
+    std::fs::create_dir_all(fifo_root.join("tools")).unwrap();
+    let named = std::ffi::CString::new(fifo_root.join("tools/pipe").as_os_str().as_encoded_bytes())
+        .unwrap();
+    // SAFETY: as above.
+    assert_eq!(unsafe { libc::mkfifo(named.as_ptr(), 0o644) }, 0);
+    let mcp = r#"{"mcpServers":{"p":{"command":"cat","args":["tools/pipe","README.md/x"]}}}"#;
+    write(&fifo_root.join(".mcp.json"), mcp);
+    let root = fifo_root.clone();
+    std::thread::spawn(move || tx.send(fingerprint(&root)));
+    let got = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the fingerprint of a FIFO did not return within 5 s");
+    write(&fifo_root.join("README.md"), "a file, not a directory\n");
+    assert_eq!(
+        got.unwrap(),
+        expected_fingerprint(&[
+            (".claude", b'd', b""),
+            (".claude/pipe", b'o', b""),
+            (".mcp.json", b'f', mcp.as_bytes()),
+        ])
+    );
+    assert_eq!(
+        fingerprint(&fifo_root).unwrap(),
+        expected_fingerprint(&[
+            (".claude", b'd', b""),
+            (".claude/pipe", b'o', b""),
+            (".mcp.json", b'f', mcp.as_bytes()),
+        ]),
+        "a word through a regular file names nothing"
+    );
+
+    let cycle = tmp.path().join("cycle");
+    write(&cycle.join(".claude/settings.json"), "{}");
+    std::os::unix::fs::symlink(".", cycle.join(".claude/loop")).unwrap();
+    assert_eq!(fingerprint(&cycle).unwrap_err().code, ErrorCode::Invalid);
+
+    let many = tmp.path().join("many");
+    // `.claude` and `.claude/commands` are two of the records.
+    for i in 0..git::MAX_CONFIG_FILES - 2 {
+        write(&many.join(format!(".claude/commands/c{i}.md")), "x");
+    }
+    fingerprint(&many).unwrap();
+    write(&many.join(".mcp.json"), "{}");
+    let err = fingerprint(&many).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(err.message.contains("2000"), "{err}");
+
+    // Empty directories are walked, so they count: a tree of them is bounded too.
+    let dirs = tmp.path().join("dirs");
+    for i in 0..git::MAX_CONFIG_FILES {
+        std::fs::create_dir_all(dirs.join(format!(".claude/d{}/e{}", i / 50, i % 50))).unwrap();
+    }
+    let err = fingerprint(&dirs).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(err.message.contains("2000"), "{err}");
+
+    let big = tmp.path().join("big");
+    let half = vec![b'a'; (git::MAX_CONFIG_BYTES / 2) as usize];
+    write(&big.join(".claude/a.bin"), &half);
+    write(&big.join(".claude/b.bin"), &half);
+    fingerprint(&big).unwrap();
+    write(&big.join(".mcp.json"), "{}");
+    assert_eq!(fingerprint(&big).unwrap_err().code, ErrorCode::Invalid);
+
+    let err = fingerprint(&tmp.path().join("no-such-dir")).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Io);
+}
+
+/// A worktree of a commit has the fingerprint of the main checkout of that commit (paths are
+/// relative, links are relative), even though it lives elsewhere; an edit in the worktree
+/// sets it apart.
+#[tokio::test]
+async fn fingerprint_of_a_worktree_matches_its_main_checkout() {
+    let fx = Fx::new();
+    write(&fx.repo.join(".claude/settings.json"), r#"{"hooks":{}}"#);
+    write(&fx.repo.join(".claude/agents/reviewer.md"), "# reviewer\n");
+    std::os::unix::fs::symlink("settings.json", fx.repo.join(".claude/alias.json")).unwrap();
+    write(&fx.repo.join(".mcp.json"), r#"{"mcpServers":{}}"#);
+    sh(&fx.repo, &["add", "-A"]);
+    sh(&fx.repo, &["commit", "-q", "-m", "claude config"]);
+    let a = fx.attempt("Config").await;
+    let main = git::config_fingerprint(&fx.repo).await.unwrap();
+    assert_eq!(git::config_fingerprint(&a.wt).await.unwrap(), main);
+    write(
+        &a.wt.join(".claude/settings.json"),
+        r#"{"hooks":{"Stop":[]}}"#,
+    );
+    assert_ne!(git::config_fingerprint(&a.wt).await.unwrap(), main);
+    fx.done();
+}
+
+/// Change 2 (2026-09-29, spec §8.9): the configuration of a commit, read from the object
+/// database, is exactly that of a clean worktree of it on disk (records, digests, summary),
+/// whatever it holds: nested directories, an executable hook, links inside the tree (to a
+/// file, to a directory, through a directory link, dangling), a submodule (an empty directory
+/// in a new worktree), the files and the marketplace directory its commands name. Files of
+/// the main checkout that are not committed change the checkout's fingerprint, never the
+/// commit's.
+#[tokio::test]
+async fn commit_config_is_the_config_of_a_checkout_of_it() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    write(
+        &r.join(".claude/settings.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command",
+              "command":"./scripts/setup.sh && sh .claude/linked/hook.sh"}]}]},
+            "statusLine":{"type":"command","command":"sh bin/status.sh"},
+            "permissions":{"allow":["Bash(*)","Read(src/**)"]},
+            "extraKnownMarketplaces":{"m":{"source":{"source":"directory","path":"./plugins"}}}}"#,
+    );
+    write(&r.join(".claude/agents/reviewer.md"), "# reviewer\n");
+    common::script(&r.join(".claude/hooks/start.sh"), "echo start");
+    std::os::unix::fs::symlink("settings.json", r.join(".claude/alias.json")).unwrap();
+    std::os::unix::fs::symlink("../shared", r.join(".claude/linked")).unwrap();
+    std::os::unix::fs::symlink("nope.json", r.join(".claude/dangling.json")).unwrap();
+    write(&r.join("shared/hook.sh"), "echo shared\n");
+    write(
+        &r.join(".mcp.json"),
+        r#"{"mcpServers":{"a":{"command":"node","args":["tools/mcp.js","--flag"]},
+            "b":{"command":"./tools/../tools/run","args":["missing.js"]}}}"#,
+    );
+    write(&r.join("tools/mcp.js"), "server\n");
+    common::script(&r.join("tools/real-run"), "exec node tools/mcp.js");
+    std::os::unix::fs::symlink("real-run", r.join("tools/run")).unwrap();
+    common::script(&r.join("scripts/setup.sh"), "echo setup");
+    write(&r.join("bin/status.sh"), "echo status\n");
+    write(&r.join("plugins/p/hooks/hooks.json"), "{}");
+    sh(r, &["add", "-A"]);
+    // A submodule entry, never initialized: an empty directory in a new worktree.
+    let head = fx.rev("HEAD");
+    sh(
+        r,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{head},.claude/sub"),
+        ],
+    );
+    sh(r, &["commit", "-q", "-m", "claude config"]);
+    let tip = fx.rev("main");
+
+    let committed = fx.git.commit_config_snapshot(r, &tip).await.unwrap();
+    let a = fx.attempt("Config").await;
+    let on_disk = git::config_snapshot(&a.wt).await.unwrap();
+    assert_eq!(committed, on_disk);
+    let paths: BTreeSet<(String, char)> = committed
+        .records
+        .iter()
+        .map(|rec| (rec.path.clone(), rec.kind))
+        .collect();
+    for (path, kind) in [
+        (".claude/alias.json", 'l'),
+        (".claude/alias.json", 'f'),
+        (".claude/dangling.json", 'l'),
+        (".claude/hooks/start.sh", 'x'),
+        (".claude/linked", 'l'),
+        (".claude/linked/hook.sh", 'f'),
+        (".claude/sub", 'd'),
+        ("scripts/setup.sh", 'x'),
+        ("bin/status.sh", 'f'),
+        ("tools/mcp.js", 'f'),
+        ("tools/real-run", 'x'),
+        ("plugins/p/hooks/hooks.json", 'f'),
+    ] {
+        assert!(
+            paths.contains(&(path.to_owned(), kind)),
+            "{path} {kind} missing from {paths:?}"
+        );
+    }
+    assert_eq!(committed.broad_allow_rules, ["Bash(*)"]);
+    assert!(committed.billing.is_empty());
+
+    // The main checkout's own files do not change what the commit is.
+    write(
+        &r.join(".claude/settings.local.json"),
+        r#"{"apiKeyHelper":"x"}"#,
+    );
+    write(&r.join("tools/mcp.js"), "edited, not committed\n");
+    let main = git::config_snapshot(r).await.unwrap();
+    assert_ne!(main.fingerprint, committed.fingerprint);
+    assert_eq!(
+        main.billing,
+        [".claude/settings.local.json imposta apiKeyHelper"]
+    );
+    assert_eq!(
+        fx.git.commit_config_snapshot(r, &tip).await.unwrap(),
+        committed
+    );
+
+    // Nothing at all: the hash of nothing, as on disk.
+    let bare = Fx::named("plain", "~/worktrees");
+    let plain = bare
+        .git
+        .commit_config_snapshot(&bare.repo, &bare.rev("HEAD"))
+        .await
+        .unwrap();
+    assert_eq!(plain.fingerprint, expected_fingerprint(&[]));
+    assert!(plain.records.is_empty());
+    fx.done();
+    bare.done();
+}
+
+/// The commit's rules are the checkout's, adapted to objects: a link out of the tree (an
+/// absolute target, `..` above the root) cannot be fingerprinted, and neither can a file the
+/// configuration runs that a committed link sends out of the tree (a checkout records it as
+/// `e`, a commit has no place on disk); link loops, more than 2000 records or 64 MiB, an
+/// unknown commit or a bad revision are errors, never a partial hash.
+#[tokio::test]
+async fn commit_config_limits_and_links() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let commit = |what: &str| {
+        sh(r, &["add", "-A"]);
+        sh(r, &["commit", "-q", "-m", what]);
+        fx.rev("HEAD")
+    };
+    let snapshot = |commit: String| {
+        let git = fx.git.clone();
+        let repo = r.clone();
+        async move { git.commit_config_snapshot(&repo, &commit).await }
+    };
+    write(&r.join(".claude/settings.json"), "{}");
+    let ok = commit("config");
+    snapshot(ok.clone()).await.unwrap();
+
+    for (name, target) in [("abs", "/etc/hosts"), ("rel", "../../outside.json")] {
+        let link = r.join(format!(".claude/{name}.json"));
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let err = snapshot(commit(name)).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{target}: {err}");
+        assert!(err.message.contains("esce dal repository"), "{err}");
+        std::fs::remove_file(&link).unwrap();
+    }
+
+    std::os::unix::fs::symlink("/usr/bin", r.join("venv")).unwrap();
+    write(
+        &r.join(".mcp.json"),
+        r#"{"mcpServers":{"v":{"command":"venv/python3"}}}"#,
+    );
+    let err = snapshot(commit("venv")).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("venv/python3"), "{err}");
+    std::fs::remove_file(r.join("venv")).unwrap();
+    std::fs::remove_file(r.join(".mcp.json")).unwrap();
+
+    std::os::unix::fs::symlink("b", r.join(".claude/a")).unwrap();
+    std::os::unix::fs::symlink("a", r.join(".claude/b")).unwrap();
+    let err = snapshot(commit("loop")).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    std::fs::remove_file(r.join(".claude/a")).unwrap();
+    std::fs::remove_file(r.join(".claude/b")).unwrap();
+    std::os::unix::fs::symlink(".", r.join(".claude/self")).unwrap();
+    let err = snapshot(commit("self")).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    std::fs::remove_file(r.join(".claude/self")).unwrap();
+
+    // `.claude` and `.claude/commands` are two of the records.
+    for i in 0..git::MAX_CONFIG_FILES - 1 {
+        write(&r.join(format!(".claude/commands/c{i}.md")), "x");
+    }
+    let err = snapshot(commit("many")).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(err.message.contains("2000"), "{err}");
+    std::fs::remove_dir_all(r.join(".claude/commands")).unwrap();
+
+    write(
+        &r.join(".claude/big.bin"),
+        vec![b'a'; git::MAX_CONFIG_BYTES as usize + 1],
+    );
+    let err = snapshot(commit("big")).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(err.message.contains("MiB"), "{err}");
+
+    let missing = "0".repeat(40);
+    assert_eq!(
+        snapshot(missing).await.unwrap_err().code,
+        ErrorCode::NotFound
+    );
+    assert_eq!(
+        snapshot("--output=x".into()).await.unwrap_err().code,
+        ErrorCode::Invalid
+    );
+    // The first commit is still readable, from its id.
+    snapshot(ok).await.unwrap();
+    fx.done();
+}
+
+/// Runs the system git in `dir` like [`sh`], with `input` on stdin.
+fn sh_stdin(dir: &Path, args: &[&str], input: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let writer = std::thread::spawn(move || stdin.write_all(&input).unwrap());
+    let out = child.wait_with_output().unwrap();
+    writer.join().unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+}
+
+/// Writes a tree object with exactly `entries` (octal mode, name, hex id), in this order and
+/// unchecked, as a crafted repository could hold it.
+fn raw_tree(repo: &Path, entries: &[(&str, &str, &str)]) -> String {
+    let mut data = Vec::new();
+    for (mode, name, oid) in entries {
+        data.extend_from_slice(format!("{mode} {name}\0").as_bytes());
+        data.extend(
+            (0..oid.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&oid[i..i + 2], 16).unwrap()),
+        );
+    }
+    sh_stdin(
+        repo,
+        &["hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+        &data,
+    )
+}
+
+/// Finding (2026-09-29 review): the CLI opens its settings by name, and a filesystem that
+/// folds case and Unicode (APFS, this Mac's) opens `.claude/Settings.json` and
+/// `.claude/ſettings.local.json` (U+017F) as `.claude/settings.json` and
+/// `.claude/settings.local.json`. A checkout parses the entry its filesystem opens under a
+/// settings name and records it under that name: its billing keys, its broad rules and the
+/// files it runs count. A commit holding a name that some filesystem could open as a
+/// configuration file's (in `.claude`, or `.Claude`, `.MCP.json` at the root) cannot be
+/// verified: which file its checkout would load depends on the volume. On a case-sensitive
+/// volume the other name is only another file, which the CLI never loads.
+#[tokio::test]
+async fn settings_under_another_name_are_what_the_cli_opens() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let settings = serde_json::json!({
+        "apiKeyHelper": "./bin/key.sh",
+        "env": {"ANTHROPIC_BASE_URL": "https://gateway.invalid", "CLAUDE_CODE_USE_BEDROCK": "1"},
+        "permissions": {"allow": ["Bash"]},
+        "hooks": {"SessionStart": [{"hooks": [{"type": "command",
+            "command": "./scripts/setup.sh"}]}]},
+    });
+    write(&r.join(".claude/Settings.json"), settings.to_string());
+    write(
+        &r.join(".claude/\u{17F}ettings.local.json"),
+        r#"{"env":{"ANTHROPIC_API_KEY":"k"}}"#,
+    );
+    common::script(&r.join("scripts/setup.sh"), "echo setup");
+    write(&r.join("bin/key.sh"), "echo key\n");
+    let folds_case = r.join(".claude/settings.json").exists();
+    let folds_unicode = r.join(".claude/settings.local.json").exists();
+
+    let s = git::config_snapshot(r).await.unwrap();
+    let paths: BTreeSet<(String, char)> = s
+        .records
+        .iter()
+        .map(|rec| (rec.path.clone(), rec.kind))
+        .collect();
+    let mut billing = Vec::new();
+    if folds_case {
+        billing.extend([
+            ".claude/settings.json imposta apiKeyHelper",
+            ".claude/settings.json imposta env.ANTHROPIC_BASE_URL",
+            ".claude/settings.json imposta env.CLAUDE_CODE_USE_BEDROCK",
+        ]);
+        assert_eq!(s.broad_allow_rules, ["Bash"]);
+        for (path, kind) in [
+            (".claude/settings.json", 'f'),
+            ("scripts/setup.sh", 'x'),
+            ("bin/key.sh", 'f'),
+        ] {
+            assert!(
+                paths.contains(&(path.to_owned(), kind)),
+                "{path} {kind} missing from {paths:?}"
+            );
+        }
+        assert!(
+            paths.iter().all(|(p, _)| p != ".claude/Settings.json"),
+            "{paths:?}"
+        );
+    } else {
+        assert!(paths.contains(&(".claude/Settings.json".to_owned(), 'f')));
+        assert!(s.broad_allow_rules.is_empty());
+    }
+    if folds_unicode {
+        billing.push(".claude/settings.local.json imposta env.ANTHROPIC_API_KEY");
+    }
+    assert_eq!(s.billing, billing, "case folds: {folds_case}");
+
+    // Committed, such names cannot be verified, whatever this volume does.
+    let commit = |what: &str| {
+        sh(r, &["add", "-A"]);
+        sh(r, &["commit", "-q", "-m", what]);
+        fx.rev("HEAD")
+    };
+    let refused = async |commit: String, named: &str| {
+        let err = fx.git.commit_config_snapshot(r, &commit).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{named}: {err}");
+        assert!(
+            err.message.contains(named) && err.message.contains("APFS"),
+            "{named}: {err}"
+        );
+    };
+    refused(commit("other case"), ".claude/Settings.json").await;
+    sh(r, &["rm", "-q", "--cached", ".claude/Settings.json"]);
+    std::fs::remove_file(r.join(".claude/Settings.json")).unwrap();
+    refused(commit("unicode"), ".claude/\u{17F}ettings.local.json").await;
+    sh(r, &["rm", "-q", "-r", "--cached", ".claude"]);
+    std::fs::remove_dir_all(r.join(".claude")).unwrap();
+    let clean = commit("no config");
+    fx.git.commit_config_snapshot(r, &clean).await.unwrap();
+
+    // At the root: `.Claude/` and `.MCP.json`, written straight into the index.
+    let blob = fx.rev("HEAD:README.md");
+    for name in [".Claude/settings.json", ".MCP.json"] {
+        sh(
+            r,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("100644,{blob},{name}"),
+            ],
+        );
+        sh(r, &["commit", "-q", "-m", name]);
+        let top = name.split('/').next().unwrap();
+        refused(fx.rev("HEAD"), top).await;
+        sh(r, &["rm", "-q", "--cached", name]);
+        sh(r, &["commit", "-q", "-m", "gone"]);
+    }
+    fx.done();
+}
+
+/// Finding (2026-09-29 review): a checkout resolves a link out of its root by its text only,
+/// never touching what it names (an automounted share, a hung volume): a file the
+/// configuration runs through such a link is its `e` record, whose content is where the path
+/// leaves the root with the rest applied as text; here the target is a directory nobody may
+/// search, which `realpath` could not get through.
+#[test]
+fn a_link_out_of_the_root_is_never_looked_at() {
+    let tmp = common::tempdir();
+    let base = tmp.path().canonicalize().unwrap();
+    let root = base.join("repo");
+    let locked = base.join("locked");
+    std::fs::create_dir_all(locked.join("inner/bin")).unwrap();
+    write(
+        &root.join(".mcp.json"),
+        r#"{"mcpServers":{"v":{"command":"venv/bin/python","args":["-m","srv"]},
+            "w":{"command":"deep/x/../y.js"}}}"#,
+    );
+    std::fs::create_dir_all(root.join("venv")).unwrap();
+    std::os::unix::fs::symlink(locked.join("inner/bin"), root.join("venv/bin")).unwrap();
+    std::os::unix::fs::symlink("../../elsewhere/far", root.join("deep")).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let got = git::config_snapshot_blocking(&root);
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let s = got.unwrap();
+    let digest = |path: &str, content: &Path| -> [u8; 32] {
+        let content = content.as_os_str().as_encoded_bytes();
+        let mut h = Sha256::new();
+        h.update(path.as_bytes());
+        h.update([0, b'e', 0]);
+        h.update(content.len().to_string().as_bytes());
+        h.update([0]);
+        h.update(content);
+        h.finalize().into()
+    };
+    let far = base.parent().unwrap().join("elsewhere/far/y.js");
+    for (path, content) in [
+        ("venv/bin/python", locked.join("inner/bin/python")),
+        ("deep/y.js", far),
+    ] {
+        let rec = s
+            .records
+            .iter()
+            .find(|rec| rec.path == path)
+            .unwrap_or_else(|| panic!("{path} missing from {:?}", s.records));
+        assert_eq!(rec.kind, 'e', "{path}");
+        assert_eq!(rec.digest, digest(path, &content), "{path}: {content:?}");
+    }
+}
+
+/// Finding (2026-09-29 review): what a crafted configuration can make a walk do is bounded,
+/// the same way every time. A word longer than `PATH_MAX` names no file and is skipped; more
+/// than `MAX_COMMAND_WORDS` path words is an error, on disk and in a commit; the trees a
+/// commit's walk reads count against `MAX_TREE_BYTES` together (one 9 MiB tree passes, two
+/// do not); a tree with a name twice cannot be verified.
+#[tokio::test]
+async fn commit_and_checkout_walks_are_bounded() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let commit = |what: &str| {
+        sh(r, &["add", "-A"]);
+        sh(r, &["commit", "-q", "-m", what]);
+        fx.rev("HEAD")
+    };
+    let hook = |command: String| {
+        serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command",
+            "command": command}]}]}})
+        .to_string()
+    };
+    let long = format!("{}/x.sh", "a".repeat(libc::PATH_MAX as usize));
+    write(&r.join(".claude/settings.json"), hook(format!("sh {long}")));
+    let s = git::config_snapshot(r).await.unwrap();
+    assert!(s.records.iter().all(|rec| !rec.path.ends_with("x.sh")));
+    fx.git
+        .commit_config_snapshot(r, &commit("long"))
+        .await
+        .unwrap();
+
+    let words: Vec<String> = (0..=git::MAX_COMMAND_WORDS)
+        .map(|i| format!("w{i}"))
+        .collect();
+    write(&r.join(".claude/settings.json"), hook(words.join(" ")));
+    let err = git::config_snapshot(r).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("4096"), "{err}");
+    let err = fx
+        .git
+        .commit_config_snapshot(r, &commit("words"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("4096"), "{err}");
+
+    // Two directories of 9 MiB each, both named by `.mcp.json`.
+    let blob = fx.rev("HEAD:README.md");
+    let big = |prefix: &str| {
+        let names: Vec<String> = (0..9 * (1 << 20) / 35)
+            .map(|i| format!("{prefix}{i:06}"))
+            .collect();
+        let entries: Vec<(&str, &str, &str)> = names
+            .iter()
+            .map(|n| ("100644", n.as_str(), blob.as_str()))
+            .collect();
+        raw_tree(r, &entries)
+    };
+    let (a, b) = (big("a"), big("b"));
+    let with_mcp = |mcp: &str| {
+        let mcp = sh_stdin(r, &["hash-object", "-w", "--stdin"], mcp.as_bytes());
+        let root = raw_tree(
+            r,
+            &[
+                ("100644", ".mcp.json", &mcp),
+                ("40000", "a", &a),
+                ("40000", "b", &b),
+            ],
+        );
+        sh(r, &["commit-tree", &root, "-m", "big trees"])
+    };
+    let one = fx
+        .git
+        .commit_config_snapshot(
+            r,
+            &with_mcp(r#"{"mcpServers":{"s":{"command":"a/a000001"}}}"#),
+        )
+        .await
+        .unwrap();
+    assert!(one.records.iter().any(|rec| rec.path == "a/a000001"));
+    let err = fx
+        .git
+        .commit_config_snapshot(
+            r,
+            &with_mcp(r#"{"mcpServers":{"s":{"command":"a/a000001","args":["b/b000001"]}}}"#),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("16 MiB"), "{err}");
+
+    let settings = sh_stdin(r, &["hash-object", "-w", "--stdin"], b"{}");
+    let claude = raw_tree(r, &[("100644", "settings.json", &settings)]);
+    let twice = raw_tree(
+        r,
+        &[("40000", ".claude", &claude), ("40000", ".claude", &claude)],
+    );
+    let twice = sh(r, &["commit-tree", &twice, "-m", "twice"]);
+    let err = fx.git.commit_config_snapshot(r, &twice).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    fx.done();
+}
+
+/// Finding (2026-09-29 review): in a partial clone, reading a missing object makes git fetch
+/// it from the promisor remote, which runs what the repository's configuration says
+/// (`remote.origin.uploadpack` here; an agent can set it with `git config` from its worktree)
+/// outside every turn. The runner never fetches (`GIT_NO_LAZY_FETCH=1` on every call): a
+/// diff, a `merge-tree`, a `worktree add` of a commit with missing objects and the
+/// configuration of that commit fail, and nothing runs. The control, plain git, runs it.
+#[tokio::test]
+async fn a_partial_clone_never_fetches_from_the_app() {
+    let fx = Fx::new();
+    let r = &fx.repo;
+    let ran = fx.dir.join("lazy-fetch-ran");
+    let url = format!("file://{}", fx.dir.join("nowhere").display());
+    let uploadpack = format!("touch '{}'; false", ran.display());
+    for (key, value) in [
+        ("extensions.partialClone", "origin"),
+        ("remote.origin.promisor", "true"),
+        ("remote.origin.url", url.as_str()),
+        ("remote.origin.uploadpack", uploadpack.as_str()),
+    ] {
+        sh(r, &["config", key, value]);
+    }
+    // A commit whose README.md and settings are objects the repository does not have, and a
+    // `main` that changed README.md too (a merge needs both contents).
+    let missing = ["1".repeat(40), "2".repeat(40)];
+    let claude = sh_stdin(
+        r,
+        &["mktree", "--missing"],
+        format!("100644 blob {}\tsettings.json\n", missing[0]).as_bytes(),
+    );
+    let tree = sh_stdin(
+        r,
+        &["mktree", "--missing"],
+        format!(
+            "100644 blob {}\tREADME.md\n040000 tree {claude}\t.claude\n",
+            missing[1]
+        )
+        .as_bytes(),
+    );
+    let evil = sh(
+        r,
+        &["commit-tree", &tree, "-p", "main", "-m", "missing objects"],
+    );
+    sh(r, &["update-ref", "refs/heads/evil", &evil]);
+    write(&r.join("README.md"), "main\n");
+    sh(r, &["commit", "-q", "-am", "main"]);
+
+    let control = std::process::Command::new("git")
+        .arg("-C")
+        .arg(r)
+        .args(["diff", "main", "evil"])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GIT_NO_LAZY_FETCH")
+        .output()
+        .unwrap();
+    assert!(!control.status.success());
+    assert!(ran.exists(), "control: plain git did not fetch lazily");
+    std::fs::remove_file(&ran).unwrap();
+
+    let read = RunOpts {
+        read_only: true,
+        ..RunOpts::default()
+    };
+    let diff = ["diff", "--no-ext-diff", "--no-textconv", "main", "evil"];
+    assert_ne!(fx.git.run(r, &diff, &read).await.unwrap().code, 0);
+    let merge = ["merge-tree", "--write-tree", "main", "evil"];
+    assert_ne!(fx.git.run(r, &merge, &read).await.unwrap().code, 0);
+    let id = atm_core::new_id();
+    let added = fx
+        .git
+        .add_worktree(
+            r,
+            &git::worktree_path(&fx.root, &id),
+            "atm/lazy",
+            &evil,
+            &id,
+        )
+        .await;
+    assert!(added.is_err(), "{added:?}");
+    let config = fx.git.commit_config_snapshot(r, &evil).await;
+    assert!(config.is_err(), "{config:?}");
+    assert!(!ran.exists(), "the app's git ran the promisor's uploadpack");
+    fx.done();
+}
+
+/// Change 1 (spec §8.9): the settings keys and `env` names that would bill the agents outside
+/// the subscription are listed, per file; a settings file that is not JSON cannot be checked
+/// and is listed too (an empty one is not); `.mcp.json`'s `env` (an MCP server's process) and a
+/// `null` helper are not.
+#[test]
+fn billing_keys_of_the_settings() {
+    let tmp = common::tempdir();
+    let root = tmp.path();
+    write(
+        &root.join(".claude/settings.json"),
+        r#"{"apiKeyHelper":"./bin/key.sh","awsCredentialExport":null,
+            "env":{"ANTHROPIC_AUTH_TOKEN":"t","CLAUDE_CODE_USE_BEDROCK":"1","OTHER":"x"}}"#,
+    );
+    write(&root.join(".claude/settings.local.json"), " \n");
+    write(
+        &root.join(".mcp.json"),
+        r#"{"mcpServers":{"s":{"command":"srv","env":{"ANTHROPIC_API_KEY":"k"}}}}"#,
+    );
+    let s = git::config_snapshot_blocking(root).unwrap();
+    assert_eq!(
+        s.billing,
+        [
+            ".claude/settings.json imposta apiKeyHelper",
+            ".claude/settings.json imposta env.ANTHROPIC_AUTH_TOKEN",
+            ".claude/settings.json imposta env.CLAUDE_CODE_USE_BEDROCK",
+        ]
+    );
+    write(&root.join(".claude/settings.local.json"), "{ \"env\": ");
+    let s = git::config_snapshot_blocking(root).unwrap();
+    assert!(
+        s.billing
+            .contains(&".claude/settings.local.json non è JSON valido (non si può controllare se fattura via API)".to_owned()),
+        "{:?}",
+        s.billing
+    );
+    // Every listed name is checked.
+    let env: serde_json::Map<String, serde_json::Value> = git::BILLING_ENV_VARS
+        .iter()
+        .map(|k| ((*k).to_owned(), "1".into()))
+        .collect();
+    let mut all = serde_json::json!({"env": env});
+    for key in git::BILLING_SETTINGS_KEYS {
+        all[key] = "x".into();
+    }
+    write(&root.join(".claude/settings.json"), all.to_string());
+    std::fs::remove_file(root.join(".claude/settings.local.json")).unwrap();
+    let s = git::config_snapshot_blocking(root).unwrap();
+    assert_eq!(
+        s.billing.len(),
+        git::BILLING_ENV_VARS.len() + git::BILLING_SETTINGS_KEYS.len()
+    );
+}
+
+/// Finding M6 #1: the files inside the checkout that the configuration runs count, found by
+/// the words of the settings' commands (hooks, `statusLine`, `apiKeyHelper`, `env`) and of
+/// every string of `.mcp.json`: editing `tools/mcp.js`, a hook script or the `apiKeyHelper`
+/// changes the fingerprint; a program on `PATH`, a path out of the root or a word naming
+/// nothing adds nothing; a path inside the root that a link sends out of it is recorded by
+/// where it leads; a marketplace directory is walked whole.
+#[test]
+fn fingerprint_covers_the_files_the_config_runs() {
+    let tmp = common::tempdir();
+    let root = tmp.path().join("repo");
+    let outside = tmp.path().join("outside");
+    write(&outside.join("python3"), "#!/bin/sh\n");
+    write(
+        &root.join(".mcp.json"),
+        r#"{"mcpServers":{"a":{"command":"node","args":["tools/mcp.js","--flag"]},
+            "b":{"command":"venv/bin/python","args":["-m","srv"]},
+            "c":{"command":"/usr/bin/env","args":["../escape.js","missing.js"]}}}"#,
+    );
+    write(
+        &root.join(".claude/settings.json"),
+        r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command",
+              "command":"\"$CLAUDE_PROJECT_DIR\"/scripts/setup.sh && ./scripts/other.sh"}]}]},
+            "statusLine":{"type":"command","command":"sh bin/status.sh"},
+            "apiKeyHelper":"./bin/key.sh",
+            "env":{"NODE_OPTIONS":"--require=./tools/preload.js"},
+            "extraKnownMarketplaces":{"m":{"source":{"source":"directory","path":"./plugins"}}}}"#,
+    );
+    for file in [
+        "tools/mcp.js",
+        "tools/preload.js",
+        "scripts/setup.sh",
+        "scripts/other.sh",
+        "bin/status.sh",
+        "bin/key.sh",
+        "plugins/p/hooks/hooks.json",
+        "src/not-named.rs",
+    ] {
+        write(&root.join(file), "v1\n");
+    }
+    write(&tmp.path().join("escape.js"), "out of the root\n");
+    std::fs::create_dir_all(root.join("venv/bin")).unwrap();
+    std::os::unix::fs::symlink(outside.join("python3"), root.join("venv/bin/python")).unwrap();
+
+    let snapshot = git::config_snapshot_blocking(&root).unwrap();
+    let paths: BTreeSet<(String, char)> = snapshot
+        .records
+        .iter()
+        .map(|r| (r.path.clone(), r.kind))
+        .collect();
+    for (path, kind) in [
+        ("tools/mcp.js", 'f'),
+        ("tools/preload.js", 'f'),
+        ("scripts/setup.sh", 'f'),
+        ("scripts/other.sh", 'f'),
+        ("bin/status.sh", 'f'),
+        ("bin/key.sh", 'f'),
+        ("plugins", 'd'),
+        ("plugins/p/hooks/hooks.json", 'f'),
+        ("venv/bin/python", 'e'),
+    ] {
+        assert!(
+            paths.contains(&(path.to_owned(), kind)),
+            "{path} {kind} missing from {paths:?}"
+        );
+    }
+    for path in ["src/not-named.rs", "missing.js", "node", "escape.js"] {
+        assert!(
+            paths.iter().all(|(p, _)| !p.ends_with(path)),
+            "{path} recorded: {paths:?}"
+        );
+    }
+    let base = snapshot.fingerprint.clone();
+    let mut seen = BTreeSet::from([base.clone()]);
+    for file in [
+        "tools/mcp.js",
+        "tools/preload.js",
+        "scripts/setup.sh",
+        "bin/key.sh",
+        "plugins/p/hooks/hooks.json",
+    ] {
+        write(&root.join(file), "v2 (the agent's)\n");
+        let now = fingerprint(&root).unwrap();
+        assert!(
+            seen.insert(now),
+            "editing {file} did not change the fingerprint"
+        );
+    }
+    // Retargeting the link out of the root is seen, though what it leads to is not read.
+    write(&outside.join("python4"), "#!/bin/sh\n");
+    std::fs::remove_file(root.join("venv/bin/python")).unwrap();
+    std::os::unix::fs::symlink(outside.join("python4"), root.join("venv/bin/python")).unwrap();
+    assert!(seen.insert(fingerprint(&root).unwrap()), "retargeted link");
+    let now = fingerprint(&root).unwrap();
+    write(&root.join("src/not-named.rs"), "v2\n");
+    write(&tmp.path().join("escape.js"), "v2\n");
+    assert_eq!(
+        fingerprint(&root).unwrap(),
+        now,
+        "neither is run by the configuration"
+    );
+}
+
+/// The confirmation's summary: whole-tool and wildcard `permissions.allow` rules, extra
+/// directories and `enableAllProjectMcpServers`, from both settings files; the paths two
+/// snapshots differ in name what changed.
+#[test]
+fn config_snapshot_summary_and_differences() {
+    let tmp = common::tempdir();
+    let a = tmp.path().join("a");
+    write(
+        &a.join(".claude/settings.json"),
+        r#"{"permissions":{"allow":["Bash(npm test:*)","Bash(*)","Read(src/**)"],
+            "additionalDirectories":["../docs"]}}"#,
+    );
+    write(
+        &a.join(".claude/settings.local.json"),
+        r#"{"permissions":{"allow":["WebFetch"]},"enableAllProjectMcpServers":true}"#,
+    );
+    let s = git::config_snapshot_blocking(&a).unwrap();
+    assert_eq!(s.broad_allow_rules, ["Bash(*)", "WebFetch"]);
+    assert!(s.additional_directories && s.all_project_mcp_servers);
+
+    let b = tmp.path().join("b");
+    write(&b.join(".claude/settings.json"), "{}");
+    let t = git::config_snapshot_blocking(&b).unwrap();
+    assert!(t.broad_allow_rules.is_empty() && !t.additional_directories);
+    assert_eq!(
+        git::differing_paths(&s, &t),
+        [".claude/settings.json", ".claude/settings.local.json"]
+    );
+    assert_eq!(git::differing_paths(&s, &s), Vec::<String>::new());
+}
+
+/// Finding M6 #12: a filter driver the repository's own configuration defines never runs from
+/// the app's git (an autocommit's `add`, a `status`), nor does a `gpg` program it sets; the
+/// user's global Git LFS filter commands are kept. Tested on the parsed `git config` output.
+#[test]
+fn config_overrides_neutralize_repo_filters_only() {
+    let out = [
+        "global\0filter.lfs.clean\ngit-lfs clean -- %f",
+        "global\0filter.lfs.process\ngit-lfs filter-process",
+        "local\0filter.lfs.smudge\ngit-lfs smudge -- %f",
+        "local\0filter.evil.clean\ntouch /tmp/pwned; cat",
+        "worktree\0filter.wt.process\nsh -c evil",
+        "global\0filter.mine.clean\nmy-tool",
+        "local\0hook.pre.command\nx",
+        "global\0merge.ours.driver\ntrue",
+        "local\0gpg.program\n/tmp/evil-gpg",
+    ]
+    .join("\0")
+        + "\0";
+    let got: BTreeMap<String, String> = git::config_overrides_from(out.as_bytes())
+        .into_iter()
+        .map(|(k, v)| (k.into_string().unwrap(), v.into_string().unwrap()))
+        .collect();
+    let want: BTreeMap<String, String> = [
+        ("commit.gpgSign", "false"),
+        ("filter.evil.clean", "cat"),
+        ("filter.evil.process", ""),
+        ("filter.evil.required", "false"),
+        ("filter.evil.smudge", "cat"),
+        ("filter.wt.clean", "cat"),
+        ("filter.wt.process", ""),
+        ("filter.wt.required", "false"),
+        ("filter.wt.smudge", "cat"),
+        ("hook.pre.enabled", "false"),
+        ("merge.ours.driver", "/usr/bin/false"),
+        ("tag.gpgSign", "false"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
+    assert_eq!(got, want);
+}
+
+/// The same, end to end: a repo-local clean filter on every file never runs from the app's
+/// autocommit (`status` and `add`), and the content is committed as is.
+#[tokio::test]
+async fn autocommit_never_runs_a_repo_filter() {
+    let fx = Fx::new();
+    let marker = fx.dir.join("filter-ran");
+    sh(
+        &fx.repo,
+        &[
+            "config",
+            "filter.evil.clean",
+            &format!("touch '{}'; cat", marker.display()),
+        ],
+    );
+    sh(
+        &fx.repo,
+        &[
+            "config",
+            "filter.evil.process",
+            &format!("touch '{}'; false", marker.display()),
+        ],
+    );
+    let a = fx.attempt("Filter").await;
+    write(&a.wt.join(".gitattributes"), "* filter=evil\n");
+    write(&a.wt.join("x.txt"), "payload\n");
+    fx.git
+        .autocommit(&a.wt, "turn")
+        .await
+        .unwrap()
+        .expect("a commit");
+    assert!(!marker.exists(), "the repo's filter ran");
     fx.done();
 }

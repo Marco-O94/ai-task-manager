@@ -762,8 +762,16 @@ fn projects_are_stored_ordered_and_updated() {
         ErrorCode::NotFound
     );
 
+    let stored = db.project("a").unwrap().security();
     let p = db
-        .set_project_security("a", ConfigPolicy::Trusted, true, Some("ab12"), NOW + 2)
+        .set_project_security(
+            "a",
+            &stored,
+            ConfigPolicy::Trusted,
+            true,
+            Some("ab12"),
+            NOW + 2,
+        )
         .unwrap();
     assert_eq!(
         (
@@ -774,11 +782,49 @@ fn projects_are_stored_ordered_and_updated() {
         (ConfigPolicy::Trusted, true, Some("ab12"))
     );
     assert!(p.to_project(true).trusted);
+    // Compare-and-set: the state read before that change no longer applies.
+    let e = err(db.set_project_security(
+        "a",
+        &stored,
+        ConfigPolicy::Trusted,
+        true,
+        Some("cd34"),
+        NOW + 3,
+    ));
+    assert_eq!(e.code, ErrorCode::Conflict);
+    // Autonomo as the default mode, then the bypass revoked: reset in the same statement, and
+    // Autonomo cannot be set as the default any more.
+    let bypass_default = UpdateProjectReq {
+        id: "a".into(),
+        name: "Alfa".into(),
+        default_target_branch: "develop".into(),
+        default_permission_mode: PermissionMode::BypassPermissions,
+        default_model: None,
+    };
+    db.update_project(&bypass_default, NOW + 3).unwrap();
     let p = db
-        .set_project_security("a", ConfigPolicy::Isolated, false, None, NOW + 3)
+        .set_project_security(
+            "a",
+            &db.project("a").unwrap().security(),
+            ConfigPolicy::Isolated,
+            false,
+            None,
+            NOW + 4,
+        )
         .unwrap();
-    assert_eq!((p.trusted_fingerprint, p.updated_at), (None, NOW + 3));
-    let e = err(db.set_project_security("nope", ConfigPolicy::Isolated, false, None, NOW));
+    assert_eq!(
+        (
+            p.trusted_fingerprint,
+            p.default_permission_mode,
+            p.updated_at
+        ),
+        (None, PermissionMode::AcceptEdits, NOW + 4)
+    );
+    assert_eq!(
+        err(db.update_project(&bypass_default, NOW + 5)).code,
+        ErrorCode::Invalid
+    );
+    let e = err(db.set_project_security("nope", &stored, ConfigPolicy::Isolated, false, None, NOW));
     assert_eq!(e.code, ErrorCode::NotFound);
     assert_eq!(err(db.project("nope")).code, ErrorCode::NotFound);
 }

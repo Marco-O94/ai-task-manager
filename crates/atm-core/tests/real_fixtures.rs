@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use atm_core::normalize::{self, EntryOp, Normalizer};
 use atm_core::wire::{self, Inbound, Pending};
-use atm_types::{ApprovalDecision, Entry, EntryBody, LimitKind, ToolStatus};
+use atm_types::{ApprovalDecision, Entry, EntryBody, LimitKind, StopReason, ToolStatus};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> String {
@@ -59,7 +59,8 @@ struct Replay {
 /// Routes one captured turn like the runner (spec §7.4): messages and stream events to
 /// `on_line`, `can_use_tool` to `on_approval_requested` then the decision the host sent,
 /// cancels to `on_approval_cancelled`, control noise dropped; `finish` at the end. The worktree
-/// is the `cwd` of the turn's `system/init`.
+/// is the `cwd` of the turn's `system/init`. A turn the host interrupted (the user's Stop) gets
+/// `on_stop_requested` at the answer to the interrupt, which precedes everything it caused.
 fn replay(label: &str) -> Replay {
     let stdout = lines(&format!("{label}.stdout.jsonl"));
     let stdin = format!("{label}.stdin.jsonl");
@@ -75,6 +76,10 @@ fn replay(label: &str) -> Replay {
         .find(|v| v["type"] == "user")
         .and_then(|v| v["message"]["content"].as_str().map(str::to_owned))
         .unwrap_or_default();
+    let interrupt = lines(&stdin)
+        .into_iter()
+        .find(|v| v["request"]["subtype"] == "interrupt")
+        .and_then(|v| v["request_id"].as_str().map(str::to_owned));
     let mut n = Normalizer::new("proc-1".into(), 0, worktree);
     let mut ts = 1_000;
     let mut ops = n.on_user_message(&prompt, ts);
@@ -92,6 +97,11 @@ fn replay(label: &str) -> Replay {
             }
             Inbound::ControlCancel { request_id } => {
                 ops.extend(n.on_approval_cancelled(&format!("approval-{request_id}")));
+            }
+            Inbound::ControlResponse { request_id, .. }
+                if interrupt.as_ref() == Some(&request_id) =>
+            {
+                n.on_stop_requested(StopReason::UserStop);
             }
             Inbound::ControlResponse { .. }
             | Inbound::ControlRequest { .. }
@@ -173,11 +183,13 @@ fn outline(r: &Replay) -> String {
                 limit,
                 text,
                 num_turns,
+                stopped,
                 ..
             } => format!(
                 "TurnEnd {subtype} is_error={is_error} num_turns={num_turns:?} \
-                 denials={permission_denials} limit={limit:?} text={:?}",
-                text.as_deref().map(|t| short(t, 80))
+                 denials={permission_denials} limit={limit:?} text={:?}{}",
+                text.as_deref().map(|t| short(t, 80)),
+                stopped.map(|s| format!(" stopped={s}")).unwrap_or_default()
             ),
             other => format!("{} {other:?}", other.kind()),
         };
@@ -312,10 +324,26 @@ fn real_interrupt_ends_with_error_during_execution() {
                 .as_str()
                 .is_some_and(|t| t.starts_with("[Request interrupted by user"))
     }));
+    // M6: what the app shows of it: "Interrotto dall'utente" without the `[ede_diagnostic]`,
+    // and the approved wait the CLI rejected on the interrupt is cancelled, not failed.
+    let r = replay("checklist-3-stop");
+    let end = r.store.values().rev().find_map(|e| match &e.body {
+        EntryBody::TurnEnd { stopped, text, .. } => Some((*stopped, text.clone())),
+        _ => None,
+    });
+    assert_eq!(end, Some((Some(StopReason::UserStop), None)));
+    let wait = r.store.values().find_map(|e| match &e.body {
+        EntryBody::ToolCall {
+            summary, status, ..
+        } if summary.contains("time.sleep(41)") => Some(status.clone()),
+        _ => None,
+    });
+    assert_eq!(wait, Some(ToolStatus::Cancelled));
 }
 
-/// `git push` never asks: the `--settings` deny rule rejects it (spec §7.8), the tool fails with
-/// the CLI's denial text and the `result` lists it in `permission_denials`.
+/// `git push` never asks: the `--settings` deny rule rejects it (spec §7.8), the CLI says so with
+/// `system/permission_denied`, a `tool_result` marked `permission-rule` and the entry of
+/// `permission_denials`; the call is `Denied` (M6; `Failed` before) with the CLI's text.
 #[test]
 fn real_git_push_is_denied_by_the_rule() {
     let out = lines("push-1-git-push.stdout.jsonl");
@@ -344,11 +372,18 @@ fn real_git_push_is_denied_by_the_rule() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(push.0, ToolStatus::Failed);
+    let denial = "Permission to use Bash with command git push has been denied.";
     assert_eq!(
-        push.1,
-        "Permission to use Bash with command git push has been denied."
+        push.0,
+        ToolStatus::Denied {
+            message: denial.into()
+        }
     );
+    assert_eq!(push.1, denial);
+    assert!(out.iter().any(|v| v["subtype"] == "permission_denied"));
+    assert!(out.iter().any(|v| {
+        v["tool_result_meta"][0]["non_execution_kind"] == normalize::RULE_DENIED_KIND
+    }));
 }
 
 /// `--resume` of an unknown session (spec §7.9): exit before `initialize` is answered, the text

@@ -40,17 +40,36 @@ const EFFORTS: &[(&str, &str)] = &[
 const MODES: &[(PermissionMode, &str)] = &[
     (
         PermissionMode::Default,
-        "Supervisionato: chiede prima di ogni azione",
+        "Supervisionato: chiede quasi sempre",
     ),
     (
         PermissionMode::AcceptEdits,
-        "Auto-edit: modifica i file, chiede per i comandi",
+        "Auto-edit: approva modifiche e comandi sui file",
     ),
     (
         PermissionMode::BypassPermissions,
         "Autonomo: non chiede mai",
     ),
 ];
+
+/// What each permission mode lets the agent do without asking (spec D6; the CLI 2.1.283 as
+/// observed in M5, spec §10.2): shown under the mode's select here and in the project settings.
+pub fn mode_help(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => {
+            "Supervisionato: chiede prima di ogni modifica e di ogni comando; passano da sole solo \
+             le letture (per esempio ls)."
+        }
+        PermissionMode::AcceptEdits => {
+            "Auto-edit: approva da solo le modifiche ai file e i comandi shell che leggono o \
+             scrivono file nel worktree (per esempio printf … >> README.md); per tutto il resto \
+             chiede, come Supervisionato."
+        }
+        PermissionMode::BypassPermissions => {
+            "Autonomo: non chiede mai, esegue qualunque comando. Il worktree non è una sandbox."
+        }
+    }
+}
 
 /// Options loaded for the task when the dialog opens.
 #[derive(Clone)]
@@ -254,6 +273,12 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
                                             })
                                             .collect_view()}
                                     </SelectNative>
+                                    <p class="text-muted-foreground text-xs" data-testid="mode-help">
+                                        {move || {
+                                            mode.with(|m| m.parse::<PermissionMode>().ok())
+                                                .map(mode_help)
+                                        }}
+                                    </p>
                                 </div>
                             </div>
                         }

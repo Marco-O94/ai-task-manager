@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
@@ -168,7 +168,196 @@ fn append_prompt_names_worktree_branch_and_target() {
         text.contains("git worktree `/tmp/a b/wt` on branch `atm/7-fix` (created from `develop`)")
     );
     assert!(text.contains("Do not push"));
+    // M5 saw the model refuse a follow-up it found unrelated to a finished task (spec §13.4).
+    assert!(text.contains("The user's later messages continue this task"));
     assert!(text.ends_with("read it first and follow its conventions."));
+}
+
+/// M6: the app launched from inside a Claude Code session (a Bash tool, its terminal) inherits
+/// that session's variables; no child gets them. The user's configuration, the provider
+/// selection and another API endpoint pass unchanged (surfaced by `cloud_provider_env` and
+/// `base_url_env`).
+#[test]
+fn child_env_drops_a_parent_sessions_variables_only() {
+    let parent = [
+        ("CLAUDECODE", "1"),
+        ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+        (
+            "CLAUDE_CODE_SESSION_ID",
+            "11111111-2222-4333-8444-555555555555",
+        ),
+        ("CLAUDE_CODE_CHILD_SESSION", "1"),
+        ("CLAUDE_CODE_SESSION_ATTENDED", "1"),
+        (
+            "CLAUDE_CODE_EXECPATH",
+            "/Users/me/.local/share/claude/versions/2.1.283",
+        ),
+        ("CLAUDE_PID", "4242"),
+        ("CLAUDE_EFFORT", "high"),
+        ("CLAUDE_CODE_MESSAGING_SOCKET", "/tmp/claude-msg.sock"),
+        ("CLAUDE_CODE_MESSAGING_TOKEN", "secret-token"),
+        ("CLAUDE_CODE_SSE_PORT", "12345"),
+        ("ENABLE_IDE_INTEGRATION", "true"),
+        ("CMUX_SOCKET_PATH", "/tmp/cmux.sock"),
+        ("CMUX_CUA_SOCKET_PATH", "/tmp/cmux-cua.sock"),
+        ("CMUX_CUA_AUTH_TOKEN_FILE", "/tmp/cmux-cua.token"),
+    ];
+    let user = [
+        ("CLAUDE_CONFIG_DIR", "/Users/me/.claude-work"),
+        ("CLAUDE_CODE_MAX_OUTPUT_TOKENS", "32000"),
+        ("CLAUDE_CODE_USE_BEDROCK", "1"),
+        ("ANTHROPIC_BASE_URL", "https://gateway.invalid"),
+        ("CLAUDE_CODE_MESSAGING", "not-a-prefix-match"),
+        ("HOME", "/Users/me"),
+    ];
+    let base: Vec<_> = os_vars(&parent).into_iter().chain(os_vars(&user)).collect();
+    for allow_env_api_key in [false, true] {
+        let env = ChildEnv::new(base.clone(), "/bin".as_ref(), allow_env_api_key);
+        for (k, _) in parent {
+            assert!(claude::is_nesting_var(k), "{k}");
+            assert_eq!(env.get(k), None, "{k} reached the child");
+        }
+        for (k, v) in user {
+            assert!(!claude::is_nesting_var(k), "{k}");
+            assert_eq!(env.get(k), Some(v.as_ref()), "{k} must pass unchanged");
+        }
+    }
+    assert!(
+        claude::cloud_provider_env(&base),
+        "Bedrock is reported, not removed"
+    );
+    assert!(
+        claude::base_url_env(&base),
+        "the gateway is reported, not removed"
+    );
+    // Every listed name and prefix is exercised above.
+    for var in claude::CLAUDE_NESTING_VARS
+        .iter()
+        .chain(claude::HOST_SESSION_VARS)
+    {
+        assert!(parent.iter().any(|(k, _)| k == var), "{var} not tested");
+    }
+    for prefix in claude::CLAUDE_NESTING_PREFIXES
+        .iter()
+        .chain(claude::HOST_SESSION_PREFIXES)
+    {
+        assert!(
+            parent.iter().any(|(k, _)| k.starts_with(prefix)),
+            "{prefix} not tested"
+        );
+    }
+}
+
+/// Change 3 (2026-09-29, spec §7.2): a cmux terminal sets `NODE_OPTIONS=--require=<its file>
+/// …` for every node program and records the user's own value. No child gets cmux's: marker
+/// `0` → removed; `1` with the saved value → the user's value back; no marker → untouched
+/// (not cmux's). The markers, `CMUX_*`, never pass.
+#[test]
+fn child_env_restores_the_users_node_options_under_cmux() {
+    let cmux = "--require=/Applications/cmux.app/Contents/Resources/preload.js";
+    // (environment, NODE_OPTIONS a child gets)
+    type Case<'a> = (&'a [(&'a str, &'a str)], Option<&'a str>);
+    let cases: [Case; 5] = [
+        (
+            &[
+                ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "0"),
+                ("NODE_OPTIONS", cmux),
+            ],
+            None,
+        ),
+        (
+            &[
+                ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "1"),
+                ("CMUX_ORIGINAL_NODE_OPTIONS", "--max-old-space-size=4096"),
+                (
+                    "NODE_OPTIONS",
+                    "--require=/cmux.js --max-old-space-size=4096",
+                ),
+            ],
+            Some("--max-old-space-size=4096"),
+        ),
+        // Said to be present but not saved: nothing to restore, left as it is.
+        (
+            &[
+                ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "1"),
+                ("NODE_OPTIONS", cmux),
+            ],
+            Some(cmux),
+        ),
+        // No marker: the user's own, untouched.
+        (&[("NODE_OPTIONS", "--inspect")], Some("--inspect")),
+        // No NODE_OPTIONS at all: the saved one comes back only with the marker `1`.
+        (
+            &[
+                ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "1"),
+                ("CMUX_ORIGINAL_NODE_OPTIONS", "--trace-warnings"),
+            ],
+            Some("--trace-warnings"),
+        ),
+    ];
+    for (vars, expected) in cases {
+        for allow_env_api_key in [false, true] {
+            let env = ChildEnv::new(os_vars(vars), "/bin".as_ref(), allow_env_api_key);
+            assert_eq!(
+                env.get("NODE_OPTIONS"),
+                expected.map(OsStr::new),
+                "{vars:?}"
+            );
+            assert_eq!(env.get("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT"), None);
+            assert_eq!(env.get("CMUX_ORIGINAL_NODE_OPTIONS"), None);
+        }
+        let mut map: std::collections::BTreeMap<OsString, OsString> =
+            os_vars(vars).into_iter().collect();
+        claude::scrub_host_env(&mut map);
+        assert_eq!(
+            map.get(OsStr::new("NODE_OPTIONS")).map(OsString::as_os_str),
+            expected.map(OsStr::new),
+            "{vars:?}"
+        );
+        assert!(
+            map.keys()
+                .all(|k| !k.to_string_lossy().starts_with("CMUX_"))
+        );
+    }
+    // A later value wins, as in the rest of the environment (`extra_env` over the app's).
+    let env = ChildEnv::new(
+        os_vars(&[
+            ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "1"),
+            ("NODE_OPTIONS", cmux),
+            ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "0"),
+        ]),
+        "/bin".as_ref(),
+        false,
+    );
+    assert_eq!(env.get("NODE_OPTIONS"), None);
+}
+
+/// fake-claude records the presence of every variable the app removes (every listed name, one
+/// per prefix, the API keys): what `tests/flow.rs` and the E2E check, setting them in the app's
+/// environment, would otherwise pass without looking.
+#[test]
+fn fake_claude_records_every_removed_variable() {
+    let src = include_str!("../src/bin/fake-claude.rs");
+    let start = src.find("const RECORDED_VARS").expect("RECORDED_VARS");
+    let block = &src[start..start + src[start..].find("];").expect("end of RECORDED_VARS")];
+    let recorded: Vec<&str> = block.split('"').skip(1).step_by(2).collect();
+    for var in claude::CLAUDE_NESTING_VARS
+        .iter()
+        .chain(claude::HOST_SESSION_VARS)
+        .chain(claude::API_KEY_VARS)
+        .chain(&[claude::NODE_OPTIONS, claude::CMUX_NODE_OPTIONS_PRESENT])
+    {
+        assert!(recorded.contains(var), "{var} not in {recorded:?}");
+    }
+    for prefix in claude::CLAUDE_NESTING_PREFIXES
+        .iter()
+        .chain(claude::HOST_SESSION_PREFIXES)
+    {
+        assert!(
+            recorded.iter().any(|v| v.starts_with(prefix)),
+            "no {prefix}* in {recorded:?}"
+        );
+    }
 }
 
 // ---- child environment (spec §7.2) ----------------------------------------------------------
@@ -275,6 +464,18 @@ fn api_key_and_cloud_provider_detection() {
         "false"
     )])));
     assert!(!claude::cloud_provider_env(&os_vars(&[("PATH", "/bin")])));
+
+    // Finding (2026-09-29): another endpoint in the app's environment is surfaced, whichever
+    // of the listed names sets it; empty is unset.
+    for var in claude::BASE_URL_VARS {
+        assert!(
+            claude::base_url_env(&os_vars(&[(*var, "https://gateway.invalid")])),
+            "{var}"
+        );
+        assert!(!claude::base_url_env(&os_vars(&[(*var, "")])), "{var}");
+    }
+    assert!(claude::BASE_URL_VARS.contains(&"ANTHROPIC_BASE_URL"));
+    assert!(!claude::base_url_env(&os_vars(&[("HOME", "/x")])));
 }
 
 // ---- login-shell PATH (spec §7.2) -----------------------------------------------------------
@@ -1121,8 +1322,14 @@ impl Fixture {
             ("ANTHROPIC_AUTH_TOKEN", "token-must-not-leak"),
             ("CLAUDECODE", "1"),
             ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+            ("CLAUDE_CODE_SESSION_ID", "parent-session"),
+            ("CLAUDE_CODE_MESSAGING_TOKEN", "parent-token"),
+            ("CLAUDE_EFFORT", "max"),
+            ("CLAUDE_CONFIG_DIR", "/Users/me/.claude-work"),
             ("GIT_DIR", "/nowhere/.git"),
             ("PWD", "/somewhere/else"),
+            ("CMUX_ORIGINAL_NODE_OPTIONS_PRESENT", "0"),
+            ("NODE_OPTIONS", "--require=/nonexistent/cmux-preload.js"),
             ("FAKE_CLAUDE_RECORD", self.record.to_str().unwrap()),
         ];
         vars.extend_from_slice(extra);
@@ -1242,7 +1449,14 @@ async fn spawn_scrubs_the_environment_and_sets_pwd() {
     assert_eq!(
         call["env"],
         json!({"ANTHROPIC_API_KEY":false,"ANTHROPIC_AUTH_TOKEN":false,"CLAUDECODE":false,
-               "CLAUDE_CODE_ENTRYPOINT":false,"GIT_DIR":false})
+               "CLAUDE_CODE_ENTRYPOINT":false,"GIT_DIR":false,"CLAUDE_CODE_SESSION_ID":false,
+               "CLAUDE_CODE_CHILD_SESSION":false,"CLAUDE_CODE_SESSION_ATTENDED":false,
+               "CLAUDE_CODE_EXECPATH":false,"CLAUDE_PID":false,
+               "CLAUDE_CODE_MESSAGING_TOKEN":false,"CLAUDE_EFFORT":false,
+               "CLAUDE_CODE_SSE_PORT":false,"ENABLE_IDE_INTEGRATION":false,
+               "CMUX_SOCKET_PATH":false,"CMUX_CUA_AUTH_TOKEN_FILE":false,
+               "CMUX_ORIGINAL_NODE_OPTIONS_PRESENT":false,"NODE_OPTIONS":false,
+               "CLAUDE_CONFIG_DIR":true})
     );
     // The fake echoes the session and permission mode it was given.
     let init = turn

@@ -52,14 +52,139 @@ pub const DENY_RULES: &[&str] = &[
 
 /// API credentials removed from the child environment unless `allow_env_api_key`.
 pub const API_KEY_VARS: &[&str] = &["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"];
-/// Set by a parent Claude Code; removed so that the child never runs as a nested session.
-pub const CLAUDE_NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT"];
+/// Set by a parent Claude Code session for itself and its tools, and inherited by the app when
+/// it is launched from inside one (a Bash tool, a terminal of such a session): removed, with
+/// [`CLAUDE_NESTING_PREFIXES`], so that every child runs as a top-level session of its own.
+/// Seen in the environment of a Claude Code 2.1.x Bash tool (M6, 2026-09-28):
+/// - `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`: mark a nested CLI and carry the parent's entry
+///   point (spec §7.2);
+/// - `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_CHILD_SESSION`, `CLAUDE_CODE_SESSION_ATTENDED`: the
+///   parent's session identity and state; an agent has its own `--session-id` and nobody
+///   attending its terminal;
+/// - `CLAUDE_CODE_EXECPATH`, `CLAUDE_PID`: the parent's executable and process;
+/// - `CLAUDE_EFFORT`: the parent's effort level, which would silently become the effort of an
+///   attempt started without `--effort`.
+///
+/// Kept on purpose, being the user's configuration rather than a session's: `CLAUDE_CONFIG_DIR`,
+/// the other `CLAUDE_CODE_*` settings (e.g. `CLAUDE_CODE_MAX_OUTPUT_TOKENS`), the OAuth token
+/// variable (passthrough, see the note at the top of this file), `CLAUDE_CODE_USE_BEDROCK`/
+/// `_VERTEX`/`_FOUNDRY`, which select the provider, and the [`BASE_URL_VARS`], which send the
+/// requests elsewhere: both surfaced instead ([`cloud_provider_env`], [`base_url_env`] →
+/// `EnvStatus` → billing banners).
+pub const CLAUDE_NESTING_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+];
+/// Prefixes of parent-session variables: `CLAUDE_CODE_MESSAGING_*` are the socket and the
+/// token of the parent session's messaging channel, a credential that would let an agent talk
+/// to the session that launched the app.
+pub const CLAUDE_NESTING_PREFIXES: &[&str] = &["CLAUDE_CODE_MESSAGING_"];
+/// The host that ran the parent session, inherited the same way (M6, seen in a cmux terminal
+/// and in IDE terminals, 2026-09-28), removed with [`HOST_SESSION_PREFIXES`]:
+/// - `CLAUDE_CODE_SSE_PORT`, `ENABLE_IDE_INTEGRATION`: an IDE terminal's link to its editor
+///   extension; the child `claude` would connect to that IDE, which nobody asked for.
+pub const HOST_SESSION_VARS: &[&str] = &["CLAUDE_CODE_SSE_PORT", "ENABLE_IDE_INTEGRATION"];
+/// `CMUX_*`: the cmux terminal's automation channel (`CMUX_SOCKET_PATH`, `CMUX_SOCKET`, the
+/// computer-use socket `CMUX_CUA_SOCKET_PATH` and its `CMUX_CUA_AUTH_TOKEN_FILE`, surface and
+/// workspace ids, its hook binary): a ready-made path for an agent to drive the terminal and
+/// the screen, native confirmation dialogs included.
+pub const HOST_SESSION_PREFIXES: &[&str] = &["CMUX_"];
 /// A truthy value of any of these selects a third-party provider.
 pub const CLOUD_PROVIDER_VARS: &[&str] = &[
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
 ];
+/// Another endpoint for the CLI's requests: `ANTHROPIC_BASE_URL` (a proxy or a gateway, which
+/// receives every request with the user's subscription credentials and may bill its own way;
+/// `system/init` still says `apiKeySource: "none"`, so the runtime stop never sees it) and a
+/// provider's (`ANTHROPIC_BEDROCK_BASE_URL`, `_VERTEX_`, `_FOUNDRY_`, used with that provider).
+/// In the app's environment they are the user's configuration: kept, like
+/// [`CLOUD_PROVIDER_VARS`], and surfaced ([`base_url_env`] → `EnvStatus::base_url_env` →
+/// billing banner, spec §7.2). In a repository's settings they are never approved (spec §8.9).
+pub const BASE_URL_VARS: &[&str] = &[
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+];
+
+/// A variable of a parent Claude Code session or of its host ([`CLAUDE_NESTING_VARS`],
+/// [`CLAUDE_NESTING_PREFIXES`], [`HOST_SESSION_VARS`], [`HOST_SESSION_PREFIXES`]): never
+/// passed to a child, and removed from the app's own process at startup (the shell re-executes
+/// itself without them, so that `ps -E` of the app does not show them either).
+pub fn is_nesting_var(name: &str) -> bool {
+    CLAUDE_NESTING_VARS.contains(&name)
+        || HOST_SESSION_VARS.contains(&name)
+        || CLAUDE_NESTING_PREFIXES
+            .iter()
+            .chain(HOST_SESSION_PREFIXES)
+            .any(|p| name.starts_with(p))
+}
+
+/// `NODE_OPTIONS`, which cmux rewrites (below).
+pub const NODE_OPTIONS: &str = "NODE_OPTIONS";
+/// cmux's record of the user's own `NODE_OPTIONS`: `0` = the user had none, `1` = the user had
+/// [`CMUX_ORIGINAL_NODE_OPTIONS`].
+pub const CMUX_NODE_OPTIONS_PRESENT: &str = "CMUX_ORIGINAL_NODE_OPTIONS_PRESENT";
+/// The user's own `NODE_OPTIONS` before cmux rewrote it.
+pub const CMUX_ORIGINAL_NODE_OPTIONS: &str = "CMUX_ORIGINAL_NODE_OPTIONS";
+
+/// What becomes of `NODE_OPTIONS` without the host session ([`cmux_node_options`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NodeOptions {
+    /// As it is: not cmux's, or cmux did not say what the user had.
+    Keep,
+    /// cmux's alone: removed.
+    Remove,
+    /// Back to the user's value.
+    Restore(OsString),
+}
+
+/// A cmux terminal (seen 2026-09-29) makes every node program load its own module:
+/// `NODE_OPTIONS=--require=<cmux file> …`, the user's value (if any) saved in
+/// [`CMUX_ORIGINAL_NODE_OPTIONS`] and [`CMUX_NODE_OPTIONS_PRESENT`] saying whether there was
+/// one. The `claude` CLI is a node program: an agent started by an app launched from such a
+/// terminal would load cmux's module (its channel to the terminal, like `CMUX_*`, spec §7.2).
+/// The rule, on the environment `get` reads: marker `0` → remove `NODE_OPTIONS`; `1` with the
+/// saved value → restore it; marker absent (or anything else) → leave it untouched.
+pub fn cmux_node_options<'a>(get: impl Fn(&str) -> Option<&'a OsStr>) -> NodeOptions {
+    match get(CMUX_NODE_OPTIONS_PRESENT).map(OsStr::as_encoded_bytes) {
+        Some(b"0") => NodeOptions::Remove,
+        Some(b"1") => get(CMUX_ORIGINAL_NODE_OPTIONS)
+            .map_or(NodeOptions::Keep, |v| NodeOptions::Restore(v.to_owned())),
+        _ => NodeOptions::Keep,
+    }
+}
+
+/// The environment `env` without a parent Claude Code session and its host: every
+/// [`is_nesting_var`] removed and `NODE_OPTIONS` as the user had it before cmux
+/// ([`cmux_node_options`], decided before its markers, `CMUX_*` themselves, are removed). Used
+/// for every child (agents, `auth status`, git, `open`) and by the shell's re-execution at
+/// startup.
+pub fn scrub_host_env(env: &mut BTreeMap<OsString, OsString>) {
+    let node = cmux_node_options(|k| env.get(OsStr::new(k)).map(OsString::as_os_str));
+    env.retain(|k, _| !k.to_str().is_some_and(is_nesting_var));
+    match node {
+        NodeOptions::Keep => {}
+        NodeOptions::Remove => {
+            env.remove(OsStr::new(NODE_OPTIONS));
+        }
+        NodeOptions::Restore(value) => {
+            env.insert(NODE_OPTIONS.into(), value);
+        }
+    }
+}
+
+/// Working directory of the probes (`--version`, `auth status`, the login shell): never a
+/// repository, whose `.claude`, `.envrc` or the like must not apply outside a turn (M6).
+pub const PROBE_CWD: &str = "/";
 
 /// Name of the login script inside the cache dir (spec §7.10).
 pub const LOGIN_SCRIPT_NAME: &str = "claude-login.command";
@@ -90,25 +215,22 @@ impl std::fmt::Debug for ChildEnv {
 }
 
 impl ChildEnv {
-    /// From `base` (normally `std::env::vars_os()`): `PATH` := `path`; `LANG=en_US.UTF-8` if
-    /// absent; removes `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` (unless
-    /// `allow_env_api_key`), `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT` and the scrubbed git
-    /// variables (`git::is_scrubbed_git_var`); sets `GIT_EDITOR=true`,
-    /// `GIT_SEQUENCE_EDITOR=true`, `GIT_TERMINAL_PROMPT=0`.
+    /// From `base` (normally `std::env::vars_os()`; a later entry wins): `PATH` := `path`;
+    /// `LANG=en_US.UTF-8` if absent; removes `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`
+    /// (unless `allow_env_api_key`), the variables of a parent Claude Code session and of its
+    /// host with cmux's `NODE_OPTIONS` ([`scrub_host_env`]) and the scrubbed git variables
+    /// (`git::is_scrubbed_git_var`); sets `GIT_EDITOR=true`, `GIT_SEQUENCE_EDITOR=true`,
+    /// `GIT_TERMINAL_PROMPT=0`.
     pub fn new(
         base: impl IntoIterator<Item = (OsString, OsString)>,
         path: &OsStr,
         allow_env_api_key: bool,
     ) -> ChildEnv {
-        let removed = |k: &str| {
-            CLAUDE_NESTING_VARS.contains(&k)
-                || is_scrubbed_git_var(k)
-                || (!allow_env_api_key && API_KEY_VARS.contains(&k))
-        };
-        let mut vars: BTreeMap<OsString, OsString> = base
-            .into_iter()
-            .filter(|(k, _)| !k.to_str().is_some_and(removed))
-            .collect();
+        let removed =
+            |k: &str| is_scrubbed_git_var(k) || (!allow_env_api_key && API_KEY_VARS.contains(&k));
+        let mut vars: BTreeMap<OsString, OsString> = base.into_iter().collect();
+        scrub_host_env(&mut vars);
+        vars.retain(|k, _| !k.to_str().is_some_and(removed));
         vars.insert("PATH".into(), path.into());
         vars.entry("LANG".into())
             .or_insert_with(|| "en_US.UTF-8".into());
@@ -158,6 +280,12 @@ pub fn cloud_provider_env(base: &[(OsString, OsString)]) -> bool {
     })
 }
 
+/// The environment sends the CLI's requests to another endpoint ([`BASE_URL_VARS`], not
+/// empty).
+pub fn base_url_env(base: &[(OsString, OsString)]) -> bool {
+    any_var(base, BASE_URL_VARS, |v| !v.is_empty())
+}
+
 /// Imports `PATH` once: `$SHELL -ilc 'printf "__ATM__%s__ATM__" "$PATH"'` (stdin null,
 /// [`LOGIN_SHELL_TIMEOUT`]), text between the markers; else [`FALLBACK_PATH`] expanded.
 pub async fn login_shell_path() -> OsString {
@@ -176,6 +304,7 @@ pub async fn shell_path(shell: &Path, timeout: Duration) -> Option<String> {
     let mut cmd = Command::new(shell);
     cmd.arg("-ilc")
         .arg(format!(r#"printf "{PATH_MARKER}%s{PATH_MARKER}" "$PATH""#))
+        .current_dir(PROBE_CWD)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -294,6 +423,7 @@ pub async fn probe_version(claude: &Path, env: &ChildEnv) -> Result<String, AppE
     };
     let mut cmd = Command::new(claude);
     cmd.arg("--version")
+        .current_dir(PROBE_CWD)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -444,17 +574,19 @@ pub fn append_prompt(worktree: &Path, branch: &str, target_branch: &str) -> Stri
          on branch `{branch}` (created from `{target_branch}`). Work only inside this \
          directory. Do not push, switch or delete branches, rewrite history, or change git \
          remotes/config. The host app commits your changes automatically after each turn. \
-         If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow \
-         its conventions.",
+         The user's later messages continue this task, even once it looks done: carry out \
+         what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it \
+         first and follow its conventions.",
         worktree.display()
     )
 }
 
-/// `claude auth status --json` with `env` and [`AUTH_STATUS_TIMEOUT`] (spec §7.10); never
-/// fails: errors become `Unknown`.
+/// `claude auth status --json` with `env` and [`AUTH_STATUS_TIMEOUT`] in [`PROBE_CWD`] (spec
+/// §7.10); never fails: errors become `Unknown`.
 pub async fn auth_status(claude: &Path, env: &ChildEnv) -> AuthState {
     let mut cmd = Command::new(claude);
     cmd.args(["auth", "status", "--json"])
+        .current_dir(PROBE_CWD)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

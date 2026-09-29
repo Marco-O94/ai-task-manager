@@ -37,6 +37,17 @@ const IO_CHANNEL: usize = 64;
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
 const RESUME_FAILED_NOTICE: &str =
     "La sessione di Claude Code non si può riprendere: avvia una nuova sessione";
+/// A Trusted turn whose configuration changed while the CLI started (checked again at
+/// `system/init`), followed by the reason: that turn is stopped, `failed` (M6, spec §8.9).
+pub const CHANGED_AT_START_NOTICE: &str = "Turno fermato: la configurazione Claude del \
+    worktree è cambiata mentre Claude Code si avviava.";
+/// A turn whose `system/init` reports an API key while the passthrough is off (spec §7.6):
+/// stopped, `failed`. Followed by ` (apiKeySource: <value>)`.
+pub const API_KEY_STOP_NOTICE: &str = "Turno fermato: Claude Code userebbe una chiave API \
+    invece dell'abbonamento Claude, quindi l'uso verrebbe fatturato via API. Togli la chiave \
+    (variabile d'ambiente, apiKeyHelper o env nelle impostazioni di Claude Code) oppure, se \
+    vuoi davvero pagare via API, attiva «Passa agli agenti la chiave API dell'ambiente» nelle \
+    Impostazioni.";
 
 /// Output of the reader tasks.
 enum Io {
@@ -167,6 +178,11 @@ struct Driver {
     io_abandoned: bool,
     init_timeout: bool,
     exit_timeout: bool,
+    /// Stopped because `system/init` reported an API key ([`Turn::stop_for_api_key`]).
+    api_key_stop: bool,
+    /// Stopped because the configuration changed while the CLI started
+    /// ([`Turn::recheck_trust`]).
+    config_stop: bool,
 }
 
 impl Driver {
@@ -191,6 +207,8 @@ impl Driver {
             io_abandoned: false,
             init_timeout: false,
             exit_timeout: false,
+            api_key_stop: false,
+            config_stop: false,
         }
     }
 
@@ -429,6 +447,8 @@ impl Turn {
             spawn_error: false,
             init_timeout: d.init_timeout,
             exit_timeout: d.exit_timeout,
+            api_key_stop: d.api_key_stop,
+            config_stop: d.config_stop,
         }
     }
 
@@ -533,7 +553,11 @@ impl Turn {
             }
             Inbound::Message(line) => {
                 if let Some(session) = normalize::init_session_id(&line) {
+                    let first = !d.init_seen;
                     self.on_session(session, d);
+                    if first && !self.stop_for_api_key(&line, d).await {
+                        self.recheck_trust(d).await;
+                    }
                 }
                 let result = normalize::parse_result(&line);
                 let ops = self.normalizer.on_line(&line, now_ms());
@@ -570,6 +594,69 @@ impl Turn {
         {
             eprintln!("attempt {}: session not recorded: {e}", self.attempt_id());
         }
+    }
+
+    /// M6 (spec §8.9): a turn that loads the repository's configuration checks it again once
+    /// the CLI has loaded it (`system/init`, the first one). The check before the spawn cannot
+    /// see a change that lands between it and the CLI's start (a process an earlier turn left
+    /// running, a hook of the configuration itself). The CLI has loaded that configuration by
+    /// now (a base URL or a provider its settings just gained included) and is about to send
+    /// its first request: its group is frozen (`SIGSTOP`) while the check runs, then resumed
+    /// (`SIGCONT`) if nothing changed, else killed at once like an API-key stop (tree recorded,
+    /// `SIGKILL`): `failed`, with [`CHANGED_AT_START_NOTICE`] and the reason as Notice and
+    /// error; the next turn runs Isolated.
+    async fn recheck_trust(&mut self, d: &mut Driver) {
+        let trusted = !self.plan.argv.iter().any(|a| a == "--strict-mcp-config");
+        if !trusted {
+            return;
+        }
+        let frozen = d.exit.is_none() && claude::killpg(d.pgid, libc::SIGSTOP).is_ok();
+        let why = self
+            .inner
+            .untrusted_reason(&self.plan.git, &self.plan.ctx)
+            .await;
+        let Some(why) = why else {
+            if frozen {
+                let _ = claude::killpg(d.pgid, libc::SIGCONT);
+            }
+            return;
+        };
+        if d.exit.is_none() {
+            d.stdin = None;
+            d.enter(Step::Kill).await;
+        }
+        d.config_stop = true;
+        let text = format!("{CHANGED_AT_START_NOTICE} {why}");
+        eprintln!("attempt {}: {text}", self.attempt_id());
+        self.notice(Level::Error, &text);
+        self.error = Some(text);
+    }
+
+    /// The user's requirement (2026-09-29, spec §7.6, §10.2): agents run only on the Claude
+    /// subscription. A `system/init` whose `apiKeySource` names an API key
+    /// ([`normalize::api_key_billing`]) while the passthrough of the environment's key is off
+    /// stops the turn at once, before its first request if the kill wins the race with it
+    /// (the CLI emits `system/init` just before `system/status` `requesting`): the group is
+    /// frozen (`SIGSTOP`), its tree recorded, then killed (`SIGKILL`). The turn is `failed`
+    /// with [`API_KEY_STOP_NOTICE`]. Returns whether it stopped.
+    async fn stop_for_api_key(&mut self, line: &Value, d: &mut Driver) -> bool {
+        if self.plan.allow_api_key {
+            return false;
+        }
+        let Some(source) = normalize::api_key_billing(line) else {
+            return false;
+        };
+        if d.exit.is_none() {
+            let _ = claude::killpg(d.pgid, libc::SIGSTOP);
+            d.stdin = None;
+            d.enter(Step::Kill).await;
+        }
+        d.api_key_stop = true;
+        let text = format!("{API_KEY_STOP_NOTICE} (apiKeySource: {source})");
+        eprintln!("attempt {}: {text}", self.attempt_id());
+        self.notice(Level::Error, &text);
+        self.error = Some(text);
+        true
     }
 
     /// `result` → close stdin; the process must then exit within [`EXIT_AFTER_RESULT`].
@@ -637,6 +724,7 @@ impl Turn {
     async fn on_cmd(&mut self, cmd: Cmd, d: &mut Driver) {
         let (approval_id, decision, reply) = match cmd {
             Cmd::Stop(cause, timings) => return self.request_stop(d, cause, timings).await,
+            Cmd::Notice(level, text) => return self.notice(level, &text),
             Cmd::Respond {
                 approval_id,
                 decision,
@@ -687,7 +775,9 @@ impl Turn {
         if d.exit.is_some() {
             return;
         }
-        d.stop.get_or_insert(cause);
+        let cause = *d.stop.get_or_insert(cause);
+        // The `result` that answers the interrupt is an error only because of this stop.
+        self.normalizer.on_stop_requested(cause.stop_reason());
         d.timings = d.timings.min(timings);
         if d.ladder.is_none() {
             self.start_ladder(d).await;
@@ -806,12 +896,16 @@ impl Turn {
     }
 }
 
-/// The Notice closing a turn that did not end with its own `result`.
+/// The Notice closing a turn that did not end with its own `result` (an API-key or
+/// configuration stop has said why already).
 fn end_notice(
     outcome: &TurnOutcome,
     status: ProcessStatus,
     reason: Option<StopReason>,
 ) -> Option<(Level, String)> {
+    if outcome.api_key_stop || outcome.config_stop {
+        return None;
+    }
     let exit = match outcome.exit_code {
         Some(code) => format!("codice {code}"),
         None => "terminato da un segnale".into(),

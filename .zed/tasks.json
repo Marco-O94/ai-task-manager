@@ -3,8 +3,9 @@
 // Prerequisiti, una volta sola (vedi README): toolchain 1.97.1 con target wasm32, `cargo install trunk`
 // e `cargo install tauri-cli` alle versioni del README.
 //
-// `app (debug)` = `cargo tauri dev`: build di debug della shell + `trunk serve` della UI su :1420, con
-// ricarica a ogni salvataggio. Usa il `claude` reale (e il tuo abbonamento quando lanci un agente).
+// `app (debug)` = `cargo tauri dev`: build di debug della shell + `trunk serve --features testkit` della
+// UI su :1420 (driver di selftest/E2E inclusi ma inerti senza ATM_SELFTEST/ATM_E2E), con ricarica a ogni
+// salvataggio. Usa il `claude` reale (e il tuo abbonamento quando lanci un agente).
 //
 // `app (debug, fake-claude)` fa lo stesso ma con fake-claude al posto del CLI (ATM_CLAUDE_PATH): il
 // prompt sceglie lo scenario con `[fake:NOME]` (simple, approval, slow, hang, crash, usage_limit,
@@ -19,7 +20,12 @@
 // `UI nel browser (mock)` = solo frontend con backend finto, su :1421 (così non collide con :1420
 // di `cargo tauri dev`). `http://localhost:1421/?task=task-inreview` apre subito un pannello task.
 //
-// Non lanciare l'app mentre gira `scripts/e2e.sh`: il test apre e chiude l'app da solo.
+// `release (.app + .dmg)` = `scripts/release.sh`: `cargo tauri build` senza `testkit` (nessun driver di test
+// nel WASM, verificato con `strings`), stampa i percorsi in target/release/bundle. App non firmata (README).
+//
+// `E2E (fake-claude)` = `scripts/e2e.sh`: bundle di debug con `testkit`, tre fasi su dati temporanei
+// (percorso §12.2, reinstallazione, prestazioni con 3 flood), fino a 15 minuti; apre e chiude l'app da
+// solo, e nella fase 3 la sua finestra resta sopra le altre. Non lanciare l'app mentre gira.
 [
   {
     "label": "app (debug)",
@@ -41,6 +47,20 @@
     ],
     "cwd": "$ZED_WORKTREE_ROOT",
     "env": { "ATM_CLAUDE_PATH": "$ZED_WORKTREE_ROOT/target/debug/fake-claude" },
+    "reveal": "always",
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "release (.app + .dmg)",
+    "command": "scripts/release.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "allow_concurrent_runs": false
+  },
+  {
+    "label": "E2E (fake-claude)",
+    "command": "scripts/e2e.sh",
+    "cwd": "$ZED_WORKTREE_ROOT",
     "reveal": "always",
     "allow_concurrent_runs": false
   },

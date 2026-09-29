@@ -8,6 +8,10 @@ publish = false
 [features]
 # In-browser backend for `trunk serve --features mock` (spec D13): `ipc::mock` replaces `ipc::tauri`.
 mock = []
+# The in-app selftest and E2E drivers (`src/selftest.rs`, `src/e2e.rs`), for debug bundles only:
+# `cargo tauri dev` and `--config src-tauri/tauri.testkit.conf.json` pass it; the release WASM of
+# `cargo tauri build` never contains them (spec §11.2 M6). Ignored together with `mock`.
+testkit = []
 
 [dependencies]
 atm-types.workspace = true

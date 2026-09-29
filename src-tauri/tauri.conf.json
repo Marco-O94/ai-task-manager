@@ -3,7 +3,7 @@
   "productName": "AI Task Manager",
   "identifier": "dev.aitaskmanager.desktop",
   "build": {
-    "beforeDevCommand": { "script": "trunk serve", "cwd": "../ui", "wait": false },
+    "beforeDevCommand": { "script": "trunk serve --features testkit", "cwd": "../ui", "wait": false },
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": { "script": "trunk build --release", "cwd": "../ui" },
     "frontendDist": "../ui/dist"

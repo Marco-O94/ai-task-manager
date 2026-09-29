@@ -1,0 +1,75 @@
+---
+source: crates/atm-core/tests/normalize.rs
+expression: view(ops)
+---
+[
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 0,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_push",
+        "name": "Bash",
+        "summary": "$ git push",
+        "input": "{\"command\":\"git push\"}",
+        "status": {
+          "state": "Running"
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Typing": null
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 1,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_push",
+        "name": "Bash",
+        "summary": "$ git push",
+        "input": "{\"command\":\"git push\"}",
+        "status": {
+          "state": "Denied",
+          "message": "Permission to use Bash with command git push has been denied."
+        },
+        "output": null
+      }
+    }
+  },
+  {
+    "Upsert": {
+      "idx": 10,
+      "rev": 2,
+      "process_id": "proc-1",
+      "ts": 1000,
+      "parent_tool_use_id": null,
+      "body": {
+        "type": "ToolCall",
+        "tool_use_id": "toolu_push",
+        "name": "Bash",
+        "summary": "$ git push",
+        "input": "{\"command\":\"git push\"}",
+        "status": {
+          "state": "Denied",
+          "message": "Permission to use Bash with command git push has been denied."
+        },
+        "output": {
+          "text": "Permission to use Bash with command git push has been denied.",
+          "truncated_bytes": 0,
+          "is_error": true
+        }
+      }
+    }
+  }
+]

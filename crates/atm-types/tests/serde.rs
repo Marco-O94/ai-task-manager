@@ -48,6 +48,7 @@ fn project() -> Project {
         allow_bypass: false,
         created_at: 1,
         updated_at: 2,
+        trust_error: None,
     }
 }
 
@@ -114,6 +115,7 @@ fn env_status() -> EnvStatus {
         git_version: Some("2.54.0".into()),
         api_key_in_env: false,
         cloud_provider_env: false,
+        base_url_env: false,
         paused: Some("usage limit".into()),
         running: 1,
         max_running: 2,
@@ -180,6 +182,18 @@ fn entry_bodies() -> Vec<EntryBody> {
             permission_denials: 0,
             text: Some("fatto".into()),
             limit: Some(LimitKind::RateLimit),
+            stopped: None,
+        },
+        EntryBody::TurnEnd {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            duration_ms: Some(400),
+            num_turns: Some(1),
+            cost_usd_estimate: None,
+            permission_denials: 0,
+            text: None,
+            limit: None,
+            stopped: Some(StopReason::UserStop),
         },
         EntryBody::Notice {
             level: Level::Warn,
@@ -644,4 +658,32 @@ fn fixed_texts() {
     assert_eq!(merge_message("T", "  ", "a1"), "T\n\nATM-Attempt: a1");
     let long = merge_message("T", &"è".repeat(3000), "a1");
     assert_eq!(long.matches('è').count(), MERGE_MESSAGE_MAX_DESCRIPTION);
+}
+
+/// `TurnEnd.stopped` (M6) is optional on the wire: omitted when `None`, and a payload saved
+/// before M6 (no key) still reads back.
+#[test]
+fn turn_end_stopped_is_optional() {
+    let old = serde_json::json!({"type": "TurnEnd", "subtype": "success", "is_error": false,
+        "duration_ms": null, "num_turns": null, "cost_usd_estimate": null,
+        "permission_denials": 0, "text": null, "limit": null});
+    let body: EntryBody = serde_json::from_value(old.clone()).unwrap();
+    assert!(matches!(body, EntryBody::TurnEnd { stopped: None, .. }));
+    assert_eq!(serde_json::to_value(&body).unwrap(), old);
+    let stopped = EntryBody::TurnEnd {
+        subtype: "error_during_execution".into(),
+        is_error: true,
+        duration_ms: None,
+        num_turns: None,
+        cost_usd_estimate: None,
+        permission_denials: 0,
+        text: None,
+        limit: None,
+        stopped: Some(StopReason::AppShutdown),
+    };
+    assert_eq!(
+        serde_json::to_value(&stopped).unwrap()["stopped"],
+        "app_shutdown"
+    );
+    round_trip(&stopped);
 }

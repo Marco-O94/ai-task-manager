@@ -3,7 +3,8 @@
 
 use atm_types::{
     Entry, EntryBody, GetEntries, GetEntriesReq, Id, Level, LimitKind, NoticeAction, SendFollowUp,
-    SendFollowUpReq, ToolOutput, ToolStatus, UnsubscribeTranscript, UnsubscribeTranscriptReq,
+    SendFollowUpReq, StopReason, ToolOutput, ToolStatus, UnsubscribeTranscript,
+    UnsubscribeTranscriptReq,
 };
 use icons::{ArrowDown, Ban, Brain, Check, ChevronRight, CircleStop, Hourglass, SquareTerminal, X};
 use leptos::html;
@@ -469,6 +470,7 @@ fn entry_view(
             permission_denials,
             text,
             limit,
+            stopped,
         } => turn_end_view(
             subtype,
             *is_error,
@@ -478,6 +480,7 @@ fn entry_view(
             *permission_denials,
             text.clone(),
             *limit,
+            *stopped,
         ),
         EntryBody::Notice {
             level,
@@ -613,8 +616,11 @@ fn turn_end_view(
     denials: u32,
     text: Option<String>,
     limit: Option<LimitKind>,
+    stopped: Option<StopReason>,
 ) -> AnyView {
-    let outcome = if is_error {
+    let outcome = if let Some(reason) = stopped {
+        (BadgeVariant::Muted, stopped_label(reason).to_owned(), "")
+    } else if is_error {
         (
             BadgeVariant::Destructive,
             format!("Errore ({subtype})"),
@@ -640,9 +646,9 @@ fn turn_end_view(
         LimitKind::AuthFailure => "Accesso a Claude Code scaduto o non valido: accedi di nuovo.",
         LimitKind::Billing => "Problema di fatturazione dell'account Claude.",
     });
-    let error = is_error.then_some(()).and(text);
+    let error = (is_error && stopped.is_none()).then_some(()).and(text);
     view! {
-        <div class="flex flex-col gap-2" data-turn-end="">
+        <div class="flex flex-col gap-2" data-turn-end="" data-stopped=stopped.map(StopReason::as_str)>
             <Marker variant=MarkerVariant::Separator class="text-xs">
                 <MarkerContent class="flex flex-wrap items-center justify-center gap-1.5">
                     <Badge variant=outcome.0 class=outcome.2>{outcome.1}</Badge>
@@ -714,6 +720,23 @@ fn alert(level: Level, title: String, text: String) -> AnyView {
         </Alert>
     }
     .into_any()
+}
+
+/// Badge of a `TurnEnd` the app stopped (M6): the CLI's error text is not shown. Only the
+/// user and the app's shutdown stop a turn today; any other reason gets a generic label
+/// rather than a wrong one.
+fn stopped_label(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::UserStop => "Interrotto dall'utente",
+        StopReason::AppShutdown => "Interrotto alla chiusura dell'app",
+        StopReason::AppRestart
+        | StopReason::SpawnError
+        | StopReason::InitTimeout
+        | StopReason::ExitTimeout
+        | StopReason::Crash
+        | StopReason::AuthFailure
+        | StopReason::UsageLimit => "Interrotto",
+    }
 }
 
 /// Labels of the permission modes (spec D6).

@@ -337,13 +337,23 @@ fn Banners() -> impl IntoView {
     }
 }
 
-/// Text-only banners: billing outside the subscription, unsupported CLI, problems.
+/// Text-only banners: billing outside the subscription, another API endpoint in the
+/// environment, unsupported CLI, problems.
 fn notes(env: &EnvStatus) -> Vec<(&'static str, String)> {
     let mut notes = Vec::new();
     if let Some(via) = billed_via(env) {
         notes.push((
             "billing",
             format!("L'uso degli agenti viene fatturato via {via}, non dall'abbonamento Claude."),
+        ));
+    }
+    if env.base_url_env {
+        notes.push((
+            "base-url",
+            "L'ambiente dell'app imposta ANTHROPIC_BASE_URL (o l'endpoint di un provider \
+             cloud): gli agenti mandano le richieste, con le credenziali dell'abbonamento \
+             Claude, a quell'endpoint invece che ad Anthropic, e l'uso può essere fatturato lì."
+                .into(),
         ));
     }
     if !env.claude.supported {
@@ -429,6 +439,7 @@ mod tests {
             git_version: None,
             api_key_in_env: false,
             cloud_provider_env: false,
+            base_url_env: false,
             paused: None,
             running: 0,
             max_running: 2,
@@ -444,6 +455,13 @@ mod tests {
         assert_eq!(billed_via(&env), None);
         env.cloud_provider_env = true;
         assert!(billed_via(&env).is_some());
+        assert!(notes(&env).iter().all(|(id, _)| *id != "base-url"));
+        env.base_url_env = true;
+        assert!(
+            notes(&env)
+                .iter()
+                .any(|(id, text)| *id == "base-url" && text.contains("ANTHROPIC_BASE_URL"))
+        );
     }
 
     #[test]

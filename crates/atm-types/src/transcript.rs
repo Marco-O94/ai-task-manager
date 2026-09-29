@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Id, Millis};
+use crate::{Id, Millis, StopReason};
 
 /// One transcript row. `(attempt, idx)` is the key; `rev` grows on every upsert, and the UI
 /// applies an upsert only if its `rev` is greater than the one it holds.
@@ -64,6 +64,12 @@ pub enum EntryBody {
         permission_denials: u32,
         text: Option<String>,
         limit: Option<LimitKind>,
+        /// The app stopped the turn (`UserStop`, `AppShutdown`) and the CLI closed it with an
+        /// error `result` (M5: `error_during_execution` whose only text is an internal
+        /// `[ede_diagnostic] …`): the UI shows "Interrotto" instead of an error, and `text` is
+        /// `None`. Absent from the JSON when `None` (entries saved before M6 have no key).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stopped: Option<StopReason>,
     },
     Notice {
         level: Level,

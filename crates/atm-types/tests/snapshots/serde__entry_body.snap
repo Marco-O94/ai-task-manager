@@ -57,6 +57,18 @@ expression: entry_bodies()
     "limit": "RateLimit"
   },
   {
+    "type": "TurnEnd",
+    "subtype": "error_during_execution",
+    "is_error": true,
+    "duration_ms": 400,
+    "num_turns": 1,
+    "cost_usd_estimate": null,
+    "permission_denials": 0,
+    "text": null,
+    "limit": null,
+    "stopped": "user_stop"
+  },
+  {
     "type": "Notice",
     "level": "Warn",
     "text": "Contesto compattato",

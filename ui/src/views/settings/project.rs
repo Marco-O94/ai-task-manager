@@ -2,8 +2,9 @@
 //! (`set_project_security`; the native confirmation is the shell's, M6) and removal.
 
 use atm_types::{
-    AppError, ConfigPolicy, IdReq, ListBranches, PermissionMode, Project, ProjectIdReq,
-    RemoveProject, SetProjectSecurity, SetProjectSecurityReq, UpdateProject, UpdateProjectReq,
+    AppError, ConfigPolicy, IdReq, ListBranches, ListProjects, PermissionMode, Project,
+    ProjectIdReq, RemoveProject, SetProjectSecurity, SetProjectSecurityReq, UpdateProject,
+    UpdateProjectReq,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -15,6 +16,7 @@ use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::callout::{Callout, CalloutVariant};
 use crate::ui::input::Input;
 use crate::ui::separator::Separator;
+use crate::views::start_dialog::mode_help;
 
 /// Permission modes with their UI names (spec D6).
 const MODES: &[(&str, &str)] = &[
@@ -40,6 +42,11 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
     let model = RwSignal::new(String::new());
     let policy = RwSignal::new(String::new());
     let allow_bypass = RwSignal::new(false);
+    // The trust in effect as the backend computes it (`Project::trusted`): `Some` only while
+    // the saved policy is Trusted.
+    let trust = RwSignal::new(None::<bool>);
+    // Why the configuration cannot be checked (`Project::trust_error`).
+    let trust_error = RwSignal::new(None::<String>);
     let confirm_remove = RwSignal::new(false);
     let busy = RwSignal::new(false);
 
@@ -50,6 +57,8 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
         model.set(p.default_model.clone().unwrap_or_default());
         policy.set(p.config_policy.as_str().to_owned());
         allow_bypass.set(p.allow_bypass);
+        trust.set((p.config_policy == ConfigPolicy::Trusted).then_some(p.trusted));
+        trust_error.set(p.trust_error.clone());
     };
     Effect::new(move |_| {
         let Some(id) = ctx.project.get().filter(|_| open.get()) else {
@@ -62,6 +71,21 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
         {
             fill(&p);
         }
+        // The cached list follows project events, and an edit of `.claude/` on disk sends none:
+        // the trust in effect is read again whenever the dialog opens, for this project only.
+        let fresh = id.clone();
+        spawn_local(async move {
+            let Ok(projects) = ipc::call::<ListProjects>(&Default::default()).await else {
+                return;
+            };
+            let still = open.try_get_untracked() == Some(true)
+                && ctx.project.try_get_untracked().flatten().as_deref() == Some(fresh.as_str());
+            if let Some(p) = projects.iter().find(|p| p.id == fresh).filter(|_| still) {
+                trust.try_set((p.config_policy == ConfigPolicy::Trusted).then_some(p.trusted));
+                trust_error.try_set(p.trust_error.clone());
+            }
+            ctx.projects.try_set(projects);
+        });
         spawn_local(async move {
             match ipc::call::<ListBranches>(&ProjectIdReq { project_id: id }).await {
                 Ok(list) => {
@@ -118,6 +142,8 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
                 {
                     mode.try_set(PermissionMode::AcceptEdits.as_str().to_owned());
                 }
+                trust.try_set((p.config_policy == ConfigPolicy::Trusted).then_some(p.trusted));
+                trust_error.try_set(p.trust_error.clone());
             },
         );
     };
@@ -164,6 +190,9 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
             </div>
             <Field id="project-mode" label="Modalità predefinita">
                 <Select id="project-mode" value=mode options=owned(MODES) disabled=no_bypass />
+                <p class="text-muted-foreground text-xs">
+                    {move || mode.with(|m| m.parse::<PermissionMode>().ok()).map(mode_help)}
+                </p>
             </Field>
             <div class="flex justify-end">
                 <Button size=ButtonSize::Sm attr:disabled=move || busy.get() on:click=save_defaults>
@@ -176,22 +205,46 @@ pub(super) fn ProjectSettings(open: RwSignal<bool>) -> impl IntoView {
             <Field
                 id="project-policy"
                 label="Configurazione Claude del repository"
-                hint="Isolata: .claude/, hook e server MCP del repository non vengono caricati."
+                hint="Isolata: .claude/, .mcp.json, hook, server MCP e regole di permesso del repository non vengono caricati. Attendibile: approvi la configurazione committata sul branch target predefinito, da cui partono i worktree, e gli agenti la caricano finché resta quella; a ogni turno l'app ricontrolla .claude/, .mcp.json e i file del repository che i loro comandi eseguono nel worktree e, se sono cambiati, il turno gira Isolato. Una configurazione che farebbe fatturare gli agenti via API invece che con l'abbonamento (apiKeyHelper, chiavi, endpoint o provider in env) non si può approvare. Revocare Attendibile o la modalità Autonoma ferma i turni in corso che le usano."
             >
                 <Select id="project-policy" value=policy options=owned(POLICIES) />
             </Field>
+            {move || match trust.get() {
+                Some(true) => view! {
+                    <p class="text-muted-foreground text-xs" data-trust="trusted">
+                        "Approvata la configurazione committata sul branch target predefinito, da cui partono i nuovi worktree. I file non committati del checkout principale (per esempio .claude/settings.local.json) non contano: non arrivano nei worktree."
+                    </p>
+                }
+                .into_any(),
+                Some(false) => match trust_error.get() {
+                    Some(error) => view! {
+                        <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione non approvabile" attr:data-trust="unverifiable">
+                            {format!("La configurazione Claude del branch target non si può verificare o approvare: {error}. I turni girano Isolati finché il problema resta.")}
+                        </Callout>
+                    }
+                    .into_any(),
+                    None => view! {
+                        <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione cambiata" attr:data-trust="stale">
+                            "La configurazione Claude committata sul branch target è cambiata dopo l'approvazione: gli attempt che partono da lì girano Isolati. «Applica» con Attendibile approva quella attuale, dopo una conferma."
+                        </Callout>
+                    }
+                    .into_any(),
+                },
+                None => ().into_any(),
+            }}
             <Checkbox id="project-bypass" checked=allow_bypass>
                 "Consenti la modalità Autonoma (bypassPermissions)"
             </Checkbox>
             <Show when=move || allow_bypass.get() || policy.get() == "trusted">
                 <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Il worktree non è una sandbox">
-                    "Gli agenti possono eseguire comandi sul tuo Mac. L'app chiede una conferma prima di applicare."
+                    "Gli agenti, gli hook e i server MCP del repository girano sul tuo Mac con i tuoi permessi e possono toccare file e servizi fuori dal worktree. L'app chiede una conferma nativa prima di applicare."
                 </Callout>
             </Show>
             <div class="flex justify-end">
                 <Button
                     size=ButtonSize::Sm
                     variant=ButtonVariant::Outline
+                    attr:data-action="apply-security"
                     attr:disabled=move || busy.get()
                     on:click=save_security
                 >

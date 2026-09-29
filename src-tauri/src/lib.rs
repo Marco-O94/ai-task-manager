@@ -31,6 +31,86 @@ const LOCK_FILE: &str = "atm.lock";
 /// A quitting instance ends within `SHUTDOWN_DEADLINE + SHUTDOWN_GRACE`; this covers the rest.
 const LOCK_MARGIN: Duration = Duration::from_secs(2);
 
+/// Debug builds: the names (never the values) [`scrub_inherited_session`] removed, for the E2E.
+#[cfg(debug_assertions)]
+pub(crate) const SCRUBBED_AT_START_ENV: &str = "ATM_SCRUBBED_AT_START";
+
+/// M6 (spec §7.2, §10.2): the variables of a parent Claude Code session or of its host
+/// (`atm_core::claude::is_nesting_var`: the parent's messaging socket and token, cmux's
+/// automation sockets, …) are not only kept from the agents, they leave the app's own process:
+/// if any is set, the app re-executes itself at once (same executable, same arguments, same
+/// pid) without them. Removing them in place would not do: `ps -E` (sysctl `KERN_PROCARGS2`)
+/// shows the environment a process was *started* with, to any process of the same user, and
+/// an agent can run `ps`. `NODE_OPTIONS` becomes what the user had before a cmux terminal
+/// rewrote it (`atm_core::claude::scrub_host_env`). Called first thing in `main`, before any
+/// thread exists. If the re-exec fails the app goes on (the agents still never get them) and
+/// says so on stderr.
+pub fn scrub_inherited_session() {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::os::unix::process::CommandExt as _;
+
+    let before: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+    let mut after = before.clone();
+    atm_core::claude::scrub_host_env(&mut after);
+    if after == before {
+        return;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            eprintln!("inherited session variables kept in the app's environment: {e}");
+            return;
+        }
+    };
+    let mut args = std::env::args_os();
+    let arg0 = args.next().unwrap_or_else(|| exe.clone().into());
+    let mut cmd = std::process::Command::new(&exe);
+    cmd.arg0(arg0).args(args).env_clear().envs(&after);
+    #[cfg(debug_assertions)]
+    cmd.env(
+        SCRUBBED_AT_START_ENV,
+        before
+            .keys()
+            .filter(|k| !after.contains_key(*k))
+            .map(|k| k.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(","),
+    );
+    let e = cmd.exec();
+    eprintln!("inherited session variables kept in the app's environment: re-exec failed: {e}");
+}
+
+/// Path of the single-instance plugin's socket (tauri-plugin-single-instance 2.5.0 on macOS,
+/// without its `semver` feature): `/tmp/<identifier with . and - as _>_si.sock`.
+fn single_instance_socket(identifier: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/tmp/{}_si.sock",
+        identifier.replace(['.', '-'], "_")
+    ))
+}
+
+/// `/tmp` is shared by every account of the Mac: a socket at the plugin's path owned by
+/// another user would receive this launch's cwd and argv and make it exit 0, silently (the
+/// plugin connects before binding). Such a socket turns the single-instance check off
+/// instead, with a line on stderr (spec §10.2).
+fn foreign_socket(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = atm_core::current_uid();
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.uid() != uid => {
+            eprintln!(
+                "single instance off: {} belongs to another user (uid {})",
+                path.display(),
+                meta.uid()
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn run() {
     // A selftest or E2E run must not hand off to an instance that is already open (debug and
     // release share the socket): the plugin would exit 0 before anything was tested.
@@ -38,6 +118,9 @@ pub fn run() {
     let single_instance = !selftest::selftest_enabled() && !e2e::enabled();
     #[cfg(not(debug_assertions))]
     let single_instance = true;
+    let context = tauri::generate_context!();
+    let single_instance =
+        single_instance && !foreign_socket(&single_instance_socket(&context.config().identifier));
 
     let mut builder = tauri::Builder::default();
     if single_instance {
@@ -135,6 +218,10 @@ pub fn run() {
             #[cfg(debug_assertions)]
             e2e::debug_e2e_queue_pick,
             #[cfg(debug_assertions)]
+            e2e::debug_e2e_queue_confirm,
+            #[cfg(debug_assertions)]
+            e2e::debug_e2e_confirms,
+            #[cfg(debug_assertions)]
             e2e::debug_e2e_login_script,
             #[cfg(debug_assertions)]
             e2e::debug_e2e_record,
@@ -157,7 +244,7 @@ pub fn run() {
             #[cfg(debug_assertions)]
             e2e::debug_e2e_gatekeeper,
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building AI Task Manager");
     app.run(on_run_event);
 }
@@ -362,6 +449,23 @@ mod tests {
         assert!(!ok("http://localhost:8080/"));
         assert!(!ok("http://tauri.localhost.evil.com/"));
         assert!(!ok("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn single_instance_socket_path_and_owner() {
+        assert_eq!(
+            single_instance_socket("dev.aitaskmanager.desktop"),
+            Path::new("/tmp/dev_aitaskmanager_desktop_si.sock")
+        );
+        let dir = std::env::temp_dir().join(format!("atm-si-{}", std::process::id()));
+        create_private_dir(&dir).unwrap();
+        let mine = dir.join("mine.sock");
+        std::fs::write(&mine, "").unwrap();
+        assert!(!foreign_socket(&mine), "our own file");
+        assert!(!foreign_socket(&dir.join("missing.sock")));
+        // `/` belongs to root: what another account's socket looks like to this one.
+        assert!(foreign_socket(Path::new("/")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

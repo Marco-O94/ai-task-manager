@@ -1,0 +1,20 @@
+{
+  "build": {
+    "beforeBuildCommand": { "script": "trunk build --release --features testkit", "cwd": "../ui" }
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "AI Task Manager",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 640,
+        "visible": false,
+        "dragDropEnabled": false,
+        "backgroundThrottling": "disabled"
+      }
+    ]
+  }
+}
