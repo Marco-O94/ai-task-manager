@@ -815,8 +815,11 @@ impl Real {
                     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
                     std::fs::write(file, content).unwrap();
                 }
-                common::git(&repo, &["add", "-A"]);
-                common::git(&repo, &["commit", "-q", "-m", "project config"]);
+                // `init_repo` already made the first commit; with no files there is nothing to add.
+                if !files.is_empty() {
+                    common::git(&repo, &["add", "-A"]);
+                    common::git(&repo, &["commit", "-q", "-m", "project config"]);
+                }
             }
         }
         // Never push anywhere real: `origin` is a throwaway bare repo (step f proves it empty).

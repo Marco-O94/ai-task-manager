@@ -520,11 +520,19 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   `CLAUDE.md`); qualunque altra richiesta riceve "Nega e ferma" e fa fallire il run.
 - **Quota.** `sonnet`, effort `low`, prompt minimi, nessun retry: 8 turni reali (probe 1, checklist 5, push 1,
   isolamento 1), circa 0,15–0,25 USD l'uno nella stima del CLI.
-- **Sub-agent e allegati (round feature del 2026-09-29), non ancora eseguiti.** Quattro test verificano ciò che il
-  round ha preso dalla documentazione e dal bundle del CLI: la regola `ask` su `Agent` arriva all'app in Supervisionato,
-  Auto-edit e Autonomo (3 turni); il rifiuto oltre il limite viene rispettato (2); `CLAUDE_CODE_SUBAGENT_MODEL` vale per
-  un sub-agent senza modello proprio (1); `--add-dir` con uno spazio nel percorso (`Application Support`) è leggibile
-  (1). Sono 7 turni reali: si lanciano a parte, quando vuoi.
+- **Sub-agent e allegati (round feature del 2026-09-29): eseguiti il 2026-09-29 con il CLI 2.1.284, 4 su 4
+  passati.** Quattro test verificano ciò che il round aveva preso dalla documentazione e dal bundle del CLI:
+  - la regola `ask` su `Agent` arriva all'app in Supervisionato, Auto-edit e Autonomo (3 turni): ogni spawn è un
+    `can_use_tool` con motivo `rule`, risposto subito dall'app e mai in attesa;
+  - il rifiuto oltre il limite viene rispettato (2 turni): con limite 1 il secondo spawn è `Denied` con il testo
+    esatto, e al turno dopo `--disallowedTools=AskUserQuestion,Agent,Task,Workflow` toglie il tool Agent (il CLI
+    risponde "No such tool available: Agent");
+  - `CLAUDE_CODE_SUBAGENT_MODEL` vale per un sub-agent senza modello proprio (1 turno): agente principale su `sonnet`,
+    sub-agent su `opus`, entrambi nel `modelUsage` del turno;
+  - `--add-dir` con uno spazio nel percorso (`Application Support`) è leggibile (1 turno): l'agente legge
+    l'allegato con Read, senza approvazioni.
+
+  Sono 7 turni reali, circa 1,9 USD nella stima del CLI, sull'abbonamento. Per ripeterli:
 
   ```bash
   ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-threads=1 subagent add_dir
@@ -646,4 +654,4 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | Limite di sub-agent (round feature del 2026-09-29) | confermato con fake-claude (`[fake:subagents]`): con max 2 e 3 avvii, due concessi e contati (`subagents_used` salvato), il terzo negato con il testo per il modello, nessuna approvazione pendente (`tests/flow.rs::subagent_limit_allows_up_to_the_max_then_denies`); con 0 `Agent`, `Task` e `Workflow` vietati dal primo turno (`a_zero_limit_disallows_subagents_from_the_first_turn`); senza limite uno spawn è un'approvazione normale (`without_a_limit_a_subagent_spawn_is_an_ordinary_approval`); limite e modello controllati prima di creare il worktree (`subagent_options_are_checked_before_the_worktree`); argv senza opzioni identico (snapshot `claude__*`) | round 2026-09-29 |
 | Allegati (round feature del 2026-09-29) | confermato con fake-claude: sezione `## Attachments` nel primo prompt e `--add-dir` a ogni turno, file e log cancellati con il task e con il progetto (`tests/flow.rs::attachments_reach_the_agent_and_go_with_the_task`, `removing_the_project_removes_its_attachments_and_logs`); percorsi rifiutati, gettoni monouso e scaduti, limite di 20 senza copie orfane (`picks_outside_the_rules_are_refused`, `tokens_are_single_use_and_the_copy_checks_again`, `the_attachment_limit_removes_the_copies_it_refuses`, `staged_picks_expire_and_the_oldest_go_first`) | round 2026-09-29 |
 | Riepilogo del progetto (round feature del 2026-09-29) | confermato: file nell'ordine atteso dal tip del branch target, mai dal checkout né dalla home, segreti mascherati (nessun "secret" nel riepilogo serializzato), note per file grandi, binari, link e JSON non valido (`tests/git.rs::overview_shows_the_committed_context_in_order`, `overview_notes_what_it_does_not_show`, `overview_masks_every_secret`, `core_overview_reads_the_target_tip_and_never_home`) | round 2026-09-29 |
-| Regola `ask` su `Agent` con il CLI reale in ogni modalità, deny del limite, `CLAUDE_CODE_SUBAGENT_MODEL`, `--add-dir` con spazi | **da verificare**: test `#[ignore]` in `tests/real_cli.rs` scritti, non ancora eseguiti (sopra) | round 2026-09-29 |
+| Regola `ask` su `Agent` con il CLI reale in ogni modalità, deny del limite, `CLAUDE_CODE_SUBAGENT_MODEL`, `--add-dir` con spazi | **verificato** il 2026-09-29 con il CLI 2.1.284: 4 test `#[ignore]` di `tests/real_cli.rs` passati, 7 turni reali (sopra) | round 2026-09-29 |
