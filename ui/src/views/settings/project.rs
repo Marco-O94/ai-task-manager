@@ -16,7 +16,6 @@ use crate::ipc;
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::callout::{Callout, CalloutVariant};
 use crate::ui::input::Input;
-use crate::ui::separator::Separator;
 use crate::ui::textarea::Textarea;
 use crate::views::start_dialog::mode_help;
 
@@ -30,6 +29,8 @@ const POLICIES: &[(&str, &str)] = &[
     ("isolated", "Isolata (consigliata)"),
     ("trusted", "Attendibile"),
 ];
+/// The page's cards.
+const CARD: &str = "bg-card text-card-foreground border-border rounded-xl border shadow-xs";
 
 /// Settings of the selected project. Mounted fresh on each visit of the page (the `Layout`
 /// shows it behind a memoized `Show`), never rebuilt in place: Leptos 0.8 would keep the old
@@ -187,107 +188,111 @@ pub fn ProjectSettings() -> impl IntoView {
         }
     });
     view! {
-        <div class="mx-auto flex max-w-2xl flex-col gap-4 p-6" data-testid="project-settings">
-            <h2 class="text-lg font-semibold">"Impostazioni progetto"</h2>
-            <Field id="project-name" label="Nome">
-                <Input id="project-name" bind_value=name />
-            </Field>
-            <Field id="project-description" label="Descrizione">
-                <Textarea
-                    id="project-description"
-                    class="min-h-24"
-                    bind_value=description
-                    placeholder="A cosa serve il repository, convenzioni, link utili…"
-                />
-                <div class="text-muted-foreground flex justify-between gap-3 text-xs">
-                    <span>"Mostrata nel riepilogo del progetto."</span>
-                    <span
-                        class=move || if description_over() { "text-destructive tabular-nums" } else { "tabular-nums" }
-                        data-testid="project-description-count"
-                    >
-                        {move || format!("{}/{MAX_PROJECT_DESCRIPTION}", description_len.get())}
-                    </span>
-                </div>
-            </Field>
-            <div class="grid grid-cols-2 gap-4">
-                <Field id="project-branch" label="Branch target predefinito">
-                    <Select id="project-branch" value=branch options=branches />
-                </Field>
-                <Field id="project-model" label="Modello predefinito">
-                    <Select id="project-model" value=model options=models() />
-                </Field>
-            </div>
-            <Field id="project-mode" label="Modalità predefinita">
-                <Select id="project-mode" value=mode options=owned(MODES) disabled=no_bypass />
-                <p class="text-muted-foreground text-xs">
-                    {move || mode.with(|m| m.parse::<PermissionMode>().ok()).map(mode_help)}
-                </p>
-            </Field>
-            <div class="flex justify-end">
-                <Button
-                    size=ButtonSize::Sm
-                    attr:disabled=move || busy.get() || description_over()
-                    on:click=save_defaults
-                >
-                    "Salva il progetto"
-                </Button>
-            </div>
-
-            <Separator />
-            <h4 class="font-medium">"Sicurezza"</h4>
-            <Field
-                id="project-policy"
-                label="Configurazione Claude del repository"
-                hint="Isolata: .claude/, .mcp.json, hook, server MCP e regole di permesso del repository non vengono caricati. Attendibile: approvi la configurazione committata sul branch target predefinito, da cui partono i worktree, e gli agenti la caricano finché resta quella; a ogni turno l'app ricontrolla .claude/, .mcp.json e i file del repository che i loro comandi eseguono nel worktree e, se sono cambiati, il turno gira Isolato. Una configurazione che farebbe fatturare gli agenti via API invece che con l'abbonamento (apiKeyHelper, chiavi, endpoint o provider in env) non si può approvare. Revocare Attendibile o la modalità Autonoma ferma i turni in corso che le usano."
+        <div class="mx-auto flex max-w-2xl flex-col gap-4 px-8 py-6" data-testid="project-settings">
+            <h2 class="text-[17px] font-semibold tracking-tight">"Impostazioni progetto"</h2>
+            <Section
+                title="Progetto"
+                description="Nome, descrizione e valori predefiniti per avviare i task."
             >
-                <Select id="project-policy" value=policy options=owned(POLICIES) />
-            </Field>
-            {move || match trust.get() {
-                Some(true) => view! {
-                    <p class="text-muted-foreground text-xs" data-trust="trusted">
-                        "Approvata la configurazione committata sul branch target predefinito, da cui partono i nuovi worktree. I file non committati del checkout principale (per esempio .claude/settings.local.json) non contano: non arrivano nei worktree."
+                <Field id="project-name" label="Nome">
+                    <Input id="project-name" bind_value=name />
+                </Field>
+                <Field id="project-description" label="Descrizione">
+                    <Textarea
+                        id="project-description"
+                        class="min-h-24"
+                        bind_value=description
+                        placeholder="A cosa serve il repository, convenzioni, link utili…"
+                    />
+                    <div class="text-muted-foreground flex justify-between gap-3 text-xs">
+                        <span>"Mostrata nel riepilogo del progetto."</span>
+                        <span
+                            class=move || if description_over() { "text-destructive tabular-nums" } else { "tabular-nums" }
+                            data-testid="project-description-count"
+                        >
+                            {move || format!("{}/{MAX_PROJECT_DESCRIPTION}", description_len.get())}
+                        </span>
+                    </div>
+                </Field>
+                <div class="grid grid-cols-2 gap-4">
+                    <Field id="project-branch" label="Branch target predefinito">
+                        <Select id="project-branch" value=branch options=branches />
+                    </Field>
+                    <Field id="project-model" label="Modello predefinito">
+                        <Select id="project-model" value=model options=models() />
+                    </Field>
+                </div>
+                <Field id="project-mode" label="Modalità predefinita">
+                    <Select id="project-mode" value=mode options=owned(MODES) disabled=no_bypass />
+                    <p class="text-muted-foreground text-xs">
+                        {move || mode.with(|m| m.parse::<PermissionMode>().ok()).map(mode_help)}
                     </p>
-                }
-                .into_any(),
-                Some(false) => match trust_error.get() {
-                    Some(error) => view! {
-                        <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione non approvabile" attr:data-trust="unverifiable">
-                            {format!("La configurazione Claude del branch target non si può verificare o approvare: {error}. I turni girano Isolati finché il problema resta.")}
-                        </Callout>
-                    }
-                    .into_any(),
-                    None => view! {
-                        <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione cambiata" attr:data-trust="stale">
-                            "La configurazione Claude committata sul branch target è cambiata dopo l'approvazione: gli attempt che partono da lì girano Isolati. «Applica» con Attendibile approva quella attuale, dopo una conferma."
-                        </Callout>
-                    }
-                    .into_any(),
-                },
-                None => ().into_any(),
-            }}
-            <Checkbox id="project-bypass" checked=allow_bypass>
-                "Consenti la modalità Autonoma (bypassPermissions)"
-            </Checkbox>
-            <Show when=move || allow_bypass.get() || policy.get() == "trusted">
-                <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Il worktree non è una sandbox">
-                    "Gli agenti, gli hook e i server MCP del repository girano sul tuo Mac con i tuoi permessi e possono toccare file e servizi fuori dal worktree. L'app chiede una conferma nativa prima di applicare."
-                </Callout>
-            </Show>
-            <div class="flex justify-end">
-                <Button
-                    size=ButtonSize::Sm
-                    variant=ButtonVariant::Outline
-                    attr:data-action="apply-security"
-                    attr:disabled=move || busy.get()
-                    on:click=save_security
-                >
-                    "Applica"
-                </Button>
-            </div>
+                </Field>
+                <div class="flex justify-end">
+                    <Button
+                        size=ButtonSize::Sm
+                        attr:disabled=move || busy.get() || description_over()
+                        on:click=save_defaults
+                    >
+                        "Salva il progetto"
+                    </Button>
+                </div>
+            </Section>
 
-            <Separator />
-            <div class="flex items-center gap-3">
-                <p class="text-muted-foreground flex-1 text-xs">
+            <Section title="Sicurezza" description="Che cosa del repository caricano gli agenti.">
+                <Field
+                    id="project-policy"
+                    label="Configurazione Claude del repository"
+                    hint="Isolata: .claude/, .mcp.json, hook, server MCP e regole di permesso del repository non vengono caricati. Attendibile: approvi la configurazione committata sul branch target predefinito, da cui partono i worktree, e gli agenti la caricano finché resta quella; a ogni turno l'app ricontrolla .claude/, .mcp.json e i file del repository che i loro comandi eseguono nel worktree e, se sono cambiati, il turno gira Isolato. Una configurazione che farebbe fatturare gli agenti via API invece che con l'abbonamento (apiKeyHelper, chiavi, endpoint o provider in env) non si può approvare. Revocare Attendibile o la modalità Autonoma ferma i turni in corso che le usano."
+                >
+                    <Select id="project-policy" value=policy options=owned(POLICIES) />
+                </Field>
+                {move || match trust.get() {
+                    Some(true) => view! {
+                        <p class="text-muted-foreground text-xs" data-trust="trusted">
+                            "Approvata la configurazione committata sul branch target predefinito, da cui partono i nuovi worktree. I file non committati del checkout principale (per esempio .claude/settings.local.json) non contano: non arrivano nei worktree."
+                        </p>
+                    }
+                    .into_any(),
+                    Some(false) => match trust_error.get() {
+                        Some(error) => view! {
+                            <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione non approvabile" attr:data-trust="unverifiable">
+                                {format!("La configurazione Claude del branch target non si può verificare o approvare: {error}. I turni girano Isolati finché il problema resta.")}
+                            </Callout>
+                        }
+                        .into_any(),
+                        None => view! {
+                            <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Configurazione cambiata" attr:data-trust="stale">
+                                "La configurazione Claude committata sul branch target è cambiata dopo l'approvazione: gli attempt che partono da lì girano Isolati. «Applica» con Attendibile approva quella attuale, dopo una conferma."
+                            </Callout>
+                        }
+                        .into_any(),
+                    },
+                    None => ().into_any(),
+                }}
+                <Checkbox id="project-bypass" checked=allow_bypass>
+                    "Consenti la modalità Autonoma (bypassPermissions)"
+                </Checkbox>
+                <Show when=move || allow_bypass.get() || policy.get() == "trusted">
+                    <Callout variant=CalloutVariant::Warning class="md:mx-0" title="Il worktree non è una sandbox">
+                        "Gli agenti, gli hook e i server MCP del repository girano sul tuo Mac con i tuoi permessi e possono toccare file e servizi fuori dal worktree. L'app chiede una conferma nativa prima di applicare."
+                    </Callout>
+                </Show>
+                <div class="flex justify-end">
+                    <Button
+                        size=ButtonSize::Sm
+                        variant=ButtonVariant::Outline
+                        attr:data-action="apply-security"
+                        attr:disabled=move || busy.get()
+                        on:click=save_security
+                    >
+                        "Applica"
+                    </Button>
+                </div>
+            </Section>
+
+            <section class=format!("{CARD} flex items-center gap-3 px-5 py-4")>
+                <p class="text-muted-foreground flex-1 text-xs text-pretty">
                     "Toglie il progetto dall'app, dopo una conferma: i file del repository e i branch restano."
                 </p>
                 <Button
@@ -299,8 +304,22 @@ pub fn ProjectSettings() -> impl IntoView {
                 >
                     "Rimuovi dalla lista…"
                 </Button>
-            </div>
+            </section>
         </div>
+    }
+}
+
+/// A card of the page: title, one-line description, then its fields.
+#[component]
+fn Section(title: &'static str, description: &'static str, children: Children) -> impl IntoView {
+    view! {
+        <section class=CARD>
+            <header class="px-5 pt-4 pb-3">
+                <h3 class="text-[13px] font-semibold">{title}</h3>
+                <p class="text-muted-foreground mt-0.5 text-xs text-pretty">{description}</p>
+            </header>
+            <div class="flex flex-col gap-4 px-5 pb-5">{children()}</div>
+        </section>
     }
 }
 

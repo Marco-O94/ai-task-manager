@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use atm_types::AppError;
-use icons::X;
+use icons::{Check, Info, X};
 use leptos::prelude::*;
 
-use crate::ui::alert::{Alert, AlertDescription};
+use crate::widgets::status::FOCUS_RING;
 
 const MAX_TOASTS: usize = 4;
 const TOAST_TTL: Duration = Duration::from_secs(5);
@@ -93,12 +93,13 @@ impl Toaster {
     }
 }
 
-/// Renders the toasts of `toaster`, bottom right, above dialogs.
+/// Renders the toasts of `toaster`, bottom right, above dialogs: the kind as an icon in a
+/// tinted circle, the text, a close button.
 #[component]
 pub fn Toasts(toaster: Toaster) -> impl IntoView {
     view! {
         <div
-            class="pointer-events-none fixed right-4 bottom-4 z-[200] flex w-96 max-w-[calc(100%-2rem)] flex-col gap-2"
+            class="pointer-events-none fixed right-5 bottom-5 z-[200] flex w-80 max-w-[calc(100%-2.5rem)] flex-col gap-2"
             role="status"
             aria-live="polite"
         >
@@ -106,26 +107,37 @@ pub fn Toasts(toaster: Toaster) -> impl IntoView {
                 each=move || toaster.toasts.get()
                 key=|t| t.id
                 children=move |t| {
-                    let class = match t.kind {
-                        ToastKind::Info => "bg-background shadow-lg",
-                        ToastKind::Success => "border-success/50 bg-background shadow-lg",
-                        ToastKind::Error => "border-destructive/50 bg-background text-destructive shadow-lg",
+                    let (tone, icon) = match t.kind {
+                        ToastKind::Info => ("bg-primary/12 text-primary", view! { <Info /> }.into_any()),
+                        ToastKind::Success => {
+                            ("bg-status-done/15 text-status-done", view! { <Check /> }.into_any())
+                        }
+                        ToastKind::Error => {
+                            ("bg-status-failed/15 text-status-failed", view! { <X /> }.into_any())
+                        }
                     };
                     let id = t.id;
                     view! {
-                        <div class="pointer-events-auto" data-toast=id>
-                            <Alert class=class>
-                                <div class="flex items-start gap-2">
-                                    <AlertDescription class="flex-1 break-words">{t.text}</AlertDescription>
-                                    <button
-                                        class="text-muted-foreground hover:text-foreground"
-                                        aria-label="Chiudi"
-                                        on:click=move |_| toaster.dismiss(id)
-                                    >
-                                        <X class="size-4" />
-                                    </button>
-                                </div>
-                            </Alert>
+                        <div
+                            class="bg-popover text-popover-foreground border-border pointer-events-auto flex items-start gap-3 rounded-lg border p-3 shadow-md"
+                            data-toast=id
+                        >
+                            // The text leads the DOM (the live region, and E2E checks read the
+                            // toast's text from its start); the icon is shown first.
+                            <p class="min-w-0 flex-1 font-medium break-words">{t.text}</p>
+                            <span class=format!(
+                                "order-first mt-0.5 grid size-5 shrink-0 place-items-center rounded-full [&_svg]:size-3 {tone}",
+                            )>{icon}</span>
+                            <button
+                                type="button"
+                                class=format!(
+                                    "text-muted-foreground hover:text-foreground -mr-1 grid size-5 shrink-0 place-items-center rounded-sm [&_svg]:size-3.5 {FOCUS_RING}",
+                                )
+                                aria-label="Chiudi"
+                                on:click=move |_| toaster.dismiss(id)
+                            >
+                                <X />
+                            </button>
                         </div>
                     }
                 }

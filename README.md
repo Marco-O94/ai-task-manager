@@ -67,8 +67,8 @@ Si scelgono nel dialog Avvia (il default del progetto sta nel suo tab Impostazio
 | **Auto-edit** (default) | `acceptEdits` | Approva da solo le modifiche ai file e i comandi shell che leggono o scrivono file nel worktree (per esempio `printf … >> README.md`) e chiede per il resto |
 | Autonomo | `bypassPermissions` + `--allow-dangerously-skip-permissions` | Non chiede mai. Si abilita per progetto (tab Impostazioni del progetto, Sicurezza) con una conferma nativa; toglierlo riporta a Auto-edit la modalità predefinita |
 
-Le richieste compaiono come card nel transcript: "Consenti", "Consenti sempre (attempt)" quando il CLI propone una
-regola, "Nega", "Nega e ferma". In ogni modalità l'app passa via `--settings` regole deny per `git push`, `~/.ssh`,
+Le richieste compaiono come card nel transcript: "Approva", "Approva sempre" (per il tentativo) quando il CLI propone
+una regola, "Rifiuta", "Rifiuta e ferma". In ogni modalità l'app passa via `--settings` regole deny per `git push`, `~/.ssh`,
 `~/.aws` e i file di credenziali: una chiamata negata da una regola compare come Negato.
 
 ### Configurazione Claude del repository: Isolata o Attendibile
@@ -139,12 +139,17 @@ mouse o col focus) e il clic destro sul nome aprono lo stesso menu: **Impostazio
 lista…**. La rimozione chiede conferma: i file del repository e i branch `atm/…` restano; i worktree dell'app vengono
 salvati con un commit sul loro branch e rimossi; task, cronologia (anche i log grezzi) e allegati vengono eliminati
 dall'app. Con un agente in esecuzione nel progetto la rimozione è rifiutata ("Ferma gli agenti del progetto prima di
-rimuoverlo") e il dialog resta aperto. Il bottone in fondo alla sidebar apre **Impostazioni app**: solo le
-impostazioni generali (percorso di claude, agenti in parallelo, modello predefinito, chiave API, worktree, editor).
+rimuoverlo") e il dialog resta aperto. In fondo alla sidebar ci sono gli agenti in esecuzione nell'app contro il
+limite, la versione di Claude Code e il bottone **Impostazioni app** (anche ⌘,): solo le impostazioni generali
+(percorso di claude, agenti in parallelo, modello predefinito, chiave API, worktree, editor). Nella topbar, accanto ai
+tab, "N in attesa di approvazione" apre il primo task il cui agente aspetta una tua risposta; il tab Task mostra quanti
+task ha il progetto.
 
 **Riepilogo** (la pagina su cui si atterra):
-- **Descrizione** del progetto (si scrive nel tab Impostazioni, al massimo 10 000 caratteri) e **Stato**: task per
-  colonna, agenti attivi, branch target e commit, modello predefinito, configurazione Isolata o Attendibile.
+- In alto, il progetto: branch target e commit, configurazione Isolata o Attendibile, nome, **descrizione** (si scrive
+  nel tab Impostazioni, al massimo 10 000 caratteri), la barra dei task per colonna con i conteggi, gli agenti attivi e,
+  se un agente aspetta un'approvazione, un avviso con "Rivedi". Sotto, le card dei file e la **Configurazione agenti**
+  (modello e modalità predefiniti).
 - **Istruzioni agenti** (`CLAUDE.md`, `.claude/CLAUDE.md`, `AGENTS.md`), **Server MCP** (`.mcp.json`), **`.claude/`**
   (impostazioni, agenti, comandi, skill) e **README**, ciascuno con una nota su come arriva agli agenti: per esempio
   `CLAUDE.md` è "caricato all'avvio" solo in Attendibile, altrimenti "letto dall'agente su istruzione del prompt";
@@ -162,8 +167,9 @@ impostazioni generali (percorso di claude, agenti in parallelo, modello predefin
 - Testo semplice, senza markdown; i caratteri invisibili o bidirezionali (quelli che possono nascondere istruzioni)
   compaiono come `⟨U+202E⟩` con un badge. I file oltre 64 KiB, i binari e i symlink (mostrati come "→ target", mai
   seguiti) non si leggono. I server aggiunti con `claude mcp add` stanno in `~/.claude.json`, che l'app non legge mai:
-  qui non compaiono.
-- "Aggiorna" rilegge (non c'è cache); **Apri task (N)** passa al tab Task.
+  qui non compaiono. Dei file lunghi si vedono le prime righe, "Mostra tutto" apre il resto.
+- "Aggiorna" rilegge (non c'è cache); **Apri task (N)** passa al tab Task (**Crea il primo task** se il progetto non
+  ne ha).
 
 **Task: Kanban o Lista.** La toolbar del tab Task passa dalla kanban (trascinamento, creazione rapida in fondo alle
 colonne) a una **lista**: una tabella con Titolo, Stato, Agente (gli stessi badge delle card), Branch e Aggiornato, in

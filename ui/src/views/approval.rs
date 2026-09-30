@@ -1,5 +1,6 @@
-//! Approval card (spec §7.8, §9.2): tool, full input, reason; "Consenti", "Consenti sempre
-//! (attempt)" only if `can_remember`, "Nega", "Nega e ferma", message field. Owner: M2-UI-TASK.
+//! Approval card (spec §7.8, §9.2): tool, full input, reason; "Approva", "Approva sempre"
+//! (for the attempt) only if `can_remember`, "Rifiuta", "Rifiuta e ferma", message field.
+//! Owner: M2-UI-TASK.
 
 use atm_types::{
     ApprovalDecision, Entry, EntryBody, Id, RespondApproval, RespondApprovalReq, ToolStatus,
@@ -7,13 +8,17 @@ use atm_types::{
 use icons::ShieldQuestion;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use tw_merge::tw_merge;
 
 use crate::app::use_app;
 use crate::ipc;
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::input::Input;
 
-/// Sent with "Nega" when the message field is empty.
+/// Compact buttons of the card, with the design's focus ring (`status::FOCUS_RING`).
+const BUTTON: &str = "h-7 px-2.5 text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+
+/// Sent with "Rifiuta" when the message field is empty.
 const DEFAULT_DENY_MESSAGE: &str = "No.";
 
 /// `entry` is a `ToolCall` in `AwaitingApproval`; answers with `respond_approval`.
@@ -82,72 +87,84 @@ pub fn ApprovalCard(attempt_id: Id, #[prop(into)] entry: Signal<Entry>) -> impl 
                     <Button
                         variant=ButtonVariant::Outline
                         size=ButtonSize::Sm
+                        class=BUTTON
+                        attr:title="Approva le richieste uguali per il resto del tentativo"
                         attr:disabled=move || busy.get()
                         attr:data-action="allow-always"
                         on:click=move |_| {
                             respond(id.get_value(), ApprovalDecision::Allow { remember: true })
                         }
                     >
-                        "Consenti sempre (attempt)"
+                        "Approva sempre"
                     </Button>
                 }
             });
+            // The only coloured block of the transcript (design: amber border, soft fill).
             Some(view! {
-                <div
-                    class="border-warning bg-warning-light/40 dark:bg-warning-dark/20 flex flex-col gap-3 rounded-xl border p-4"
+                <section
+                    aria-label="Richiesta di permesso"
+                    class="border-status-waiting/40 bg-status-waiting/8 overflow-hidden rounded-lg border"
                     data-approval=approval_id.clone()
                 >
-                    <div class="flex items-start gap-2">
-                        <ShieldQuestion class="mt-0.5 size-4 shrink-0" />
-                        <div class="min-w-0">
-                            <p class="text-sm font-medium">{format!("{name} chiede l'approvazione")}</p>
-                            <p class="text-muted-foreground font-mono text-xs [overflow-wrap:anywhere]">
-                                {summary.clone()}
-                            </p>
-                        </div>
+                    <div class="flex items-center gap-2 px-3 pt-3">
+                        <ShieldQuestion class="text-status-waiting size-4 shrink-0" />
+                        <h3 class="text-[13px] font-semibold">"Richiesta di permesso"</h3>
+                        <span class="bg-background rounded-sm px-1.5 font-mono text-[11px]">{name.clone()}</span>
                     </div>
-                    {reason.clone().map(|r| view! { <p class="text-sm">"Motivo: " {r}</p> })}
-                    <pre class="bg-background max-h-80 overflow-auto rounded-md border p-2 font-mono text-xs whitespace-pre-wrap [overflow-wrap:anywhere]">
+                    <p class="text-muted-foreground px-3 pt-1.5 font-mono text-[11px] [overflow-wrap:anywhere]">
+                        {summary.clone()}
+                    </p>
+                    <pre class="bg-background mx-3 mt-2.5 max-h-80 overflow-auto rounded-md border px-3 py-2 font-mono text-[12px] leading-[18px] whitespace-pre-wrap [overflow-wrap:anywhere]">
                         {input}
                     </pre>
-                    <Input
-                        bind_value=message
-                        name="deny-message"
-                        placeholder="Messaggio per l'agente se neghi (facoltativo)"
-                        class="bg-background"
-                    />
-                    <div class="flex flex-wrap gap-2">
+                    {reason
+                        .clone()
+                        .map(|r| {
+                            view! { <p class="text-muted-foreground px-3 pt-2 text-xs">"Motivo: " {r}</p> }
+                        })}
+                    <div class="px-3 pt-3">
+                        <Input
+                            bind_value=message
+                            name="deny-message"
+                            placeholder="Messaggio per l'agente se rifiuti (facoltativo)"
+                            class="bg-background h-8 text-[13px] md:text-[13px]"
+                        />
+                    </div>
+                    <div class="flex flex-wrap items-center gap-2 p-3">
                         <Button
                             size=ButtonSize::Sm
+                            class=BUTTON
                             attr:disabled=move || busy.get()
                             attr:data-action="allow"
                             on:click=move |_| {
                                 respond(id.get_value(), ApprovalDecision::Allow { remember: false })
                             }
                         >
-                            "Consenti"
+                            "Approva"
                         </Button>
                         {remember}
                         <Button
-                            variant=ButtonVariant::Outline
+                            variant=ButtonVariant::Ghost
                             size=ButtonSize::Sm
+                            class=tw_merge!(BUTTON, "text-muted-foreground ml-auto")
                             attr:disabled=move || busy.get()
                             attr:data-action="deny"
                             on:click=move |_| deny(id.get_value(), false)
                         >
-                            "Nega"
+                            "Rifiuta"
                         </Button>
                         <Button
-                            variant=ButtonVariant::Destructive
+                            variant=ButtonVariant::Ghost
                             size=ButtonSize::Sm
+                            class=tw_merge!(BUTTON, "text-destructive hover:bg-destructive/10 hover:text-destructive")
                             attr:disabled=move || busy.get()
                             attr:data-action="deny-stop"
                             on:click=move |_| deny(id.get_value(), true)
                         >
-                            "Nega e ferma"
+                            "Rifiuta e ferma"
                         </Button>
                     </div>
-                </div>
+                </section>
             })
         })
         .flatten()

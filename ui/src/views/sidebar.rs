@@ -1,12 +1,13 @@
-//! Sidebar (projects with their menu, "Aggiungi repository", app settings, the removal
-//! confirmation) and topbar (project name and page tabs, account chip, pause banner with
-//! "Riprendi", running counter), spec §9.2. Owner: M2-UI-BOARD, UI-SHELL.
+//! Sidebar (projects with their menu, "Aggiungi repository", running meter, app settings, the
+//! removal confirmation) and topbar (project name, pending approvals and page tabs, account
+//! chip, pause banner with "Riprendi"), spec §9.2. Owner: M2-UI-BOARD, UI-SHELL.
 
 use atm_types::{
-    AddProject, AddProjectReq, AuthState, Empty, EnvStatus, GetSettings, Id, IdReq, PickRepoFolder,
-    RemoveProject, ResumeAgents,
+    AddProject, AddProjectReq, AuthState, Empty, EnvStatus, GetBoard, GetSettings, Id, IdReq,
+    PickRepoFolder, ProjectIdReq, RemoveProject, ResumeAgents, TaskCard,
 };
-use icons::{Ellipsis, FolderGit2, FolderPlus, Settings as SettingsIcon, Trash2, TriangleAlert};
+use icons::{Ellipsis, Folder, Plus, Settings2, Trash2, TriangleAlert, Zap};
+use leptos::ev;
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -22,12 +23,13 @@ use crate::ui::dialog::{
     Dialog, DialogBody, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader,
     DialogTitle,
 };
+use crate::ui::kbd::Kbd;
 use crate::ui::scroll_area::ScrollArea;
-use crate::ui::separator::Separator;
 use crate::ui::spinner::Spinner;
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
 use crate::views::settings::SettingsDialog;
-use crate::widgets::context_menu::{ContextMenu, ContextMenuItem, MenuState};
+use crate::widgets::context_menu::{ContextMenu, ContextMenuItem, ContextMenuSeparator, MenuState};
+use crate::widgets::status::{FOCUS_RING, PILL_TABLIST, Status, StatusDot, pill_tab};
 
 /// Left column, 240 px.
 #[component]
@@ -46,50 +48,87 @@ pub fn Sidebar() -> impl IntoView {
             .with(|t| t.as_ref().map(|(_, name)| actions_label(name)))
             .unwrap_or_default()
     });
+    // ⌘, opens "Impostazioni app", as in any Mac app; not over another dialog.
+    let shortcut = window_event_listener(ev::keydown, move |e| {
+        if e.meta_key() && e.key() == "," && !dialog_open() {
+            e.prevent_default();
+            settings_open.set(true);
+        }
+    });
+    on_cleanup(move || shortcut.remove());
+    let row = format!(
+        "hover:bg-accent hover:text-accent-foreground flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] font-medium transition-colors [&_svg]:size-3.5 [&_svg]:shrink-0 {FOCUS_RING}"
+    );
+    let add_class = format!("text-muted-foreground mt-1 {row}");
     view! {
-        <nav class="bg-sidenav flex w-60 shrink-0 flex-col border-r" data-view="sidebar">
-            <div class="flex h-12 shrink-0 items-center px-4 font-semibold">"AI Task Manager"</div>
-            <Separator />
-            <p class="text-muted-foreground px-4 pt-4 pb-2 text-xs font-medium tracking-wide uppercase">
-                "Progetti"
-            </p>
+        <nav
+            class="bg-sidebar text-sidebar-foreground border-sidebar-border flex w-60 shrink-0 flex-col border-r"
+            data-view="sidebar"
+        >
+            <div class="flex h-13 shrink-0 items-center gap-2.5 px-4">
+                <span class="bg-primary text-primary-foreground grid size-6 place-items-center rounded-md">
+                    <Zap class="size-3.5" />
+                </span>
+                <span class="text-[13px] font-semibold tracking-tight">"AI Task Manager"</span>
+            </div>
             <ScrollArea class="min-h-0 flex-1">
-                <ul class="flex flex-col gap-0.5 px-2" data-testid="projects">
-                    <For
-                        each=move || ctx.projects.get()
-                        key=|p| (p.id.clone(), p.name.clone())
-                        let:project
+                <div class="px-2 pt-2 pb-3">
+                    <p class="text-muted-foreground px-2 pb-1.5 text-[11px] font-medium tracking-wider uppercase">
+                        "Progetti"
+                    </p>
+                    <ul class="flex flex-col gap-0.5" data-testid="projects">
+                        <For
+                            each=move || ctx.projects.get()
+                            key=|p| (p.id.clone(), p.name.clone())
+                            let:project
+                        >
+                            <ProjectItem
+                                id=project.id
+                                name=project.name
+                                repo_path=project.repo_path
+                                menu
+                            />
+                        </For>
+                    </ul>
+                    <Show when=move || loaded.get() && ctx.projects.with(Vec::is_empty)>
+                        <p class="text-muted-foreground px-2 py-1.5 text-xs">"Nessun progetto."</p>
+                    </Show>
+                    <button
+                        type="button"
+                        class=add_class
+                        on:click=move |_| add_repository(ctx)
                     >
-                        <ProjectItem
-                            id=project.id
-                            name=project.name
-                            repo_path=project.repo_path
-                            menu
-                        />
-                    </For>
-                </ul>
-                <Show when=move || loaded.get() && ctx.projects.with(Vec::is_empty)>
-                    <p class="text-muted-foreground px-4 text-xs">"Nessun progetto."</p>
-                </Show>
+                        <Plus />
+                        "Aggiungi repository"
+                    </button>
+                </div>
             </ScrollArea>
-            <Separator />
-            <div class="flex flex-col gap-1 p-2">
-                <Button
-                    variant=ButtonVariant::Ghost
-                    class="w-full justify-start"
-                    on:click=move |_| add_repository(ctx)
-                >
-                    <FolderPlus />
-                    "Aggiungi repository"
-                </Button>
-                <Button
-                    variant=ButtonVariant::Ghost
-                    class="w-full justify-start"
-                    on:click=move |_| settings_open.set(true)
-                >
-                    <SettingsIcon />
+            <div class="border-sidebar-border flex flex-col gap-2 border-t p-3">
+                {move || {
+                    ctx.env
+                        .with(|env| env.as_ref().map(|env| (env.running, env.max_running)))
+                        .map(|(running, max)| view! { <RunningMeter running max /> })
+                }}
+                <button type="button" class=row on:click=move |_| settings_open.set(true)>
+                    <Settings2 class="text-muted-foreground" />
                     "Impostazioni app"
-                </Button>
+                    <Kbd class="border-border ml-auto border font-mono text-[10px]">"⌘,"</Kbd>
+                </button>
+                {move || {
+                    ctx.env
+                        .with(|env| env.as_ref().and_then(cli_version))
+                        .map(|(version, untested)| {
+                            view! {
+                                <p
+                                    class="text-muted-foreground px-2 text-[11px] leading-4"
+                                    title=untested.then_some("Più recente della versione testata")
+                                >
+                                    {format!("Claude Code {version}")}
+                                    {untested.then_some(" · non testata")}
+                                </p>
+                            }
+                        })
+                }}
             </div>
             <SettingsDialog open=settings_open />
             <ContextMenu state=menu.state label=menu_label>
@@ -101,9 +140,10 @@ pub fn Sidebar() -> impl IntoView {
                         }
                     }
                 >
-                    <SettingsIcon />
+                    <Settings2 />
                     "Impostazioni progetto"
                 </ContextMenuItem>
+                <ContextMenuSeparator />
                 <ContextMenuItem
                     attr:data-action="menu-remove"
                     destructive=true
@@ -122,6 +162,51 @@ pub fn Sidebar() -> impl IntoView {
             <RemoveProjectDialog />
         </nav>
     }
+}
+
+/// A dialog of the app is open.
+fn dialog_open() -> bool {
+    document()
+        .query_selector("[role=dialog][data-state=open]")
+        .ok()
+        .flatten()
+        .is_some()
+}
+
+/// "In esecuzione x/y" of the whole app (`EnvStatus.running`/`max_running`): one segment per
+/// parallel slot.
+#[component]
+fn RunningMeter(running: u32, max: u32) -> impl IntoView {
+    view! {
+        <div class="border-border bg-card/60 rounded-lg border p-2.5" data-testid="running">
+            <div class="flex items-center justify-between text-xs">
+                <span class="text-muted-foreground">"In esecuzione"</span>
+                <span class="font-mono font-semibold tabular-nums">{format!("{running}/{max}")}</span>
+            </div>
+            <div
+                class="mt-2 flex gap-1"
+                role="meter"
+                aria-label="Agenti in esecuzione"
+                aria-valuemin="0"
+                aria-valuemax=max.to_string()
+                aria-valuenow=running.min(max).to_string()
+            >
+                {(0..max)
+                    .map(|i| {
+                        let fill = if i < running { Status::Running.bg() } else { "bg-muted" };
+                        view! { <span class=format!("h-1 flex-1 rounded-full {fill}") /> }
+                    })
+                    .collect_view()}
+            </div>
+        </div>
+    }
+}
+
+/// The CLI version, and whether it is newer than the tested one.
+fn cli_version(env: &EnvStatus) -> Option<(String, bool)> {
+    let version = env.claude.version.clone()?;
+    let untested = version_newer(&version, &env.claude.tested_version);
+    Some((version, untested))
 }
 
 /// The sidebar's project menu: its state and the project it acts on, `(id, name)`.
@@ -160,17 +245,22 @@ fn ProjectItem(id: String, name: String, repo_path: String, menu: ProjectMenu) -
         let id = id.clone();
         Memo::new(move |_| ctx.project.with(|p| p.as_deref() == Some(id.as_str())))
     };
-    let class = move || {
-        if selected.get() {
-            "bg-accent text-accent-foreground w-full justify-start pr-8 font-medium"
-        } else {
-            "text-muted-foreground w-full justify-start pr-8 font-normal"
-        }
-    };
     let item = NodeRef::<html::Li>::new();
     let more = NodeRef::<html::Button>::new();
     let (id, name) = (StoredValue::new(id), StoredValue::new(name));
     let open_here = move || id.with_value(|id| menu.open_on(id));
+    let class = move || {
+        let tone = if selected.get() {
+            "bg-accent text-accent-foreground font-medium"
+        } else {
+            "text-sidebar-foreground hover:bg-accent/60 [&>svg]:text-muted-foreground"
+        };
+        // The item whose menu is open keeps a ring while the focus is in the menu.
+        let ring = if open_here() { "ring-ring ring-1" } else { "" };
+        format!(
+            "flex h-8 w-full items-center gap-2 rounded-md px-2 pr-8 text-left text-[13px] transition-colors [&>svg]:size-3.5 [&>svg]:shrink-0 {FOCUS_RING} {tone} {ring}"
+        )
+    };
     let on_context = move |ev: MouseEvent| {
         ev.prevent_default();
         // The focus comes back to the project's button.
@@ -196,26 +286,27 @@ fn ProjectItem(id: String, name: String, repo_path: String, menu: ProjectMenu) -
     };
     view! {
         <li class="group relative" node_ref=item on:contextmenu=on_context>
-            <Button
-                variant=ButtonVariant::Ghost
-                size=ButtonSize::Sm
-                class=Signal::derive(move || class().to_owned())
-                attr:title=repo_path
-                attr:data-project=name.get_value()
-                attr:aria-current=move || selected.get().then_some("true")
+            <button
+                type="button"
+                class=class
+                title=repo_path
+                data-project=name.get_value()
+                aria-current=move || selected.get().then_some("true")
                 on:click=move |_| {
                     if !selected.get_untracked() {
                         ctx.select_project(id.get_value(), ProjectView::Overview);
                     }
                 }
             >
-                <FolderGit2 />
+                <Folder />
                 <span class="truncate">{name.get_value()}</span>
-            </Button>
+            </button>
             <button
                 type="button"
                 node_ref=more
-                class="text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:ring-ring/50 absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-md opacity-0 outline-none group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-[3px] aria-expanded:opacity-100 [&_svg]:size-4"
+                class=format!(
+                    "text-muted-foreground hover:bg-accent hover:text-foreground absolute top-1/2 right-1 flex size-6 -translate-y-1/2 items-center justify-center rounded-md opacity-0 group-hover:opacity-100 focus-visible:opacity-100 aria-expanded:opacity-100 [&_svg]:size-3.5 {FOCUS_RING}",
+                )
                 data-action="project-menu"
                 aria-haspopup="menu"
                 aria-expanded=move || open_here().to_string()
@@ -305,7 +396,7 @@ fn RemoveProjectDialog() -> impl IntoView {
     };
     view! {
         <Dialog open>
-            <DialogContent class="sm:max-w-md" data_name_prefix="RemoveProjectDialog">
+            <DialogContent class="shadow-md sm:max-w-md" data_name_prefix="RemoveProjectDialog">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>{title}</DialogTitle>
@@ -381,8 +472,8 @@ pub fn add_repository(ctx: AppCtx) {
     });
 }
 
-/// Bar above the project's page: its name and path, the page tabs, the environment chips;
-/// the environment banners under it.
+/// Bar above the project's page: its name and path, the pending approvals, the page tabs, the
+/// account chip; the environment banners under it.
 #[component]
 pub fn Topbar() -> impl IntoView {
     let ctx = use_app();
@@ -392,17 +483,21 @@ pub fn Topbar() -> impl IntoView {
             .with(|ps| ps.iter().find(|p| p.id == id).cloned())
     });
     let has_project = Memo::new(move |_| ctx.project.with(Option::is_some));
+    let cards = project_cards(ctx, false);
+    let count = Signal::derive(move || cards.with(|c| c.as_ref().map(Vec::len)));
     view! {
         <div class="shrink-0" data-view="topbar">
-            <header class="flex h-12 items-center gap-3 border-b px-4">
-                <div class="flex min-w-0 flex-1 items-baseline gap-2">
+            <header class="border-border flex h-13 items-center gap-4 border-b px-5">
+                <div class="flex min-w-0 flex-1 items-baseline gap-2.5">
                     {move || {
                         project
                             .get()
                             .map(|p| {
                                 view! {
-                                    <h1 class="truncate font-semibold">{p.name}</h1>
-                                    <span class="text-muted-foreground truncate font-mono text-xs">
+                                    <h1 class="max-w-full shrink-0 truncate text-[15px] font-semibold tracking-tight">
+                                        {p.name}
+                                    </h1>
+                                    <span class="text-muted-foreground truncate font-mono text-[11px]">
                                         {p.repo_path}
                                     </span>
                                 }
@@ -411,7 +506,8 @@ pub fn Topbar() -> impl IntoView {
                 </div>
                 // Outside the closure above, which re-runs on every `refresh_projects`.
                 <Show when=move || has_project.get()>
-                    <PageTabs />
+                    <ApprovalsPill cards />
+                    <PageTabs count />
                 </Show>
                 {move || ctx.env.get().map(|env| view! { <EnvChips env /> })}
             </header>
@@ -420,10 +516,91 @@ pub fn Topbar() -> impl IntoView {
     }
 }
 
-/// Riepilogo | Task | Impostazioni of the selected project (`role=tablist`, ←/→/Home/End move
-/// and select, spec F2).
+/// The selected project's cards (`get_board`, again on each `board_version`, as the board
+/// does): the topbar's Task count and approvals pill, the Riepilogo's counts. `None` until
+/// they arrive. A failure is a toast with `report`, else only logged: the page on screen
+/// reports its own.
+pub(crate) fn project_cards(ctx: AppCtx, report: bool) -> RwSignal<Option<Vec<TaskCard>>> {
+    let cards = RwSignal::new(None);
+    let fetches = StoredValue::new(0u64);
+    let shown = StoredValue::new(None::<Id>);
+    Effect::new(move |_| {
+        ctx.board_version.track();
+        let project = ctx.project.get();
+        let seq = fetches
+            .try_update_value(|n| {
+                *n += 1;
+                *n
+            })
+            .unwrap_or_default();
+        if project != shown.get_value() {
+            shown.set_value(project.clone());
+            cards.set(None);
+        }
+        let Some(project_id) = project else {
+            return;
+        };
+        spawn_local(async move {
+            let res = ipc::call::<GetBoard>(&ProjectIdReq { project_id }).await;
+            if fetches.try_get_value() != Some(seq) {
+                return;
+            }
+            match res {
+                Ok(list) => {
+                    cards.try_set(Some(list));
+                }
+                Err(e) if report => ctx.toasts.app_error(&e),
+                Err(e) => leptos::logging::warn!("get_board: {e}"),
+            }
+        });
+    });
+    cards
+}
+
+/// "N in attesa di approvazione": opens the first task that waits, on the Task page. Built
+/// once behind a memoized `Show`; the click reads the task then.
 #[component]
-fn PageTabs() -> impl IntoView {
+fn ApprovalsPill(cards: RwSignal<Option<Vec<TaskCard>>>) -> impl IntoView {
+    let ctx = use_app();
+    let waiting = Memo::new(move |_| {
+        cards.with(|cards| {
+            let cards = cards.as_ref()?;
+            let first = cards.iter().find(|c| c.pending_approvals > 0)?;
+            let total: u32 = cards.iter().map(|c| c.pending_approvals).sum();
+            Some((total, first.task.id.clone()))
+        })
+    });
+    let open = move |_| {
+        if let Some((_, task)) = waiting.get_untracked() {
+            ctx.project_view.set(ProjectView::Tasks);
+            ctx.open_task.set(Some(task));
+        }
+    };
+    view! {
+        <Show when=move || waiting.with(Option::is_some)>
+            <button
+                type="button"
+                class=format!(
+                    "bg-status-waiting/12 text-status-waiting hover:bg-status-waiting/20 inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium whitespace-nowrap transition-colors {FOCUS_RING}",
+                )
+                title="Apri il task che attende"
+                data-action="open-waiting"
+                on:click=open
+            >
+                <StatusDot status=Status::Waiting ping=true />
+                {move || {
+                    waiting
+                        .with(|w| w.as_ref().map(|(n, _)| format!("{n} in attesa di approvazione")))
+                }}
+            </button>
+        </Show>
+    }
+}
+
+/// Riepilogo | Task | Impostazioni of the selected project (`role=tablist`, ←/→/Home/End move
+/// and select, spec F2); the Task tab shows how many tasks the project has.
+#[component]
+fn PageTabs(count: Signal<Option<usize>>) -> impl IntoView {
     let ctx = use_app();
     let keys = move |e: KeyboardEvent| {
         let all = ProjectView::ALL;
@@ -458,26 +635,34 @@ fn PageTabs() -> impl IntoView {
                 aria-selected=move || selected.get().to_string()
                 aria-controls=move || selected.get().then(|| view.page_id())
                 tabindex=move || if selected.get() { "0" } else { "-1" }
-                class=move || {
-                    if selected.get() {
-                        "bg-background text-foreground dark:bg-input/30 dark:border-input rounded-md border px-2.5 text-sm font-medium shadow-sm"
-                    } else {
-                        "text-foreground/60 hover:text-foreground rounded-md border border-transparent px-2.5 text-sm font-medium"
-                    }
-                }
+                class=move || pill_tab(selected.get())
                 on:click=move |_| ctx.project_view.set(view)
             >
                 {label}
+                {(view == ProjectView::Tasks)
+                    .then(|| {
+                        view! {
+                            {move || {
+                                count
+                                    .get()
+                                    .map(|n| {
+                                        // "Task (N)" for screen readers, as "Apri task (N)".
+                                        view! {
+                                            <span class="sr-only">" ("</span>
+                                            <span class="text-muted-foreground font-mono text-[11px] tabular-nums">
+                                                {n}
+                                            </span>
+                                            <span class="sr-only">")"</span>
+                                        }
+                                    })
+                            }}
+                        }
+                    })}
             </button>
         }
     };
     view! {
-        <div
-            role="tablist"
-            aria-label="Pagine del progetto"
-            class="bg-muted flex h-8 shrink-0 items-stretch rounded-lg p-[3px] [&>button]:focus-visible:ring-ring/50 [&>button]:outline-none [&>button]:focus-visible:ring-[3px]"
-            on:keydown=keys
-        >
+        <div role="tablist" aria-label="Pagine del progetto" class=PILL_TABLIST on:keydown=keys>
             {tab(ProjectView::Overview, "Riepilogo")}
             {tab(ProjectView::Tasks, "Task")}
             {tab(ProjectView::Settings, "Impostazioni")}
@@ -485,32 +670,21 @@ fn PageTabs() -> impl IntoView {
     }
 }
 
-/// Running counter, version badge and account chip.
+/// Account chip: the `subscriptionType` only, never the email or the organization (spec §9.2,
+/// §10.1); the login method and provider in its tooltip.
 #[component]
 fn EnvChips(env: EnvStatus) -> impl IntoView {
-    let running = env.running;
-    let untested = env
-        .claude
-        .version
-        .clone()
-        .filter(|v| version_newer(v, &env.claude.tested_version));
     let (chip, details) = match &env.auth {
         AuthState::LoggedIn {
             auth_method,
             api_provider,
-            email,
-            org_name,
             subscription_type,
+            ..
         } => {
-            let chip = [email.as_deref(), subscription_type.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
+            let chip = subscription_type.clone().unwrap_or_default();
             let details = [
                 auth_method.as_deref().map(|m| format!("Accesso: {m}")),
                 api_provider.as_deref().map(|p| format!("Provider: {p}")),
-                org_name.as_deref().map(|o| format!("Organizzazione: {o}")),
             ]
             .into_iter()
             .flatten()
@@ -527,26 +701,22 @@ fn EnvChips(env: EnvStatus) -> impl IntoView {
         chip
     };
     view! {
-        <div class="flex shrink-0 items-center gap-2">
-            <Badge variant=BadgeVariant::Outline class="gap-1.5 font-medium" attr:data-testid="running">
-                {(running > 0).then(|| view! { <Spinner class="size-3" /> })}
-                {format!("In esecuzione {running}/{}", env.max_running)}
-            </Badge>
-            {untested
-                .map(|v| {
-                    view! {
-                        <Badge variant=BadgeVariant::Info attr:title="Più recente della versione testata">
-                            {format!("Claude Code {v}")}
-                        </Badge>
-                    }
-                })}
+        <div class="flex shrink-0 items-center">
             <Tooltip>
-                <Badge variant=BadgeVariant::Secondary class="max-w-64 truncate" attr:data-testid="account">
+                <Badge
+                    variant=BadgeVariant::Outline
+                    class="border-border text-muted-foreground h-6 max-w-56 truncate px-2 text-[11px] font-medium"
+                    attr:data-testid="account"
+                >
                     {chip}
                 </Badge>
                 {(!details.is_empty())
                     .then(|| {
-                        view! { <TooltipContent position=TooltipPosition::Left>{details}</TooltipContent> }
+                        view! {
+                            <TooltipContent position=TooltipPosition::Left class="shadow-md">
+                                {details}
+                            </TooltipContent>
+                        }
                     })}
             </Tooltip>
         </div>
@@ -606,6 +776,7 @@ fn Banners() -> impl IntoView {
                 <Button
                     size=ButtonSize::Sm
                     variant=ButtonVariant::Outline
+                    class="h-7 text-[13px]"
                     attr:disabled=move || resuming.get()
                     on:click=resume
                 >
@@ -628,6 +799,7 @@ fn Banners() -> impl IntoView {
                 <Button
                     size=ButtonSize::Sm
                     variant=ButtonVariant::Outline
+                    class="h-7 text-[13px]"
                     on:click=move |_| ctx.refresh_env(true)
                 >
                     "Ricontrolla"
@@ -679,11 +851,11 @@ fn notes(env: &EnvStatus) -> Vec<(&'static str, String)> {
 fn Banner(testid: &'static str, children: Children) -> impl IntoView {
     view! {
         <div
-            class="bg-warning-light dark:bg-warning-dark/20 flex items-center gap-3 border-b px-4 py-2 text-sm"
+            class="bg-status-waiting/8 border-status-waiting/25 flex items-center gap-3 border-b px-5 py-2 text-[13px]"
             role="status"
             data-banner=testid
         >
-            <TriangleAlert class="text-warning size-4 shrink-0" />
+            <TriangleAlert class="text-status-waiting size-4 shrink-0" />
             {children()}
         </div>
     }

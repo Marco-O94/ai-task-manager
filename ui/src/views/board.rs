@@ -6,33 +6,38 @@
 
 mod list;
 
+pub(crate) use list::{updated_text, updated_title};
+
 use std::time::Duration;
 
 use atm_types::{
     AttemptState, CONTINUE_PROMPT, CreateTask, CreateTaskReq, GetBoard, Id, MoveTask, MoveTaskReq,
-    ProcessStatus, ProjectIdReq, SendFollowUp, SendFollowUpReq, StopReason, TaskCard, TaskStatus,
-    WorktreeState,
+    ProjectIdReq, SendFollowUp, SendFollowUpReq, StopReason, TaskCard, TaskStatus, WorktreeState,
 };
-use icons::{ChevronLeft, ChevronRight, FolderPlus, GitBranch, List, Pencil, Plus, SquareKanban};
+use icons::{
+    ChevronLeft, ChevronRight, FolderPlus, GitBranch, List, Pencil, Plus, SquareKanban,
+    TriangleAlert,
+};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use tw_merge::tw_merge;
 
 use crate::app::{AppCtx, use_app};
 use crate::ipc;
 use crate::state::board::{apply_move, column, drop_before};
-use crate::ui::badge::{Badge, BadgeSize, BadgeVariant};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
-use crate::ui::card::{Card, CardContent, CardSize};
 use crate::ui::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::input::Input;
 use crate::ui::scroll_area::ScrollArea;
 use crate::ui::skeleton::Skeleton;
-use crate::ui::spinner::Spinner;
 use crate::views::sidebar::add_repository;
 use crate::views::start_dialog::StartDialog;
 use crate::views::task_dialog::{TaskDialog, TaskDialogMode};
-use crate::widgets::dnd::DragCtx;
+use crate::widgets::dnd::{DragCtx, DropPlaceholder};
+use crate::widgets::status::{
+    AgentBadge, FOCUS_RING, PILL_TABLIST, Status, StatusDot, agent_state, pill_tab,
+};
 use list::TaskList;
 
 /// Column heading shown on the board.
@@ -207,10 +212,10 @@ pub fn Board() -> impl IntoView {
             data-view="board"
             data-start-for=move || start_for.get()
         >
-            <Toolbar board task_view list />
+            <Toolbar board task_view />
             <Show when=move || !list.get()>
                 <div
-                    class="flex min-h-0 flex-1 gap-3 overflow-x-auto px-4 pt-3 pb-4"
+                    class="flex min-h-0 flex-1 gap-3 overflow-x-auto px-5 pb-5"
                     data-testid="columns"
                 >
                     {TaskStatus::ALL
@@ -228,31 +233,26 @@ pub fn Board() -> impl IntoView {
     }
 }
 
-/// Kanban | Lista toggle (`[data-task-view]`, `aria-pressed`) and, in the list, "Nuovo task"
-/// (the columns have their own "+"). Neither button captures an id.
+/// Kanban | Lista toggle (`[data-task-view]`, `aria-pressed`) as pill tabs, and "Nuovo task"
+/// on the right. Neither button captures an id.
 #[component]
-fn Toolbar(board: BoardState, task_view: RwSignal<TaskView>, list: Memo<bool>) -> impl IntoView {
+fn Toolbar(board: BoardState, task_view: RwSignal<TaskView>) -> impl IntoView {
     view! {
-        <div class="flex items-center gap-2 px-4 pt-3" data-testid="board-toolbar">
-            <div
-                class="bg-muted text-muted-foreground inline-flex h-8 items-center rounded-lg p-[3px]"
-                role="group"
-                aria-label="Vista dei task"
-            >
+        <div class="flex h-12 shrink-0 items-center gap-3 px-5" data-testid="board-toolbar">
+            <div class=PILL_TABLIST role="group" aria-label="Vista dei task">
                 {view_toggle(task_view, TaskView::Kanban, "Kanban", view! { <SquareKanban /> })}
                 {view_toggle(task_view, TaskView::List, "Lista", view! { <List /> })}
             </div>
-            <div class="flex-1" />
-            <Show when=move || list.get()>
-                <Button
-                    size=ButtonSize::Sm
-                    attr:data-action="new-task"
-                    on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(TaskStatus::Todo)))
-                >
-                    <Plus />
-                    "Nuovo task"
-                </Button>
-            </Show>
+            <Button
+                variant=ButtonVariant::Outline
+                size=ButtonSize::Sm
+                class="bg-card dark:bg-card dark:border-border dark:hover:bg-accent ml-auto text-[13px]"
+                attr:data-action="new-task"
+                on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(TaskStatus::Todo)))
+            >
+                <Plus />
+                "Nuovo task"
+            </Button>
         </div>
     }
 }
@@ -267,13 +267,7 @@ fn view_toggle(
     view! {
         <button
             type="button"
-            class=move || {
-                if active() {
-                    "bg-background text-foreground inline-flex h-full items-center gap-1.5 rounded-md px-2.5 text-sm font-medium shadow-sm outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 dark:bg-input/30 [&_svg]:size-4"
-                } else {
-                    "text-foreground/60 hover:text-foreground inline-flex h-full items-center gap-1.5 rounded-md px-2.5 text-sm font-medium outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50 [&_svg]:size-4"
-                }
-            }
+            class=move || tw_merge!(pill_tab(active()), "px-2.5 [&_svg]:size-3.5")
             data-task-view=value.as_str()
             aria-pressed=move || active().to_string()
             on:click=move |_| {
@@ -314,7 +308,7 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
     let drag = board.drag;
     let cards = Memo::new(move |_| board.cards.with(|c| column(c, status)));
     let collapsed = RwSignal::new(status == TaskStatus::Cancelled);
-    // Where the placeholder bar goes: before a card (`Some(Some(id))`) or at the end.
+    // Where the drop placeholder goes: before a card (`Some(Some(id))`) or at the end.
     let placeholder = Memo::new(move |_| {
         let (over, index) = drag.drop.get()?;
         if over != status {
@@ -323,23 +317,24 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
         let dragged = drag.dragging.get()?;
         cards.with(|col| drop_before(col, index, &dragged))
     });
-    let root = NodeRef::<html::Div>::new();
+    let root = NodeRef::<html::Section>::new();
     let list = NodeRef::<html::Div>::new();
     let count = move || cards.with(Vec::len);
+    let title = column_title(status);
+    let colour = Status::of_column(status);
 
     let expanded = move || {
         view! {
-            <header class="flex items-center gap-2 px-3 pt-3 pb-2">
-                <h2 class="text-sm font-semibold">{column_title(status)}</h2>
-                <Badge variant=BadgeVariant::Muted size=BadgeSize::Sm>
-                    {count}
-                </Badge>
-                <div class="flex-1" />
+            <header class="flex h-10 shrink-0 items-center gap-2 px-3">
+                <StatusDot status=colour />
+                <h2 class="text-[13px] font-semibold">{title}</h2>
+                <span class="text-muted-foreground font-mono text-[11px] tabular-nums">{count}</span>
                 <Button
                     variant=ButtonVariant::Ghost
                     size=ButtonSize::IconXs
+                    class="text-muted-foreground ml-auto size-7"
                     attr:title="Nuovo task"
-                    attr:aria-label=format!("Nuovo task in {}", column_title(status))
+                    attr:aria-label=format!("Nuovo task in {title}")
                     on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(status)))
                 >
                     <Plus />
@@ -350,6 +345,7 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
                             <Button
                                 variant=ButtonVariant::Ghost
                                 size=ButtonSize::IconXs
+                                class="text-muted-foreground size-7"
                                 attr:title="Comprimi"
                                 attr:aria-label="Comprimi Annullati"
                                 on:click=move |_| collapsed.set(true)
@@ -360,12 +356,12 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
                     })}
             </header>
             <ScrollArea class="min-h-0 flex-1">
-                <div node_ref=list class="flex min-h-12 flex-col gap-2 px-2 pt-1 pb-2" data-card-list="">
+                <div node_ref=list class="flex min-h-12 flex-col gap-2 px-2 pb-2" data-card-list="">
                     <Show when=move || board.loaded.get() fallback=|| view! { <ColumnSkeleton /> }>
                         <For each=move || cards.get() key=|c| c.task.id.clone() let:card>
                             <TaskCardView board card placeholder />
                         </For>
-                        <PlaceholderBar show=Signal::derive(move || placeholder.get() == Some(None)) />
+                        <DropPlaceholder show=Signal::derive(move || placeholder.get() == Some(None)) />
                         <Show when=move || count() == 0 && placeholder.with(Option::is_none)>
                             <p class="text-muted-foreground py-6 text-center text-xs">"Nessun task"</p>
                         </Show>
@@ -378,26 +374,29 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
     let folded = move || {
         view! {
             <button
-                class="hover:bg-accent flex h-full w-full flex-col items-center gap-3 rounded-xl py-3"
+                class=format!(
+                    "hover:bg-accent flex h-full w-full flex-col items-center gap-3 rounded-xl py-3 {FOCUS_RING}",
+                )
                 title="Espandi Annullati"
                 on:click=move |_| collapsed.set(false)
             >
-                <ChevronLeft class="size-4" />
-                <span class="text-sm font-semibold [writing-mode:vertical-rl]">{column_title(status)}</span>
-                <Badge variant=BadgeVariant::Muted size=BadgeSize::Sm>
-                    {count}
-                </Badge>
+                <ChevronLeft class="text-muted-foreground size-4" />
+                <StatusDot status=colour />
+                <span class="text-[13px] font-semibold [writing-mode:vertical-rl]">{title}</span>
+                <span class="text-muted-foreground font-mono text-[11px] tabular-nums">{count}</span>
             </button>
         }
     };
 
     view! {
-        <div
+        <section
             node_ref=root
-            class="bg-muted/60 flex shrink-0 flex-col rounded-xl border transition-colors"
-            class=("w-72", move || !collapsed.get())
+            class="bg-muted/50 flex shrink-0 flex-col rounded-xl transition-shadow"
+            class=("w-[264px]", move || !collapsed.get())
             class=("w-11", move || collapsed.get())
-            class=("border-primary", move || placeholder.with(Option::is_some))
+            class=("ring-1", move || placeholder.with(Option::is_some))
+            class=("ring-primary/30", move || placeholder.with(Option::is_some))
+            aria-label=title
             data-column=status.as_str()
             data-collapsed=move || collapsed.get().to_string()
             on:dragover=move |ev| {
@@ -418,20 +417,15 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
             }
         >
             {move || if collapsed.get() { folded().into_any() } else { expanded().into_any() }}
-        </div>
+        </section>
     }
-}
-
-#[component]
-fn PlaceholderBar(show: Signal<bool>) -> impl IntoView {
-    view! { <div class="bg-primary h-0.5 shrink-0 rounded-full" class:invisible=move || !show.get() /> }
 }
 
 #[component]
 fn ColumnSkeleton() -> impl IntoView {
     view! {
-        <Skeleton class="h-16 w-full" />
-        <Skeleton class="h-12 w-full" />
+        <Skeleton class="h-16 w-full rounded-lg" />
+        <Skeleton class="h-12 w-full rounded-lg" />
     }
 }
 
@@ -453,7 +447,7 @@ fn TaskCardView(
                 .unwrap_or_else(|| card.clone())
         })
     };
-    let bar_here = {
+    let slot_here = {
         let id = id.clone();
         Signal::derive(move || {
             placeholder.with(|p| p.as_ref().is_some_and(|b| b.as_ref() == Some(&id)))
@@ -465,7 +459,7 @@ fn TaskCardView(
     };
     let selected = {
         let id = id.clone();
-        move || ctx.open_task.with(|t| t.as_ref() == Some(&id))
+        Memo::new(move |_| ctx.open_task.with(|t| t.as_ref() == Some(&id)))
     };
     let open = {
         let id = id.clone();
@@ -476,14 +470,22 @@ fn TaskCardView(
             card.with_untracked(|c| c.task.clone()),
         )));
     };
+    // Closed tasks recede: Fatto muted, Annullati also struck through.
+    let status = Memo::new(move |_| card.with(|c| c.task.status));
+    let closed = move || matches!(status.get(), TaskStatus::Done | TaskStatus::Cancelled);
 
     view! {
         <div class="flex flex-col gap-2">
-            <PlaceholderBar show=bar_here />
+            <DropPlaceholder show=slot_here />
             <div
-                class="group rounded-xl outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                class=("ring-2", selected.clone())
-                class=("ring-primary", selected)
+                class=format!(
+                    "group bg-card cursor-grab rounded-lg border p-3 shadow-xs transition-colors active:cursor-grabbing {FOCUS_RING}",
+                )
+                class=("border-border", move || !selected.get())
+                class=("hover:border-foreground/20", move || !selected.get())
+                class=("border-primary", move || selected.get())
+                class=("ring-1", move || selected.get())
+                class=("ring-primary", move || selected.get())
                 class=("opacity-40", dragging)
                 data-task-id=id.clone()
                 draggable="true"
@@ -505,151 +507,138 @@ fn TaskCardView(
                     }
                 }
             >
-                <Card size=CardSize::Sm class="hover:border-foreground/20 cursor-grab gap-2 py-3 shadow-xs active:cursor-grabbing">
-                    <CardContent class="flex flex-col gap-2 px-3">
-                        <div class="flex items-start gap-2">
-                            <p class="flex-1 text-sm leading-snug font-medium break-words">
-                                {move || card.with(|c| c.task.title.clone())}
-                            </p>
-                            <button
-                                class="text-muted-foreground hover:text-foreground -mt-0.5 rounded p-0.5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
-                                title="Modifica"
-                                aria-label="Modifica il task"
-                                on:click=move |ev| {
-                                    ev.stop_propagation();
-                                    edit();
+                <div class="flex items-start gap-2">
+                    <p
+                        class="line-clamp-2 flex-1 text-[13px] leading-[18px] font-medium text-pretty break-words"
+                        class=("text-muted-foreground", closed)
+                        class=("line-through", move || status.get() == TaskStatus::Cancelled)
+                    >
+                        {move || card.with(|c| c.task.title.clone())}
+                    </p>
+                    <button
+                        class="text-muted-foreground hover:text-foreground -mt-0.5 rounded-sm p-0.5 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+                        title="Modifica"
+                        aria-label="Modifica il task"
+                        on:click=move |ev| {
+                            ev.stop_propagation();
+                            edit();
+                        }
+                    >
+                        <Pencil class="size-3.5" />
+                    </button>
+                </div>
+                {move || {
+                    card.with(|c| {
+                        let badges = card_badges(ctx, c);
+                        let branch = branch_line(c);
+                        (badges.is_some() || branch.is_some())
+                            .then(|| {
+                                view! {
+                                    <div class="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+                                        {badges}
+                                        {branch}
+                                    </div>
                                 }
-                            >
-                                <Pencil class="size-3.5" />
-                            </button>
-                        </div>
-                        {move || {
-                            let description = card.with(|c| c.task.description.clone());
-                            (!description.trim().is_empty())
-                                .then(|| {
-                                    view! {
-                                        <p class="text-muted-foreground line-clamp-2 text-xs break-words">
-                                            {description}
-                                        </p>
-                                    }
-                                })
-                        }}
-                        {move || card.with(|c| (card_badges(ctx, c), branch_line(c)))}
-                    </CardContent>
-                </Card>
+                            })
+                    })
+                }}
             </div>
         </div>
     }
 }
 
-/// Badges of a card (spec §9.2): running, pending approvals, failed, interrupted (with
-/// "Continua", spec §7.9), missing worktree, closed attempt. `None` without any: the list
-/// view shows a dash instead.
+/// Badges of a card (spec §9.2): the agent's state (see [`agent_state`]), "Interrotto" with
+/// "Continua" (spec §7.9), and a missing worktree. `None` without any: the list view shows a
+/// dash instead. `display: contents`, so they flow in the caller's row.
 fn card_badges(ctx: AppCtx, card: &TaskCard) -> Option<impl IntoView + use<>> {
-    let active = card.attempt_state == Some(AttemptState::Active);
-    let idle = active && !card.running;
-    let interrupted = idle && interrupted_by_app(card.last_stop_reason);
-    let failed = idle && !interrupted && card.last_status == Some(ProcessStatus::Failed);
-    let stopped = idle && !interrupted && card.last_status == Some(ProcessStatus::Killed);
+    let state = agent_state(card);
     let missing = card.worktree_state == Some(WorktreeState::Missing);
-    let closed = match card.attempt_state {
-        Some(AttemptState::Merged) => Some((BadgeVariant::Success, "Mergiato")),
-        Some(AttemptState::Discarded) => Some((BadgeVariant::Muted, "Scartato")),
-        _ => None,
-    };
-    let approvals = card.pending_approvals;
-    let attempt_id = card.attempt_id.clone().filter(|_| interrupted);
-    let any = card.running || approvals > 0 || failed || stopped || interrupted || missing;
-    let any = any || closed.is_some();
-
-    any.then(|| {
+    if state.is_none() && !missing {
+        return None;
+    }
+    let agent = state.map(|(label, status)| {
+        let name = badge_name(card, status);
+        let attempt_id = card.attempt_id.clone().filter(|_| name == "interrupted");
         view! {
-            <div class="flex flex-wrap items-center gap-1.5" data-testid="badges">
-                {card
-                    .running
-                    .then(|| {
-                        view! {
-                            <Badge variant=BadgeVariant::Info class="gap-1" attr:data-badge="running">
-                                <Spinner class="size-3" />
-                                "In esecuzione"
-                            </Badge>
-                        }
-                    })}
-                {(approvals > 0)
-                    .then(|| {
-                        let text = if approvals == 1 {
-                            "Richiede approvazione".to_owned()
-                        } else {
-                            format!("Richiede approvazione ({approvals})")
-                        };
-                        view! {
-                            <Badge variant=BadgeVariant::Warning attr:data-badge="approval">
-                                {text}
-                            </Badge>
-                        }
-                    })}
-                {failed
-                    .then(|| {
-                        view! {
-                            <Badge variant=BadgeVariant::Destructive attr:data-badge="failed">
-                                "Fallito"
-                            </Badge>
-                        }
-                    })}
-                {stopped
-                    .then(|| {
-                        view! {
-                            <Badge variant=BadgeVariant::Muted attr:data-badge="stopped">
-                                "Fermato"
-                            </Badge>
-                        }
-                    })}
+            <span class="inline-flex items-center gap-1" data-badge=name>
+                // The live region replaces the old running spinner's; a pending approval
+                // replaces the running badge, so it is one too.
+                <AgentBadge
+                    label
+                    status
+                    attr:role=matches!(name, "running" | "approval").then_some("status")
+                />
                 {attempt_id
                     .map(|attempt_id| {
                         view! {
-                            <Badge variant=BadgeVariant::Warning class="gap-1 pr-0.5" attr:data-badge="interrupted">
-                                "Interrotto –"
-                                <button
-                                    class="rounded px-1 underline-offset-2 hover:underline"
-                                    on:click=move |ev| {
-                                        ev.stop_propagation();
-                                        continue_attempt(ctx, attempt_id.clone());
-                                    }
-                                >
-                                    "Continua"
-                                </button>
-                            </Badge>
+                            <button
+                                class=format!(
+                                    "text-primary rounded-sm text-[11px] font-medium underline-offset-2 hover:underline {FOCUS_RING}",
+                                )
+                                on:click=move |ev| {
+                                    ev.stop_propagation();
+                                    continue_attempt(ctx, attempt_id.clone());
+                                }
+                            >
+                                "Continua"
+                            </button>
                         }
                     })}
-                {missing
-                    .then(|| {
-                        view! {
-                            <Badge variant=BadgeVariant::Warning attr:data-badge="missing">
-                                "Worktree mancante"
-                            </Badge>
-                        }
-                    })}
-                {closed
-                    .map(|(variant, text)| {
-                        view! {
-                            <Badge variant=variant attr:data-badge="closed">
-                                {text}
-                            </Badge>
-                        }
-                    })}
-            </div>
+            </span>
         }
+    });
+    Some(view! {
+        <div class="contents" data-testid="badges">
+            {agent}
+            {missing
+                .then(|| {
+                    view! {
+                        <span
+                            class=format!(
+                                "inline-flex h-5 items-center gap-1 rounded-md px-1.5 text-[11px] font-medium whitespace-nowrap {}",
+                                Status::Failed.tint(),
+                            )
+                            data-badge="missing"
+                        >
+                            <TriangleAlert class="size-3" />
+                            "Worktree mancante"
+                        </span>
+                    }
+                })}
+        </div>
     })
+}
+
+/// `data-badge` of the agent's badge, which the E2E drives: `running` only while the
+/// registry runs the process, `closed` for a merged or discarded attempt.
+fn badge_name(card: &TaskCard, status: Status) -> &'static str {
+    if card.pending_approvals > 0 {
+        return "approval";
+    }
+    if card.running {
+        return "running";
+    }
+    if card.attempt_state != Some(AttemptState::Active) {
+        return "closed";
+    }
+    match status {
+        Status::Todo => "interrupted",
+        Status::Failed => "failed",
+        Status::Cancelled => "stopped",
+        Status::Review => "ready",
+        // `last_status` still Running: the process is ending.
+        _ => "ending",
+    }
 }
 
 /// The branch of the card's attempt, if it has one.
 fn branch_line(card: &TaskCard) -> Option<impl IntoView + use<>> {
     card.branch.clone().map(|branch| {
         view! {
-            <p class="text-muted-foreground flex min-w-0 items-center gap-1 font-mono text-[11px]">
+            <span class="text-muted-foreground inline-flex max-w-full min-w-0 items-center gap-1 font-mono text-[11px]">
                 <GitBranch class="size-3 shrink-0" />
                 <span class="truncate">{branch}</span>
-            </p>
+            </span>
         }
     })
 }
@@ -704,7 +693,7 @@ fn QuickCreate(board: BoardState, status: TaskStatus) -> impl IntoView {
                         <Button
                             variant=ButtonVariant::Ghost
                             size=ButtonSize::Sm
-                            class="text-muted-foreground w-full justify-start"
+                            class="text-muted-foreground h-7 w-full justify-start text-xs"
                             attr:data-testid="quick-create"
                             on:click=move |_| editing.set(true)
                         >
@@ -755,8 +744,9 @@ fn QuickCreate(board: BoardState, status: TaskStatus) -> impl IntoView {
 
 #[cfg(test)]
 mod tests {
-    use super::interrupted_by_app;
-    use atm_types::StopReason;
+    use super::{badge_name, interrupted_by_app};
+    use crate::widgets::status::agent_state;
+    use atm_types::{AttemptState, ProcessStatus, StopReason, Task, TaskCard, TaskStatus};
 
     #[test]
     fn quit_and_crash_recovery_offer_continua_user_stop_does_not() {
@@ -765,5 +755,53 @@ mod tests {
         assert!(!interrupted_by_app(Some(StopReason::UserStop)));
         assert!(!interrupted_by_app(Some(StopReason::Crash)));
         assert!(!interrupted_by_app(None));
+    }
+
+    #[test]
+    fn badge_names_follow_the_agent_state() {
+        let name = |f: fn(&mut TaskCard)| {
+            let mut card = TaskCard {
+                task: Task {
+                    id: "t".into(),
+                    project_id: "p".into(),
+                    title: "Titolo".into(),
+                    description: String::new(),
+                    status: TaskStatus::InProgress,
+                    position: 1.0,
+                    created_at: 0,
+                    updated_at: 0,
+                },
+                attempt_id: Some("a".into()),
+                attempt_state: Some(AttemptState::Active),
+                branch: None,
+                running: false,
+                pending_approvals: 0,
+                last_status: Some(ProcessStatus::Running),
+                last_stop_reason: None,
+                worktree_state: None,
+            };
+            f(&mut card);
+            let (_, status) = agent_state(&card)?;
+            Some(badge_name(&card, status))
+        };
+        assert_eq!(name(|c| c.running = true), Some("running"));
+        assert_eq!(name(|c| c.pending_approvals = 1), Some("approval"));
+        assert_eq!(name(|_| {}), Some("ending"));
+        let failed = name(|c| c.last_status = Some(ProcessStatus::Failed));
+        assert_eq!(failed, Some("failed"));
+        let stopped = name(|c| c.last_status = Some(ProcessStatus::Killed));
+        assert_eq!(stopped, Some("stopped"));
+        let interrupted = name(|c| {
+            c.last_status = Some(ProcessStatus::Killed);
+            c.last_stop_reason = Some(StopReason::AppShutdown);
+        });
+        assert_eq!(interrupted, Some("interrupted"));
+        let ready = name(|c| c.last_status = Some(ProcessStatus::Completed));
+        assert_eq!(ready, Some("ready"));
+        let merged = name(|c| c.attempt_state = Some(AttemptState::Merged));
+        assert_eq!(merged, Some("closed"));
+        let discarded = name(|c| c.attempt_state = Some(AttemptState::Discarded));
+        assert_eq!(discarded, Some("closed"));
+        assert_eq!(name(|c| c.attempt_state = None), None);
     }
 }

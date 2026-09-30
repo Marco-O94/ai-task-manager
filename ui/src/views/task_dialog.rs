@@ -181,7 +181,7 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
 
     view! {
         <Dialog open=open>
-            <DialogContent class="overflow-y-auto sm:max-w-lg" data_name_prefix="TaskDialog">
+            <DialogContent class="overflow-y-auto rounded-xl shadow-md sm:max-w-lg" data_name_prefix="TaskDialog">
                 <form
                     class="flex flex-col gap-4"
                     data-testid="task-dialog"
@@ -236,7 +236,7 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                                 .get()
                                 .map(|e| {
                                     view! {
-                                        <p class="text-destructive text-sm" role="alert">
+                                        <p class="text-destructive text-[13px]" role="alert">
                                             {e}
                                         </p>
                                     }
@@ -523,7 +523,7 @@ fn AttachmentsField(
     view! {
         <div class="flex flex-col gap-2" data-testid="attachments">
             <div class="flex items-center gap-2">
-                <span id="task-attachments" class="text-sm leading-none font-medium">
+                <span id="task-attachments" class="text-[13px] leading-none font-medium">
                     "Allegati"
                 </span>
                 <span class="text-muted-foreground text-xs">{limits}</span>
@@ -547,7 +547,7 @@ fn AttachmentsField(
                 <ul class="flex max-h-40 flex-col gap-1 overflow-y-auto" aria-labelledby="task-attachments">
                     <For each=move || rows.get() key=|r| r.key.clone() let:row>
                         <li
-                            class="bg-muted/50 flex items-center gap-2 rounded-md py-1 pr-1 pl-2 text-sm"
+                            class="bg-muted/50 flex items-center gap-2 rounded-md py-1 pr-1 pl-2 text-[13px]"
                             data-attachment=row.name.clone()
                         >
                             <FileText class="text-muted-foreground size-3.5 shrink-0" />
@@ -557,7 +557,7 @@ fn AttachmentsField(
                             <span class="text-muted-foreground shrink-0 text-xs">{format_size(row.size)}</span>
                             <button
                                 type="button"
-                                class="text-muted-foreground hover:text-foreground rounded p-0.5 disabled:opacity-50"
+                                class="text-muted-foreground hover:text-foreground rounded-sm p-0.5 disabled:opacity-50"
                                 title="Rimuovi"
                                 aria-label=format!("Rimuovi {}", row.name)
                                 data-action="remove-attachment"

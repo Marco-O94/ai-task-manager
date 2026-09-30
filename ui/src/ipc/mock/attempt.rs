@@ -146,7 +146,7 @@ struct Attempt {
     deferred_start: bool,
     /// Approvals of the running turn: id → the decision once answered.
     approvals: HashMap<Id, Option<ApprovalDecision>>,
-    /// "Consenti sempre" rules, `Tool(input)` of the fixture step.
+    /// "Approva sempre" rules, `Tool(input)` of the fixture step.
     allow_rules: Vec<String>,
 }
 
@@ -852,7 +852,7 @@ async fn run_turn(attempt_id: Id, turn: u32) {
     }
     let notice = match end {
         End::Stopped => Some("Esecuzione fermata dall'utente."),
-        End::DeniedAndStopped => Some("Turno fermato con «Nega e ferma»."),
+        End::DeniedAndStopped => Some("Turno fermato con «Rifiuta e ferma»."),
         End::Completed | End::Abandoned => None,
     };
     if let Some(text) = notice {
@@ -911,7 +911,7 @@ async fn replay(attempt_id: &str, turn: u32, steps: Vec<Step>) -> Result<(), End
     Ok(())
 }
 
-/// One tool call: approval first when the step asks for it and no "Consenti sempre" rule
+/// One tool call: approval first when the step asks for it and no "Approva sempre" rule
 /// matches, then its result. A subagent (`nests`) is returned still running, with its final
 /// body, to be closed after its nested steps.
 async fn tool_call(

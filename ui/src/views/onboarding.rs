@@ -7,7 +7,7 @@ use atm_types::{
     AuthState, Empty, EnvStatus, GetEnv, GetEnvReq, GetSettings, LoginMethod, OpenLoginTerminal,
     OpenLoginTerminalReq, OpenUrl, OpenUrlReq, UpdateSettings,
 };
-use icons::{Copy, ExternalLink, Terminal};
+use icons::{Copy, ExternalLink, Terminal, Zap};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
@@ -84,10 +84,17 @@ pub fn Onboarding(continue_anyway: RwSignal<bool>) -> impl IntoView {
             data-view="onboarding"
             data-step=move || step.get().as_str()
         >
-            <Card class="w-full max-w-lg">
-                <CardHeader>
-                    <CardTitle>"AI Task Manager"</CardTitle>
-                    <CardDescription>"Usa il Claude Code installato sul tuo Mac."</CardDescription>
+            <Card class="border-border w-full max-w-lg shadow-xs">
+                <CardHeader class="flex flex-row items-center gap-3 sm:flex">
+                    <span class="bg-primary text-primary-foreground grid size-9 shrink-0 place-items-center rounded-lg">
+                        <Zap class="size-4" />
+                    </span>
+                    <div class="flex min-w-0 flex-col gap-1">
+                        <CardTitle class="text-[15px] tracking-tight">"AI Task Manager"</CardTitle>
+                        <CardDescription class="text-[13px]">
+                            "Usa il Claude Code installato sul tuo Mac."
+                        </CardDescription>
+                    </div>
                 </CardHeader>
                 {move || match step.get() {
                     Step::Checking => view! { <CheckingStep checking /> }.into_any(),
@@ -136,7 +143,7 @@ fn CheckingStep(checking: RwSignal<bool>) -> impl IntoView {
     view! {
         <CardContent class="flex items-center gap-2">
             <Spinner />
-            <p class="text-muted-foreground text-sm">"Verifica dell'ambiente in corso…"</p>
+            <p class="text-muted-foreground text-[13px]">"Verifica dell'ambiente in corso…"</p>
         </CardContent>
         <CardFooter class="justify-end">
             <RecheckButton checking />
@@ -266,7 +273,7 @@ fn LoggedOutStep(checking: RwSignal<bool>) -> impl IntoView {
     };
     view! {
         <CardContent class="flex flex-col gap-4">
-            <p class="text-sm">
+            <p class="text-[13px] text-pretty">
                 "Accedi a Claude Code per avviare gli agenti. L'accesso avviene nel Terminale con il CLI: l'app non vede mai password, codici o token."
             </p>
             <div class="flex flex-col gap-2">
@@ -349,7 +356,7 @@ fn LoginDialog(
 
     view! {
         <Dialog open=open class="absolute">
-            <DialogContent class="sm:max-w-md" close_on_backdrop_click=false data_name_prefix="Login">
+            <DialogContent class="shadow-md sm:max-w-md" close_on_backdrop_click=false data_name_prefix="Login">
                 <DialogBody attr:data-testid="login-dialog">
                     <DialogHeader>
                         <DialogTitle>"Completa l'accesso nel Terminale…"</DialogTitle>
@@ -367,7 +374,7 @@ fn LoginDialog(
                                 .into_any()
                         } else {
                             view! {
-                                <div class="text-muted-foreground flex items-center gap-2 text-sm">
+                                <div class="text-muted-foreground flex items-center gap-2 text-[13px]">
                                     <Spinner />
                                     "In attesa dell'accesso…"
                                 </div>
@@ -419,7 +426,7 @@ fn CopyCommand(command: Signal<String>) -> impl IntoView {
         });
     };
     view! {
-        <div class="bg-muted flex items-center gap-2 rounded-md border py-1 pr-1 pl-3">
+        <div class="bg-muted border-border flex items-center gap-2 rounded-md border py-1 pr-1 pl-3">
             <code class="flex-1 font-mono text-xs select-all" data-testid="login-command">
                 {move || command.get()}
             </code>

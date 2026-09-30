@@ -1,4 +1,5 @@
 //! Follow-up composer (spec §7.9, §9.2): textarea + send (⌘↩), disabled while a turn runs.
+//! Pinned under the transcript, with the focus ring on its box.
 //! Owner: M2-UI-TASK.
 
 use atm_types::{Id, SendFollowUp, SendFollowUpReq};
@@ -46,52 +47,60 @@ pub fn Composer(attempt_id: Id, #[prop(into)] running: Signal<bool>) -> impl Int
 
     view! {
         <form
-            class="flex shrink-0 flex-col gap-2 border-t p-3"
+            class="shrink-0 border-t p-3"
             data-view="composer"
             on:submit=move |ev| {
                 ev.prevent_default();
                 send();
             }
         >
-            <Textarea
-                bind_value=text
-                name="follow-up"
-                rows=3u32
-                class="max-h-48 resize-none"
-                placeholder="Scrivi un messaggio di follow-up…"
-                attr:disabled=disabled
-                on:keydown=move |ev: KeyboardEvent| {
-                    if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
-                        ev.prevent_default();
-                        send();
-                    }
-                }
-            />
-            <div class="flex items-center justify-between gap-2">
-                <span class="text-muted-foreground flex items-center gap-1.5 text-xs">
-                    {move || {
-                        if running.get() {
-                            "L'agente sta lavorando: potrai rispondere alla fine del turno.".into_any()
-                        } else {
-                            view! {
-                                <KbdGroup>
-                                    <Kbd>"⌘"</Kbd>
-                                    <Kbd>"↩"</Kbd>
-                                </KbdGroup>
-                                " per inviare"
-                            }
-                                .into_any()
+            // The ring is on the whole box, not on the borderless textarea.
+            <div class="bg-card border-input focus-within:ring-ring rounded-lg border shadow-xs focus-within:ring-2">
+                <label for="follow-up" class="sr-only">
+                    "Messaggio all'agente"
+                </label>
+                <Textarea
+                    bind_value=text
+                    id="follow-up"
+                    name="follow-up"
+                    rows=2u32
+                    class="block max-h-48 min-h-14 resize-none rounded-none border-0 bg-transparent px-3 pt-2.5 pb-1 text-[13px] shadow-none focus-visible:ring-0 md:text-[13px] dark:bg-transparent"
+                    placeholder="Scrivi all'agente…"
+                    attr:disabled=disabled
+                    on:keydown=move |ev: KeyboardEvent| {
+                        if ev.key() == "Enter" && (ev.meta_key() || ev.ctrl_key()) {
+                            ev.prevent_default();
+                            send();
                         }
-                    }}
-                </span>
-                <Button
-                    size=ButtonSize::Sm
-                    attr:r#type="submit"
-                    attr:disabled=move || disabled() || text.with(|t| t.trim().is_empty())
-                >
-                    <Send />
-                    "Invia"
-                </Button>
+                    }
+                />
+                <div class="flex items-center gap-2 px-3 pb-2">
+                    <span class="text-muted-foreground min-w-0 text-[11px]">
+                        {move || {
+                            if running.get() {
+                                "L'agente sta lavorando: potrai rispondere alla fine del turno."
+                            } else {
+                                "L'agente riceve il messaggio come nuovo turno."
+                            }
+                        }}
+                    </span>
+                    <span class="ml-auto flex shrink-0 items-center gap-2">
+                        <KbdGroup>
+                            <Kbd>"⌘"</Kbd>
+                            <Kbd>"↩"</Kbd>
+                        </KbdGroup>
+                        <Button
+                            size=ButtonSize::IconSm
+                            class="size-7 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
+                            attr:r#type="submit"
+                            attr:aria-label="Invia"
+                            attr:title="Invia (⌘↩)"
+                            attr:disabled=move || disabled() || text.with(|t| t.trim().is_empty())
+                        >
+                            <Send />
+                        </Button>
+                    </span>
+                </div>
             </div>
         </form>
     }

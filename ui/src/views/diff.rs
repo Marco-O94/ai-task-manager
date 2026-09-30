@@ -22,7 +22,6 @@ use crate::ui::collapsible::{Collapsible, CollapsibleContent, CollapsibleTrigger
 use crate::ui::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::skeleton::Skeleton;
 use crate::views::merge_dialog::MergeDialog;
-use crate::views::transcript::ON_DESTRUCTIVE;
 
 /// Lines of a file shown before "Mostra tutto" (spec §9.2).
 const MAX_LINES: usize = 2_000;
@@ -170,10 +169,16 @@ pub fn DiffView(
         });
     });
 
+    // "3 file · +86 −12", with the counts in the diff colours.
     let summary = move || {
         diff.with(|d| match d {
-            Some(Ok(d)) => format!("{} file · +{} −{}", d.files.len(), d.additions, d.deletions),
-            _ => String::new(),
+            Some(Ok(d)) => Some(view! {
+                {format!("{} file · ", d.files.len())}
+                <span class="text-success">{format!("+{}", d.additions)}</span>
+                " "
+                <span class="text-destructive">{format!("−{}", d.deletions)}</span>
+            }),
+            _ => None,
         })
     };
     let conflicts = move || status.with(|s| s.as_ref().is_some_and(|s| !s.conflicts.is_empty()));
@@ -184,9 +189,11 @@ pub fn DiffView(
     };
 
     view! {
-        <div class="flex flex-col gap-3 p-4" data-view="diff">
+        <div class="flex flex-col gap-3 px-5 py-4" data-view="diff">
             <div class="flex flex-wrap items-center gap-2">
-                <span class="text-sm font-medium" data-diff-summary="">{summary}</span>
+                <span class="font-mono text-xs font-medium tabular-nums" data-diff-summary="">
+                    {summary}
+                </span>
                 <div class="ml-auto flex flex-wrap gap-2">
                     <Show when=conflicts>
                         <Button variant=ButtonVariant::Outline size=ButtonSize::Sm on:click=resolve>
@@ -294,7 +301,7 @@ fn status_alerts(s: &BranchStatus) -> AnyView {
             let class = if error {
                 "border-destructive/50 text-destructive"
             } else {
-                "border-warning/60 bg-warning-light/40 dark:bg-warning-dark/20"
+                "border-status-waiting/25 bg-status-waiting/8"
             };
             view! {
                 <Alert class=class>
@@ -410,7 +417,7 @@ fn FileBlock(file: FileDiff, ui: FileUi) -> impl IntoView {
         });
         view! {
             <div class="overflow-x-auto">
-                <table class="w-full border-collapse font-mono text-xs">
+                <table class="w-full border-collapse font-mono text-[11.5px] leading-[18px]">
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -419,20 +426,19 @@ fn FileBlock(file: FileDiff, ui: FileUi) -> impl IntoView {
         .into_any()
     };
     view! {
-        <div class="rounded-lg border" data-file=file.path.clone()>
+        <div class="bg-card overflow-hidden rounded-lg border" data-file=file.path.clone()>
             <Collapsible open>
-                <CollapsibleTrigger class="hover:bg-accent/50 flex w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm">
+                <CollapsibleTrigger
+                    class="hover:bg-muted/60 focus-visible:ring-ring flex h-9 w-full min-w-0 items-center gap-2 px-3 text-left text-[13px] outline-none focus-visible:ring-2 focus-visible:ring-inset"
+                    attr:aria-expanded=move || open.get().to_string()
+                >
                     <span class=move || {
                         tw_merge!("shrink-0 transition-transform", if open.get() { "rotate-90" } else { "" })
                     }>
-                        <ChevronRight class="size-4" />
+                        <ChevronRight class="text-muted-foreground size-3.5" />
                     </span>
                     <span title=label>
-                        <Badge
-                            variant
-                            size=crate::ui::badge::BadgeSize::Sm
-                            class=if file.status == FileStatus::Deleted { ON_DESTRUCTIVE } else { "" }
-                        >
+                        <Badge variant size=crate::ui::badge::BadgeSize::Sm>
                             {letter}
                         </Badge>
                     </span>
@@ -449,10 +455,10 @@ fn FileBlock(file: FileDiff, ui: FileUi) -> impl IntoView {
                         };
                         view! { <Badge variant=BadgeVariant::Muted>{tag}</Badge> }
                     })}
-                    <span class="text-success shrink-0 font-mono text-xs">
+                    <span class="text-success shrink-0 font-mono text-[11px] tabular-nums">
                         {format!("+{}", file.additions)}
                     </span>
-                    <span class="text-destructive shrink-0 font-mono text-xs">
+                    <span class="text-destructive shrink-0 font-mono text-[11px] tabular-nums">
                         {format!("−{}", file.deletions)}
                     </span>
                 </CollapsibleTrigger>
@@ -473,21 +479,22 @@ fn status_badge(status: FileStatus) -> (&'static str, &'static str, BadgeVariant
     }
 }
 
-const NUM_CLASS: &str = "text-muted-foreground w-12 border-r px-2 text-right align-top select-none";
+const NUM_CLASS: &str = "text-muted-foreground/70 w-12 border-r border-border/60 px-2 text-right align-top tabular-nums select-none";
 
 fn line_view(line: &DiffLine) -> impl IntoView + use<> {
-    let (class, sign, kind) = match line.kind {
-        LineKind::Add => ("bg-success/10", "+", "add"),
-        LineKind::Del => ("bg-destructive/10", "-", "del"),
-        LineKind::Hunk => ("bg-info/10 text-muted-foreground", "", "hunk"),
-        LineKind::Meta => ("text-muted-foreground italic", "", "meta"),
-        LineKind::Context => ("", " ", "context"),
+    // Soft fills: additions on success, deletions on destructive, the sign in full colour.
+    let (class, sign, sign_class, kind) = match line.kind {
+        LineKind::Add => ("bg-success/8", "+", "text-success", "add"),
+        LineKind::Del => ("bg-destructive/8", "-", "text-destructive", "del"),
+        LineKind::Hunk => ("bg-muted/60 text-muted-foreground", "", "", "hunk"),
+        LineKind::Meta => ("text-muted-foreground italic", "", "", "meta"),
+        LineKind::Context => ("", " ", "", "context"),
     };
     view! {
         <tr class=class data-line=kind>
             <td class=NUM_CLASS>{line.old_no}</td>
             <td class=NUM_CLASS>{line.new_no}</td>
-            <td class="text-muted-foreground w-4 pl-2 align-top select-none">{sign}</td>
+            <td class=format!("w-4 pl-2 align-top select-none {sign_class}")>{sign}</td>
             <td class="pr-2 pl-1 whitespace-pre">{line.text.clone()}</td>
         </tr>
     }
@@ -523,7 +530,7 @@ pub fn ClosedAttempt(attempt: AttemptView) -> impl IntoView {
         });
     };
     view! {
-        <div class="flex flex-col gap-3 p-4" data-view="closed-attempt">
+        <div class="flex flex-col gap-3 px-5 py-4" data-view="closed-attempt">
             <Alert>
                 <AlertTitle>{text}</AlertTitle>
                 <AlertDescription>

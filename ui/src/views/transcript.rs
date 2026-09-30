@@ -2,11 +2,13 @@
 //! "Carica precedenti", autoscroll and "Vai all'ultimo". Owner: M2-UI-TASK.
 
 use atm_types::{
-    Entry, EntryBody, GetEntries, GetEntriesReq, Id, Level, LimitKind, NoticeAction, SendFollowUp,
-    SendFollowUpReq, StopReason, ToolOutput, ToolStatus, UnsubscribeTranscript,
+    Entry, EntryBody, GetEntries, GetEntriesReq, Id, Level, LimitKind, Millis, NoticeAction,
+    SendFollowUp, SendFollowUpReq, StopReason, ToolOutput, ToolStatus, UnsubscribeTranscript,
     UnsubscribeTranscriptReq,
 };
-use icons::{ArrowDown, Ban, Brain, Check, ChevronRight, CircleStop, Hourglass, SquareTerminal, X};
+use icons::{
+    ArrowDown, Ban, Brain, Check, ChevronRight, CircleStop, Hourglass, Sparkles, SquareTerminal, X,
+};
 use leptos::html;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -18,15 +20,14 @@ use crate::ipc;
 use crate::state::transcript::{Row, TranscriptStore};
 use crate::ui::alert::{Alert, AlertDescription, AlertTitle};
 use crate::ui::badge::{Badge, BadgeVariant};
-use crate::ui::bubble::{Bubble, BubbleAlign, BubbleContent, BubbleVariant};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::collapsible::{Collapsible, CollapsibleContent, CollapsibleTrigger};
 use crate::ui::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::marker::{Marker, MarkerContent, MarkerVariant};
-use crate::ui::message::{Message, MessageAlign, MessageContent};
 use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
 use crate::views::approval::ApprovalCard;
+use crate::widgets::status::{FOCUS_RING, Status, StatusDot};
 
 /// "In fondo" = less than this many pixels from the bottom (spec §9.4).
 const BOTTOM_SLACK_PX: i32 = 48;
@@ -207,7 +208,7 @@ pub fn Transcript(attempt_id: Id) -> impl IntoView {
                 on:keydown=on_key
                 on:mousedown=on_press
             >
-                <div node_ref=content class="flex flex-col gap-3 px-4 py-3">
+                <div node_ref=content class="flex max-w-[68ch] flex-col gap-1 px-5 py-4">
                     <Show when=move || store.has_more.get()>
                         <Button
                             variant=ButtonVariant::Ghost
@@ -247,7 +248,7 @@ pub fn Transcript(attempt_id: Id) -> impl IntoView {
                             .map(|text| {
                                 view! {
                                     <div
-                                        class="text-muted-foreground flex items-start gap-2 text-sm"
+                                        class="text-muted-foreground flex items-start gap-2 text-[13px]"
                                         data-typing=""
                                     >
                                         <Spinner class="mt-0.5 shrink-0" />
@@ -347,7 +348,7 @@ fn EntryRow(row: Row, attempt_id: StoredValue<Id>) -> impl IntoView {
     let nested = row.entry.with_untracked(|e| e.parent_tool_use_id.is_some());
     let class = tw_merge!(
         "[content-visibility:auto] [contain-intrinsic-size:auto_3rem]",
-        if nested { "ml-5 border-l-2 pl-3" } else { "" }
+        if nested { "ml-2 border-l pl-3" } else { "" }
     );
     view! {
         <div data-entry=row.idx class=class>
@@ -364,29 +365,41 @@ fn entry_view(
     open: RwSignal<bool>,
 ) -> AnyView {
     match &entry.body {
+        // No bubbles: a label with the author and the time; only the user's text is on muted.
+        // The rows are tight (tool calls stack), messages keep their own space above.
         EntryBody::UserMessage { text } => {
             let text = text.clone();
             view! {
-                <Message align=MessageAlign::End>
-                    <MessageContent>
-                        <Bubble align=BubbleAlign::End>
-                            <BubbleContent class="whitespace-pre-wrap">{text}</BubbleContent>
-                        </Bubble>
-                    </MessageContent>
-                </Message>
+                <div class="pt-3">
+                    <p class="text-muted-foreground mb-1.5 text-[11px]">
+                        <span class="text-foreground font-medium">"Tu"</span>
+                        {format!(" · {}", clock(entry.ts))}
+                    </p>
+                    <div class="bg-muted rounded-lg px-3 py-2.5 text-[13px] leading-5 whitespace-pre-wrap text-pretty [overflow-wrap:anywhere]">
+                        {text}
+                    </div>
+                </div>
             }
             .into_any()
         }
         EntryBody::AssistantText { text } => {
             let text = text.clone();
+            let author = if entry.parent_tool_use_id.is_some() {
+                "Sub-agent"
+            } else {
+                "Claude"
+            };
             view! {
-                <Message>
-                    <MessageContent>
-                        <Bubble variant=BubbleVariant::Ghost>
-                            <BubbleContent class="whitespace-pre-wrap">{text}</BubbleContent>
-                        </Bubble>
-                    </MessageContent>
-                </Message>
+                <div class="pt-3">
+                    <p class="text-muted-foreground mb-1.5 flex items-center gap-1.5 text-[11px]">
+                        <Sparkles class="size-3 shrink-0" />
+                        <span class="text-foreground font-medium">{author}</span>
+                        {format!(" · {}", clock(entry.ts))}
+                    </p>
+                    <p class="text-[13px] leading-5 whitespace-pre-wrap text-pretty [overflow-wrap:anywhere]">
+                        {text}
+                    </p>
+                </div>
             }
             .into_any()
         }
@@ -395,8 +408,8 @@ fn entry_view(
             expandable(
                 open,
                 view! {
-                    <Brain class="size-4" />
-                    <span class="italic">"Ragionamento"</span>
+                    <Brain class="size-3.5 shrink-0" />
+                    <span class="font-sans italic">"Ragionamento"</span>
                 }
                 .into_any(),
                 move || {
@@ -431,7 +444,7 @@ fn entry_view(
             parts.push(format!("{mcp_servers} server MCP"));
             let warnings = warnings.clone();
             view! {
-                <div class="flex flex-col gap-2">
+                <div class="flex flex-col gap-2 py-2">
                     <Marker variant=MarkerVariant::Separator class="text-xs">
                         <MarkerContent>{parts.join(" · ")}</MarkerContent>
                     </Marker>
@@ -492,7 +505,7 @@ fn entry_view(
             expandable(
                 open,
                 view! {
-                    <SquareTerminal class="size-4" />
+                    <SquareTerminal class="size-3.5 shrink-0" />
                     <span>"stderr"</span>
                 }
                 .into_any(),
@@ -502,13 +515,10 @@ fn entry_view(
     }
 }
 
-/// The vendored `Destructive` badge uses `text-destructive-foreground`, which has no token.
-pub const ON_DESTRUCTIVE: &str = "text-white";
-
 const PRE_CLASS: &str = "bg-muted max-h-80 overflow-auto rounded-md p-2 font-mono text-xs whitespace-pre-wrap [overflow-wrap:anywhere]";
 
-/// A collapsed row whose body is rendered only while open (tool output, thinking, stderr are
-/// collapsed by default, spec §9.4).
+/// A collapsed 28 px mono row whose body is rendered only while open (tool output, thinking,
+/// stderr are collapsed by default, spec §9.4).
 fn expandable(
     open: RwSignal<bool>,
     header: AnyView,
@@ -516,15 +526,21 @@ fn expandable(
 ) -> AnyView {
     view! {
         <Collapsible open>
-            <CollapsibleTrigger class="text-muted-foreground hover:text-foreground flex w-full min-w-0 items-center gap-2 text-left text-sm">
+            <CollapsibleTrigger
+                class=tw_merge!(
+                    "text-muted-foreground hover:bg-muted flex h-7 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left font-mono text-[11.5px]",
+                    FOCUS_RING
+                )
+                attr:aria-expanded=move || open.get().to_string()
+            >
                 <span class=move || {
                     tw_merge!("shrink-0 transition-transform", if open.get() { "rotate-90" } else { "" })
                 }>
-                    <ChevronRight class="size-4" />
+                    <ChevronRight class="size-3.5" />
                 </span>
                 {header}
             </CollapsibleTrigger>
-            <CollapsibleContent class="pt-2 pl-6">{move || open.get().then(&body)}</CollapsibleContent>
+            <CollapsibleContent class="pt-1.5 pb-1 pl-7">{move || open.get().then(&body)}</CollapsibleContent>
         </Collapsible>
     }
     .into_any()
@@ -539,36 +555,45 @@ fn tool_view(
     open: RwSignal<bool>,
 ) -> AnyView {
     let (icon, badge) = match status {
-        ToolStatus::Running => (view! { <Spinner /> }.into_any(), None),
+        // The sub-agent at work: the live dot of the design.
+        ToolStatus::Running if matches!(name, "Task" | "Agent") => (
+            view! { <StatusDot status=Status::Running ping=true /> }.into_any(),
+            None,
+        ),
+        ToolStatus::Running => (view! { <Spinner class="size-3.5" /> }.into_any(), None),
         ToolStatus::Succeeded => (
-            view! { <Check class="text-success size-4" /> }.into_any(),
+            view! { <Check class="text-success size-3.5" /> }.into_any(),
             None,
         ),
         ToolStatus::Failed => (
-            view! { <X class="text-destructive size-4" /> }.into_any(),
-            Some((BadgeVariant::Destructive, "Errore", ON_DESTRUCTIVE)),
+            view! { <X class="text-destructive size-3.5" /> }.into_any(),
+            Some((BadgeVariant::Destructive, "Errore")),
         ),
         ToolStatus::Denied { .. } => (
-            view! { <Ban class="text-destructive size-4" /> }.into_any(),
-            Some((BadgeVariant::Destructive, "Negato", ON_DESTRUCTIVE)),
+            view! { <Ban class="text-destructive size-3.5" /> }.into_any(),
+            Some((BadgeVariant::Destructive, "Negato")),
         ),
         ToolStatus::Cancelled => (
-            view! { <CircleStop class="text-muted-foreground size-4" /> }.into_any(),
-            Some((BadgeVariant::Muted, "Annullato", "")),
+            view! { <CircleStop class="text-muted-foreground size-3.5" /> }.into_any(),
+            Some((BadgeVariant::Muted, "Annullato")),
         ),
         ToolStatus::AwaitingApproval { .. } => (
-            view! { <Hourglass class="size-4" /> }.into_any(),
-            Some((BadgeVariant::Warning, "Richiede approvazione", "")),
+            view! { <Hourglass class="size-3.5" /> }.into_any(),
+            Some((BadgeVariant::Warning, "Attende approvazione")),
         ),
     };
     let header = view! {
         {icon}
-        <span class="text-foreground min-w-0 truncate font-mono text-xs" title=summary.to_owned()>
+        <span class="text-foreground/90 min-w-0 truncate" title=summary.to_owned()>
             {summary.to_owned()}
         </span>
         {badge
-            .map(|(variant, label, class)| {
-                view! { <Badge variant class=tw_merge!("shrink-0", class)>{label}</Badge> }
+            .map(|(variant, label)| {
+                view! {
+                    <Badge variant class="ml-auto shrink-0 font-sans">
+                        {label}
+                    </Badge>
+                }
             })}
     }
     .into_any();
@@ -619,17 +644,13 @@ fn turn_end_view(
     stopped: Option<StopReason>,
 ) -> AnyView {
     let outcome = if let Some(reason) = stopped {
-        (BadgeVariant::Muted, stopped_label(reason).to_owned(), "")
+        (BadgeVariant::Muted, stopped_label(reason).to_owned())
     } else if is_error {
-        (
-            BadgeVariant::Destructive,
-            format!("Errore ({subtype})"),
-            ON_DESTRUCTIVE,
-        )
+        (BadgeVariant::Destructive, format!("Errore ({subtype})"))
     } else if subtype == "success" {
-        (BadgeVariant::Success, "Completato".to_owned(), "")
+        (BadgeVariant::Success, "Completato".to_owned())
     } else {
-        (BadgeVariant::Muted, subtype.to_owned(), "")
+        (BadgeVariant::Muted, subtype.to_owned())
     };
     let mut details = Vec::new();
     details.extend(duration_ms.map(seconds));
@@ -648,10 +669,10 @@ fn turn_end_view(
     });
     let error = (is_error && stopped.is_none()).then_some(()).and(text);
     view! {
-        <div class="flex flex-col gap-2" data-turn-end="" data-stopped=stopped.map(StopReason::as_str)>
+        <div class="flex flex-col gap-2 py-3" data-turn-end="" data-stopped=stopped.map(StopReason::as_str)>
             <Marker variant=MarkerVariant::Separator class="text-xs">
                 <MarkerContent class="flex flex-wrap items-center justify-center gap-1.5">
-                    <Badge variant=outcome.0 class=outcome.2>{outcome.1}</Badge>
+                    <Badge variant=outcome.0>{outcome.1}</Badge>
                     {details.into_iter().map(|d| view! { <Badge variant=BadgeVariant::Outline>{d}</Badge> }).collect_view()}
                 </MarkerContent>
             </Marker>
@@ -683,7 +704,7 @@ fn notice_view(
         }
     });
     view! {
-        <div data-notice="">
+        <div class="py-1.5" data-notice="">
             {alert(level, String::new(), text)}
             {button}
         </div>
@@ -710,7 +731,7 @@ fn new_session(ctx: AppCtx, attempt_id: StoredValue<Id>, sending: RwSignal<bool>
 fn alert(level: Level, title: String, text: String) -> AnyView {
     let class = match level {
         Level::Info => "",
-        Level::Warn => "border-warning/60 bg-warning-light/40 dark:bg-warning-dark/20",
+        Level::Warn => "border-status-waiting/25 bg-status-waiting/8",
         Level::Error => "border-destructive/50 text-destructive",
     };
     view! {
@@ -740,13 +761,19 @@ fn stopped_label(reason: StopReason) -> &'static str {
 }
 
 /// Labels of the permission modes (spec D6).
-fn mode_label(mode: &str) -> String {
+pub fn mode_label(mode: &str) -> String {
     match mode {
         "default" => "Supervisionato".into(),
         "acceptEdits" => "Auto-edit".into(),
         "bypassPermissions" => "Autonomo".into(),
         other => other.into(),
     }
+}
+
+/// "18:22", local time.
+fn clock(ms: Millis) -> String {
+    let date = js_sys::Date::new(&JsValue::from_f64(ms as f64));
+    format!("{:02}:{:02}", date.get_hours(), date.get_minutes())
 }
 
 fn pretty_json(text: &str) -> String {

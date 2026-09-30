@@ -1,10 +1,10 @@
 //! Mock of `get_project_overview` (spec F3). Owner: UI-SHELL.
 //!
-//! The demo project gets a full repository: CLAUDE.md, `.claude/CLAUDE.md` as a link, an
-//! AGENTS.md with a bidirectional character, a README too large to show, `.claude/settings.json`
-//! with its secrets masked, `.mcp.json` servers and `.claude/` agents, commands and skills.
-//! Any other project gets a bare one (README only). `?overview_error` answers with the error
-//! of a default target branch that cannot be read.
+//! The demo project gets a full repository: a long CLAUDE.md with a hidden character, no
+//! `.claude/CLAUDE.md`, an AGENTS.md with a bidirectional character, a README,
+//! `.claude/settings.json` with its secrets masked, `.mcp.json` servers and `.claude/` agents,
+//! commands and skills. Any other project gets an empty one, for the empty states.
+//! `?overview_error` answers with the error of a default target branch that cannot be read.
 
 use atm_types::*;
 use serde_json::Value;
@@ -40,32 +40,22 @@ fn overview(project: &Project) -> ProjectOverview {
         claude_skills: Vec::new(),
     };
     if project.name != "demo" {
-        overview.files.push(file(
-            "README.md",
-            ContextFileKind::Readme,
-            "# sito-web\n\nSito statico: `npm run build` genera `dist/`.\n",
-            "solo contesto per te",
-        ));
         return overview;
     }
 
     // The usage notes are the backend's (`git/overview.rs`, `usage`).
-    let (memory, nested_memory, config) = if loaded {
-        (
-            "caricato all'avvio",
-            "caricato all'avvio",
-            "caricato all'avvio",
-        )
+    let (memory, config) = if loaded {
+        ("caricato all'avvio", "caricato all'avvio")
     } else {
         (
             "letto dall'agente su istruzione del prompt",
-            "non caricato in modalità Isolata: il prompt fa leggere solo il CLAUDE.md della radice",
             "non caricato in modalità Isolata",
         )
     };
     overview.files = vec![
         ContextFile {
             used_by_agents: loaded,
+            hidden_chars: true,
             ..file(
                 "CLAUDE.md",
                 ContextFileKind::Memory,
@@ -74,24 +64,26 @@ fn overview(project: &Project) -> ProjectOverview {
                  ## Regole\n\
                  - Esegui `cargo test` e `cargo clippy -- -D warnings` prima di chiudere un task.\n\
                  - Niente dipendenze nuove senza chiedere.\n\
-                 - Messaggi di errore per l'utente in italiano.\n\n\
+                 - Messaggi di errore per l'utente in italiano.\n\
+                 - Un commit per task, con un messaggio che dice il perché.\n\
+                 - Non toccare `migrations/` già rilasciate: aggiungine una nuova.\n\n\
                  ## Struttura\n\
                  - `src/api/`: handler HTTP\n\
                  - `src/parser/`: parser dei filtri\n\
-                 - `tests/`: test di integrazione (database in memoria)\n",
+                 - `src/db/`: accesso al database (sqlx)\n\
+                 - `tests/`: test di integrazione (database in memoria)\n\n\
+                 ## Stile\n\
+                 - Errori con `thiserror`, mai `unwrap()` fuori dai test.\n\
+                 - Nomi dei moduli al singolare.\n\
+                 - Log con `tracing`, livello `debug` per i dettagli.\n\n\
+                 ## Comandi\n\
+                 - `cargo run -- --port 8080`: avvia il server\n\
+                 - `cargo test parser`: solo i test del parser\n\
+                 - `cargo sqlx prepare`: aggiorna le query verificate\n\n\
+                 ## Note\n\
+                 - La paginazione usa un cursore, non l'offset.\n\
+                 - Il campo `email`⟨U+200B⟩ degli utenti è unico.\n",
                 memory,
-            )
-        },
-        ContextFile {
-            size: "../CLAUDE.md".len() as u64,
-            content: None,
-            note: Some("→ ../CLAUDE.md".into()),
-            used_by_agents: loaded,
-            ..file(
-                ".claude/CLAUDE.md",
-                ContextFileKind::Memory,
-                "",
-                nested_memory,
             )
         },
         ContextFile {
@@ -106,17 +98,24 @@ fn overview(project: &Project) -> ProjectOverview {
                 "letto su istruzione del prompt",
             )
         },
-        ContextFile {
-            size: 91_136,
-            content: None,
-            note: Some("troppo grande (89 KiB)".into()),
-            ..file(
-                "README.md",
-                ContextFileKind::Readme,
-                "",
-                "solo contesto per te",
-            )
-        },
+        file(
+            "README.md",
+            ContextFileKind::Readme,
+            "# demo\n\n\
+             API REST di esempio: utenti, ricerca con filtri e paginazione.\n\n\
+             ## Avvio\n\n\
+             ```sh\n\
+             cp .env.example .env\n\
+             cargo run -- --port 8080\n\
+             ```\n\n\
+             ## Endpoint\n\n\
+             - `GET /users?filter=…&cursor=…`\n\
+             - `GET /users/{id}`\n\
+             - `POST /users`\n\n\
+             ## Licenza\n\n\
+             MIT\n",
+            "solo contesto per te",
+        ),
         ContextFile {
             used_by_agents: loaded,
             note: Some("valori segreti mascherati".into()),

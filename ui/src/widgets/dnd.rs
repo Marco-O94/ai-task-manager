@@ -101,6 +101,20 @@ impl DragCtx {
     }
 }
 
+/// The drop slot a column shows at the insertion index: a dashed card-sized box, out of the
+/// layout (`hidden`) while `show` is false. It carries no `data-task-id`, so the card
+/// midpoints never count it.
+#[component]
+pub fn DropPlaceholder(show: Signal<bool>) -> impl IntoView {
+    view! {
+        <div
+            class="border-primary/40 bg-primary/5 h-[58px] shrink-0 rounded-lg border-2 border-dashed"
+            class:hidden=move || !show.get()
+            aria-hidden="true"
+        />
+    }
+}
+
 /// Insertion index for a pointer at `client_y` among cards whose vertical midpoints are
 /// `mids` (ascending): the number of midpoints above the pointer.
 pub fn insertion_index(mids: &[f64], client_y: f64) -> usize {

@@ -34,7 +34,7 @@ fn models() -> Vec<(String, String)> {
 pub fn SettingsDialog(open: RwSignal<bool>) -> impl IntoView {
     view! {
         <Dialog open=open>
-            <DialogContent class="overflow-y-auto sm:max-w-xl" data_name_prefix="Settings">
+            <DialogContent class="overflow-y-auto shadow-md sm:max-w-xl" data_name_prefix="Settings">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>"Impostazioni app"</DialogTitle>
@@ -196,7 +196,7 @@ fn Field(
 #[component]
 fn Checkbox(id: &'static str, checked: RwSignal<bool>, children: Children) -> impl IntoView {
     view! {
-        <label for=id class="flex items-start gap-2 text-sm">
+        <label for=id class="flex items-start gap-2 text-[13px]">
             <input
                 type="checkbox"
                 id=id

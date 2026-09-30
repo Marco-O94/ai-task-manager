@@ -141,7 +141,7 @@ pub fn MergeDialog(
             .into_any(),
             Blocked::Failed(e) if e.code == ErrorCode::TargetCheckoutDirty => view! {
                 <Alert
-                    class="border-warning/60 bg-warning-light/40 dark:bg-warning-dark/20"
+                    class="border-status-waiting/25 bg-status-waiting/8"
                     attr:data-outcome="target-dirty"
                 >
                     <AlertTitle>{format!("Il checkout di {} ha modifiche locali", target())}</AlertTitle>
@@ -166,7 +166,7 @@ pub fn MergeDialog(
 
     view! {
         <Dialog open>
-            <DialogContent class="sm:max-w-2xl" data_name_prefix="MergeDialog">
+            <DialogContent class="rounded-xl shadow-md sm:max-w-2xl" data_name_prefix="MergeDialog">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>{move || format!("Squash merge in {}", target())}</DialogTitle>
@@ -226,7 +226,7 @@ pub fn DiscardDialog(open: RwSignal<bool>, attempt_id: Id, branch: String) -> im
     };
     view! {
         <Dialog open>
-            <DialogContent class="sm:max-w-md" data_name_prefix="DiscardDialog">
+            <DialogContent class="rounded-xl shadow-md sm:max-w-md" data_name_prefix="DiscardDialog">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>"Scartare il tentativo?"</DialogTitle>

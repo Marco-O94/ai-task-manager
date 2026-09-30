@@ -292,7 +292,7 @@ fn Layout() -> impl IntoView {
                                     .get()
                                     .map(|task_id| {
                                         view! {
-                                            <aside class="w-[55%] shrink-0 overflow-hidden border-l">
+                                            <aside class="border-border bg-background w-[55%] shrink-0 overflow-hidden border-l shadow-lg">
                                                 <TaskPanel task_id />
                                             </aside>
                                         }

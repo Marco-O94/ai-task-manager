@@ -956,7 +956,8 @@ async fn steps_1_2(run: &mut Run) -> R<String> {
     until("board after Ricontrolla", UI, || q("[data-view=sidebar]")).await?;
     let account = wait_q("[data-testid=account]").await?;
     let chip = text(&account);
-    if !chip.contains("fake@example.com") {
+    // The subscription only: the app never shows the email or the organization (spec §10.1).
+    if chip != "max" || chip.contains('@') {
         return Err(format!("account chip: {chip:?}"));
     }
     Ok(format!(
@@ -1088,8 +1089,8 @@ async fn step_3(run: &Run) -> R<String> {
 /// F3 on the project just added: `mcp` lands on its Riepilogo, read from its committed files.
 /// The CLAUDE.md card shows the file and how an Isolated project's agents get it; the MCP
 /// server of `.mcp.json` is listed with its env key and never the value, which is neither in
-/// the page (text or attributes) nor in the `get_project_overview` reply; the CTA "Apri task
-/// (0)" opens its empty Task page. The page is a `tabpanel` inside the `main` landmark (which
+/// the page (text or attributes) nor in the `get_project_overview` reply; the CTA "Crea il
+/// primo task" (no tasks yet) opens its empty Task page. The page is a `tabpanel` inside the `main` landmark (which
 /// keeps its own role), and each file block's trigger says whether its text is expanded and
 /// controls it: CLAUDE.md expanded, README.md collapsed with its text `inert` until clicked.
 async fn overview_of_mcp() -> R<String> {
@@ -1162,9 +1163,9 @@ async fn overview_of_mcp() -> R<String> {
             reply.contains(MCP_SECRET)
         ));
     }
-    let cta = until("Apri task (0)", UI, || {
+    let cta = until("Crea il primo task", UI, || {
         q("[data-view=overview] [data-action=open-tasks]")
-            .filter(|b| text(b).contains("Apri task (0)"))
+            .filter(|b| text(b).contains("Crea il primo task"))
     })
     .await?;
     click(&cta);
@@ -1180,7 +1181,7 @@ async fn overview_of_mcp() -> R<String> {
         "mcp on its Riepilogo (a tabpanel in main): CLAUDE.md «letto dall'agente su istruzione \
          del prompt» (Isolata), expanded; README.md collapsed and inert, then expanded by its \
          trigger; server {MCP_SERVER} with env key {MCP_ENV_KEY} and its value in neither the \
-         page nor get_project_overview; «Apri task (0)» → its empty board"
+         page nor get_project_overview; «Crea il primo task» → its empty board"
     ))
 }
 
@@ -1300,16 +1301,21 @@ async fn step_4_relaunch(run: &mut Run) -> R<String> {
     ))
 }
 
-/// "Crea hello [fake:approval]" in Auto-edit: running badge with its spinner, approval card,
-/// "Consenti sempre" (the card, the badges and the pending tool entry clear; the answer
-/// fake-claude got allows and remembers), the text streamed word by word, TurnEnd, "In
-/// revisione".
+/// "Crea hello [fake:approval]" in Auto-edit: running (or already approval) badge as a live
+/// region, approval card, "Approva sempre" (the card, the badges and the pending tool entry
+/// clear; the answer fake-claude got allows and remembers), the text streamed word by word,
+/// TurnEnd, "In revisione".
 async fn step_5(run: &mut Run) -> R<String> {
     let t1 = run.st.t1.clone();
     start_attempt(&t1, "acceptEdits").await?;
-    let running = until("running badge", UI, || badge(&t1, "running")).await?;
-    if find_in(&running, "[role=status]").is_none() {
-        return Err("no spinner in the running badge".into());
+    // One agent badge per card: the approval replaces the running badge as soon as it is
+    // asked, so either may be the first one seen; both are live regions.
+    let live = until("running badge", UI, || {
+        badge(&t1, "running").or_else(|| badge(&t1, "approval"))
+    })
+    .await?;
+    if find_in(&live, "[role=status]").is_none() {
+        return Err("no live region in the agent badge".into());
     }
     let card_ = until("approval card", TURN, || {
         q("[data-view=task-panel] [data-approval]")
@@ -1334,11 +1340,11 @@ async fn step_5(run: &mut Run) -> R<String> {
     let panel = panel().ok_or("no task panel")?;
     let typing = TypingLog::start(&panel)?;
     let before = entries().len();
-    click(&find_in(&card_, "[data-action=allow-always]").ok_or("no Consenti sempre")?);
+    click(&find_in(&card_, "[data-action=allow-always]").ok_or("no Approva sempre")?);
     until("approval answered", UI, || {
         (q("[data-view=task-panel] [data-approval]").is_none()
             && badge(&t1, "approval").is_none()
-            && !panel_header().contains("Richiede approvazione"))
+            && !panel_header().contains("Attende approvazione"))
         .then_some(())
     })
     .await?;
@@ -1372,7 +1378,7 @@ async fn step_5(run: &mut Run) -> R<String> {
     }
     let bash = bash_call(&attempt).await?;
     if bash != ToolStatus::Succeeded {
-        return Err(format!("Bash entry after Consenti sempre: {bash:?}"));
+        return Err(format!("Bash entry after Approva sempre: {bash:?}"));
     }
     wait_idle(&t1, "inreview").await?;
     // The panel refetches its detail on its own, after the board.
@@ -1407,7 +1413,7 @@ async fn step_5(run: &mut Run) -> R<String> {
         return Err(format!("recorded answer {answer}"));
     }
     Ok(format!(
-        "spinner in the running badge → approval card → Consenti sempre (card and badges \
+        "live agent badge → approval card → Approva sempre (card and badges \
          cleared, Bash entry Succeeded, fake-claude got allow + updatedPermissions \
          Bash(echo hello) for the session) → typing {previews:?} → {} entries → TurnEnd \
          Completato → In revisione (column, panel and DB: task inreview, turn completed); \

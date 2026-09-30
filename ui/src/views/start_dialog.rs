@@ -206,7 +206,7 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
 
     view! {
         <Dialog open>
-            <DialogContent class="overflow-y-auto sm:max-w-lg" data_name_prefix="StartDialog">
+            <DialogContent class="overflow-y-auto rounded-xl shadow-md sm:max-w-lg" data_name_prefix="StartDialog">
                 <DialogBody>
                     <DialogHeader>
                         <DialogTitle>"Avvia l'agente"</DialogTitle>

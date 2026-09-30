@@ -1,40 +1,50 @@
-//! Task panel (right split, 55 %): header (Avvia, Stop, Scarta, Apri in…, "Sposta in…", the
-//! attachments, the attempt's model and sub-agent limit) and the Agente / Modifiche tabs
-//! (spec §9.2). Refetches `get_task_detail` when `AppCtx::detail_version` changes.
-//! Owner: M2-UI-TASK, attachments and model line UI-TASKS.
+//! Task panel (right split, 55 %): header on three rows (column and date with the actions:
+//! Avvia, Merge, Stop, Continua, Scarta, Apri in…, "Sposta in…"; the title; the agent badge,
+//! the branch and the attachments) plus the attempt's label/value line, and the Agente /
+//! Modifiche tabs (spec §9.2). Refetches `get_task_detail` when `AppCtx::detail_version`
+//! changes. Owner: M2-UI-TASK, attachments and model line UI-TASKS.
 
 use atm_types::{
     AppError, AttemptIdReq, AttemptView, CONTINUE_PROMPT, GetTaskDetail, Id, IdReq, MoveTask,
-    MoveTaskReq, OpenAttempt, OpenAttemptReq, OpenTarget, ProcessStatus, SendFollowUp,
-    SendFollowUpReq, StopAttempt, Task, TaskDetail, TaskStatus, WorktreeState,
+    MoveTaskReq, OpenAttempt, OpenAttemptReq, OpenTarget, SendFollowUp, SendFollowUpReq,
+    StopAttempt, Task, TaskCard, TaskDetail, TaskStatus, WorktreeState,
 };
 use icons::{
-    Code, FolderOpen, GitBranch, Paperclip, Play, RotateCw, Square, SquareTerminal, Trash2, X,
+    Code, FolderOpen, GitBranch, GitMerge, Paperclip, Play, RotateCw, Square, SquareTerminal,
+    Trash2, X,
 };
+use leptos::ev::KeyboardEvent;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use tw_merge::tw_merge;
+use wasm_bindgen::JsCast;
 
 use crate::app::{AppCtx, use_app};
 use crate::ipc;
 use crate::ui::alert::{Alert, AlertDescription, AlertTitle};
-use crate::ui::badge::{Badge, BadgeVariant};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::select_native::SelectNative;
 use crate::ui::skeleton::Skeleton;
-use crate::ui::spinner::Spinner;
 use crate::ui::tabs::{Tabs, TabsContent, TabsList, TabsTrigger, TabsVariant};
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
-use crate::views::board::interrupted_by_app;
+use crate::views::board::{column_title, interrupted_by_app, updated_text, updated_title};
 use crate::views::composer::Composer;
 use crate::views::diff::{ClosedAttempt, DiffView};
 use crate::views::merge_dialog::DiscardDialog;
+use crate::views::overview::short_commit;
 use crate::views::start_dialog::StartDialog;
 use crate::views::task_dialog::format_size;
-use crate::views::transcript::{ON_DESTRUCTIVE, Transcript};
+use crate::views::transcript::{Transcript, mode_label};
+use crate::widgets::status::{AgentBadge, FOCUS_RING, Status, StatusDot, agent_state};
 
 const TAB_AGENT: &str = "agent";
 const TAB_CHANGES: &str = "changes";
+
+/// The header's compact buttons (h-7), with the design's focus ring.
+const SMALL: &str = "h-7 px-2.5 text-xs has-[>svg]:px-2.5 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+/// Line tab: the underline sits on the tab list's bottom border, in the primary colour.
+const LINE_TAB: &str = "h-full flex-none rounded-none border-0 px-0 text-[13px] after:bg-primary group-data-[orientation=Horizontal]/tabs:after:bottom-[-1px] focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 
 /// Mounted per task: `app.rs` re-creates it when `AppCtx::open_task` changes.
 #[component]
@@ -87,11 +97,12 @@ pub fn TaskPanel(task_id: Id) -> impl IntoView {
                 } else {
                     Some(
                         view! {
-                            <header class="flex items-center gap-2 border-b p-3">
+                            <header class="flex items-center gap-2 border-b px-5 py-3.5">
                                 <Skeleton class="h-6 flex-1" />
                                 <Button
                                     variant=ButtonVariant::Ghost
                                     size=ButtonSize::IconSm
+                                    class=tw_merge!("text-muted-foreground size-7", FOCUS_RING)
                                     attr:aria-label="Chiudi"
                                     on:click=close
                                 >
@@ -148,7 +159,11 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                 .unwrap_or_default()
         })
     });
-    let meta = Memo::new(move |_| active.with(|a| a.as_ref().and_then(attempt_meta)));
+    let meta =
+        Memo::new(move |_| active.with(|a| a.as_ref().map(attempt_meta).unwrap_or_default()));
+    let agent = Memo::new(move |_| detail.with(|d| d.as_ref().and_then(panel_state)));
+    let pending =
+        Memo::new(move |_| active.with(|a| a.as_ref().is_some_and(|a| a.pending_approvals > 0)));
     let active_id = Memo::new(move |_| active.with(|a| a.as_ref().map(|a| a.id.clone())));
     let active_ref =
         Memo::new(move |_| active.with(|a| a.as_ref().map(|a| (a.id.clone(), a.branch.clone()))));
@@ -167,12 +182,21 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
             })
     });
     let tab = RwSignal::new(TAB_AGENT);
+    // One primary action per state: Avvia (no attempt), Continua (interrupted), else Merge in
+    // review while the agent is idle; it opens Modifiche, where the merge is (and hides there).
+    let can_merge = Memo::new(move |_| {
+        task.with(|t| t.status == TaskStatus::InReview)
+            && active.with(Option::is_some)
+            && !running.get()
+            && !interrupted.get()
+            && tab.get() != TAB_CHANGES
+    });
     let start_for = RwSignal::new(None::<Id>);
     let discard_open = RwSignal::new(false);
     let task_id = move || task.with_untracked(|t| t.id.clone());
     let open_start = move |_| start_for.set(Some(task_id()));
 
-    let agent = move || match shown_id.get() {
+    let agent_view = move || match shown_id.get() {
         Some(attempt_id) => view! { <Transcript attempt_id /> }.into_any(),
         None => view! {
             <div class="flex flex-1 items-center justify-center p-6">
@@ -229,185 +253,237 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
     };
 
     view! {
-        <header class="flex flex-col gap-2 border-b p-3">
+        <header class="shrink-0 border-b px-5 pt-3.5 pb-3">
+            // The close button stays top right however the actions wrap; the date gives way before
+            // they do.
             <div class="flex items-start gap-2">
-                <div class="min-w-0 flex-1">
-                    <h2 class="truncate text-base font-semibold">{move || task.with(|t| t.title.clone())}</h2>
-                    <div class="mt-1 flex flex-wrap items-center gap-1.5">
-                        <Badge variant=BadgeVariant::Outline>
-                            {move || status_label(task.with(|t| t.status))}
-                        </Badge>
-                        {move || active.get().map(|a| branch_chip(&a))}
-                        <Show when=move || running.get()>
-                            <Badge variant=BadgeVariant::Info class="gap-1">
-                                <Spinner class="size-3" />
-                                "In esecuzione"
-                            </Badge>
+                <div class="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
+                    <p class="text-muted-foreground flex min-w-0 flex-[1_1_10rem] items-center gap-2 text-[11px] whitespace-nowrap">
+                        {move || view! { <StatusDot status=Status::of_column(task.with(|t| t.status)) /> }}
+                        <span>{move || column_title(task.with(|t| t.status))}</span>
+                        <span aria-hidden="true">"·"</span>
+                        <span class="truncate" title=move || task.with(|t| updated_title(t.created_at))>
+                            {move || format!("creato {}", updated_text(task.with(|t| t.created_at)))}
+                        </span>
+                    </p>
+                    <div class="ml-auto flex flex-wrap items-center justify-end gap-1">
+                        <Show when=move || active.with(Option::is_none)>
+                            <Button size=ButtonSize::Sm class=SMALL attr:data-action="open-start" on:click=open_start>
+                                <Play />
+                                "Avvia"
+                            </Button>
                         </Show>
-                        {move || {
-                            let n = active.with(|a| a.as_ref().map_or(0, |a| a.pending_approvals));
-                            (n > 0)
-                                .then(|| {
-                                    view! {
-                                        <Badge variant=BadgeVariant::Warning>
-                                            {format!("Richiede approvazione ({n})")}
-                                        </Badge>
-                                    }
-                                })
-                        }}
-                        <Show when=move || {
-                            !running.get() && !interrupted.get()
-                                && last_process
-                                    .with(|p| p.as_ref().is_some_and(|p| p.status == ProcessStatus::Failed))
-                        }>
-                            <Badge variant=BadgeVariant::Destructive class=ON_DESTRUCTIVE>
-                                "Fallito"
-                            </Badge>
+                        <Show when=move || can_merge.get()>
+                            <Button
+                                size=ButtonSize::Sm
+                                class=SMALL
+                                attr:data-action="open-merge"
+                                attr:title="Apri Modifiche per il merge"
+                                on:click=move |_| show_tab(tab, TAB_CHANGES, true)
+                            >
+                                <GitMerge />
+                                "Merge"
+                            </Button>
                         </Show>
                         <Show when=move || interrupted.get()>
-                            <Badge variant=BadgeVariant::Warning>"Interrotto"</Badge>
+                            <Button
+                                size=ButtonSize::Sm
+                                class=SMALL
+                                on:click=move |_| attempt_command(ctx, active, Command::Continue)
+                            >
+                                <RotateCw />
+                                "Continua"
+                            </Button>
                         </Show>
+                        <Show when=move || running.get()>
+                            <Button
+                                variant=ButtonVariant::Outline
+                                size=ButtonSize::Sm
+                                class=SMALL
+                                attr:data-action="stop"
+                                on:click=move |_| attempt_command(ctx, active, Command::Stop)
+                            >
+                                <Square />
+                                "Stop"
+                            </Button>
+                        </Show>
+                        <Show when=move || active.with(Option::is_some)>
+                            <Button
+                                variant=ButtonVariant::Ghost
+                                size=ButtonSize::Sm
+                                class=tw_merge!(SMALL, "text-destructive hover:bg-destructive/10 hover:text-destructive")
+                                attr:data-action="discard"
+                                on:click=move |_| discard_open.set(true)
+                            >
+                                <Trash2 />
+                                "Scarta"
+                            </Button>
+                        </Show>
+                        <Show when=move || {
+                            active.with(|a| a.as_ref().is_some_and(|a| a.worktree_state == WorktreeState::Present))
+                        }>
+                            <div class="flex items-center">
+                                {[
+                                    (OpenTarget::Finder, "Apri in Finder"),
+                                    (OpenTarget::Terminal, "Apri nel Terminale"),
+                                    (OpenTarget::Editor, "Apri nell'editor"),
+                                ]
+                                    .into_iter()
+                                    .map(|(target, label)| {
+                                        let icon = match target {
+                                            OpenTarget::Finder => view! { <FolderOpen /> }.into_any(),
+                                            OpenTarget::Terminal => view! { <SquareTerminal /> }.into_any(),
+                                            OpenTarget::Editor => view! { <Code /> }.into_any(),
+                                        };
+                                        view! {
+                                            <Tooltip class="my-0">
+                                                <Button
+                                                    variant=ButtonVariant::Ghost
+                                                    size=ButtonSize::IconSm
+                                                    class=tw_merge!("text-muted-foreground size-7 [&_svg:not([class*='size-'])]:size-3.5", FOCUS_RING)
+                                                    attr:aria-label=label
+                                                    on:click=move |_| attempt_command(ctx, active, Command::Open(target))
+                                                >
+                                                    {icon}
+                                                </Button>
+                                                <TooltipContent position=TooltipPosition::Bottom class="shadow-md">
+                                                    {label}
+                                                </TooltipContent>
+                                            </Tooltip>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </div>
+                        </Show>
+                        <label for="task-move" class="sr-only">
+                            "Sposta in"
+                        </label>
+                        <div class="w-28" title="Sposta in">
+                            <MoveSelect task active start_for />
+                        </div>
                     </div>
-                    {move || {
-                        meta.get()
-                            .map(|line| {
-                                view! {
-                                    <p class="text-muted-foreground mt-1.5 text-xs" data-testid="attempt-meta">
-                                        {line}
-                                    </p>
-                                }
-                            })
-                    }}
-                    <Show when=move || attachments.with(|a| !a.is_empty())>
-                        <ul class="mt-1.5 flex flex-wrap gap-1.5" aria-label="Allegati">
-                            <For each=move || attachments.get() key=|a| a.id.clone() let:a>
-                                <li
-                                    class="bg-muted text-muted-foreground inline-flex max-w-60 items-center gap-1 rounded-md px-1.5 py-0.5 text-xs"
-                                    title=a.path.clone()
-                                    data-attachment=a.name.clone()
-                                >
-                                    <Paperclip class="size-3 shrink-0" />
-                                    <span class="text-foreground truncate">{a.name.clone()}</span>
-                                    <span class="shrink-0">{format_size(a.size)}</span>
-                                </li>
-                            </For>
-                        </ul>
-                    </Show>
                 </div>
+                <span class="bg-border mx-1 mt-1.5 h-4 w-px shrink-0" aria-hidden="true"></span>
                 <Button
                     variant=ButtonVariant::Ghost
                     size=ButtonSize::IconSm
+                    class=tw_merge!("text-muted-foreground size-7 shrink-0", FOCUS_RING)
                     attr:aria-label="Chiudi"
                     on:click=move |_| ctx.open_task.set(None)
                 >
                     <X />
                 </Button>
             </div>
-            <div class="flex flex-wrap items-center gap-2">
-                <Show when=move || active.with(Option::is_none)>
-                    <Button size=ButtonSize::Sm attr:data-action="open-start" on:click=open_start>
-                        <Play />
-                        "Avvia"
-                    </Button>
+            <h2 class="mt-1.5 text-[17px] leading-6 font-semibold tracking-tight text-pretty [overflow-wrap:anywhere]">
+                {move || task.with(|t| t.title.clone())}
+            </h2>
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+                {move || agent.get().map(|(label, status)| view! { <AgentBadge label status /> })}
+                {move || active.get().map(|a| branch_chip(&a))}
+                <Show when=move || attachments.with(|a| !a.is_empty())>
+                    <Show when=move || agent.with(Option::is_some) || active.with(Option::is_some)>
+                        <span class="bg-border h-3 w-px" aria-hidden="true"></span>
+                    </Show>
+                    <ul class="flex flex-wrap gap-1.5" aria-label="Allegati">
+                        <For each=move || attachments.get() key=|a| a.id.clone() let:a>
+                            <li
+                                class="bg-muted inline-flex h-5 max-w-60 items-center gap-1 rounded-md px-1.5 text-[11px]"
+                                title=a.path.clone()
+                                data-attachment=a.name.clone()
+                            >
+                                <Paperclip class="text-muted-foreground size-3 shrink-0" />
+                                <span class="truncate">{a.name.clone()}</span>
+                                <span class="text-muted-foreground shrink-0">{format_size(a.size)}</span>
+                            </li>
+                        </For>
+                    </ul>
                 </Show>
-                <Show when=move || running.get()>
-                    <Button
-                        variant=ButtonVariant::Outline
-                        size=ButtonSize::Sm
-                        attr:data-action="stop"
-                        on:click=move |_| attempt_command(ctx, active, Command::Stop)
-                    >
-                        <Square />
-                        "Stop"
-                    </Button>
-                </Show>
-                <Show when=move || interrupted.get()>
-                    <Button
-                        size=ButtonSize::Sm
-                        on:click=move |_| attempt_command(ctx, active, Command::Continue)
-                    >
-                        <RotateCw />
-                        "Continua"
-                    </Button>
-                </Show>
-                <Show when=move || active.with(Option::is_some)>
-                    <Button
-                        variant=ButtonVariant::Outline
-                        size=ButtonSize::Sm
-                        class="text-destructive"
-                        attr:data-action="discard"
-                        on:click=move |_| discard_open.set(true)
-                    >
-                        <Trash2 />
-                        "Scarta"
-                    </Button>
-                </Show>
-                <Show when=move || {
-                    active.with(|a| a.as_ref().is_some_and(|a| a.worktree_state == WorktreeState::Present))
-                }>
-                    <div class="flex items-center">
-                        {[
-                            (OpenTarget::Finder, "Apri in Finder"),
-                            (OpenTarget::Terminal, "Apri nel Terminale"),
-                            (OpenTarget::Editor, "Apri nell'editor"),
-                        ]
-                            .into_iter()
-                            .map(|(target, label)| {
-                                let icon = match target {
-                                    OpenTarget::Finder => view! { <FolderOpen /> }.into_any(),
-                                    OpenTarget::Terminal => view! { <SquareTerminal /> }.into_any(),
-                                    OpenTarget::Editor => view! { <Code /> }.into_any(),
-                                };
-                                view! {
-                                    <Tooltip class="my-0">
-                                        <Button
-                                            variant=ButtonVariant::Ghost
-                                            size=ButtonSize::IconSm
-                                            attr:aria-label=label
-                                            on:click=move |_| attempt_command(ctx, active, Command::Open(target))
-                                        >
-                                            {icon}
-                                        </Button>
-                                        <TooltipContent position=TooltipPosition::Bottom>{label}</TooltipContent>
-                                    </Tooltip>
-                                }
-                            })
-                            .collect_view()}
-                    </div>
-                </Show>
-                <div class="ml-auto flex items-center gap-2">
-                    <label for="task-move" class="text-muted-foreground text-xs">
-                        "Sposta in"
-                    </label>
-                    <div class="w-36">
-                        <MoveSelect task active start_for />
-                    </div>
-                </div>
             </div>
+            <Show when=move || meta.with(|m| !m.is_empty())>
+                // The sr-only colon keeps "Sub-agent: …" readable as one phrase (and its text).
+                <dl class="mt-2.5 flex flex-wrap gap-x-4 gap-y-1 text-xs" data-testid="attempt-meta">
+                    <For each=move || meta.get() key=|(label, value)| (*label, value.clone()) let:pair>
+                        <div class="flex min-w-0 gap-1.5">
+                            <dt class="text-muted-foreground shrink-0">
+                                {pair.0}
+                                <span class="sr-only">": "</span>
+                            </dt>
+                            <dd class="min-w-0 truncate font-mono">{pair.1}</dd>
+                        </div>
+                    </For>
+                </dl>
+            </Show>
         </header>
         <Tabs default_value=TAB_AGENT class="min-h-0 flex-1 gap-0">
-            <TabsList variant=TabsVariant::Line class="w-full justify-start gap-2 border-b px-3">
-                <TabsTrigger value=TAB_AGENT class="flex-none px-2" on:click=move |_| tab.set(TAB_AGENT)>
+            <TabsList
+                variant=TabsVariant::Line
+                class="w-full shrink-0 justify-start gap-5 border-b px-5 group-data-[orientation=Horizontal]/tabs:h-9"
+                attr:role="tablist"
+                attr:aria-label="Task"
+                on:keydown=move |ev: KeyboardEvent| {
+                    let next = match ev.key().as_str() {
+                        "ArrowLeft" | "ArrowRight" if tab.get_untracked() == TAB_AGENT => TAB_CHANGES,
+                        "ArrowLeft" | "ArrowRight" | "Home" => TAB_AGENT,
+                        "End" => TAB_CHANGES,
+                        _ => return,
+                    };
+                    ev.prevent_default();
+                    show_tab(tab, next, true);
+                }
+            >
+                <TabsTrigger
+                    value=TAB_AGENT
+                    class=LINE_TAB
+                    attr:id="task-tab-agent"
+                    attr:role="tab"
+                    attr:aria-controls="task-tabpanel-agent"
+                    attr:aria-selected=move || (tab.get() == TAB_AGENT).to_string()
+                    attr:tabindex=move || if tab.get() == TAB_AGENT { "0" } else { "-1" }
+                    attr:data-tab=TAB_AGENT
+                    attr:aria-describedby=move || pending.get().then_some("task-tab-agent-waiting")
+                    on:click=move |_| tab.set(TAB_AGENT)
+                >
                     "Agente"
+                    // No text: the E2E finds the tab by its exact label; the description says it.
+                    <Show when=move || pending.get()>
+                        <StatusDot status=Status::Waiting />
+                    </Show>
                 </TabsTrigger>
                 <TabsTrigger
                     value=TAB_CHANGES
-                    class="flex-none px-2"
+                    class=LINE_TAB
+                    attr:id="task-tab-changes"
+                    attr:role="tab"
+                    attr:aria-controls="task-tabpanel-changes"
+                    attr:aria-selected=move || (tab.get() == TAB_CHANGES).to_string()
+                    attr:tabindex=move || if tab.get() == TAB_CHANGES { "0" } else { "-1" }
+                    attr:data-tab=TAB_CHANGES
                     on:click=move |_| tab.set(TAB_CHANGES)
                 >
                     "Modifiche"
                 </TabsTrigger>
             </TabsList>
+            <Show when=move || pending.get()>
+                <span id="task-tab-agent-waiting" class="sr-only">
+                    "In attesa di approvazione"
+                </span>
+            </Show>
             <TabsContent
                 value=TAB_AGENT
                 class="flex min-h-0 flex-col group-data-[orientation=Horizontal]/tabs:mt-0"
+                attr:id="task-tabpanel-agent"
+                attr:role="tabpanel"
+                attr:aria-labelledby="task-tab-agent"
             >
-                {agent}
+                {agent_view}
                 {move || active_id.get().map(|attempt_id| view! { <Composer attempt_id running /> })}
             </TabsContent>
             <TabsContent
                 value=TAB_CHANGES
                 class="min-h-0 overflow-y-auto group-data-[orientation=Horizontal]/tabs:mt-0"
+                attr:id="task-tabpanel-changes"
+                attr:role="tabpanel"
+                attr:aria-labelledby="task-tab-changes"
             >
                 {changes}
             </TabsContent>
@@ -425,11 +501,50 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
 
 fn branch_chip(attempt: &AttemptView) -> impl IntoView + use<> {
     view! {
-        <span class="text-muted-foreground inline-flex min-w-0 items-center gap-1 font-mono text-xs">
+        <span
+            class="text-muted-foreground inline-flex min-w-0 items-center gap-1 font-mono text-[11px]"
+            title=format!("{} → {}", attempt.branch, attempt.target_branch)
+        >
             <GitBranch class="size-3 shrink-0" />
             <span class="truncate">{attempt.branch.clone()}</span>
-            <span class="shrink-0">{format!("→ {}", attempt.target_branch)}</span>
         </span>
+    }
+}
+
+/// The agent badge of the board card (`status::agent_state`), from the detail: the active
+/// attempt, else the last closed one; the latest turn only counts for the active one.
+fn panel_state(d: &TaskDetail) -> Option<(&'static str, Status)> {
+    let attempt = d.attempt.as_ref().or(d.closed_attempts.last())?;
+    let last = d.attempt.as_ref().and(d.processes.last());
+    agent_state(&TaskCard {
+        task: d.task.clone(),
+        attempt_id: Some(attempt.id.clone()),
+        attempt_state: Some(attempt.state),
+        branch: Some(attempt.branch.clone()),
+        running: attempt.running,
+        pending_approvals: attempt.pending_approvals,
+        last_status: last.map(|p| p.status),
+        last_stop_reason: last.and_then(|p| p.stop_reason),
+        worktree_state: Some(attempt.worktree_state),
+    })
+}
+
+/// Selects a tab of the vendored `Tabs` (its state is private) by clicking its trigger;
+/// `focus` for the arrow keys. The active tab is not clicked again: its view would rebuild.
+fn show_tab(tab: RwSignal<&'static str>, value: &str, focus: bool) {
+    if tab.get_untracked() == value {
+        return;
+    }
+    let trigger = document()
+        .query_selector(&format!("[data-view=task-panel] [data-tab={value}]"))
+        .ok()
+        .flatten()
+        .and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok());
+    if let Some(trigger) = trigger {
+        trigger.click();
+        if focus {
+            let _ = trigger.focus();
+        }
     }
 }
 
@@ -470,14 +585,19 @@ fn MoveSelect(
         });
     });
     view! {
-        <SelectNative id="task-move" value=value.read_only() on_change>
+        <SelectNative
+            id="task-move"
+            class="h-7 rounded-md ps-2.5 pe-7 text-xs shadow-xs"
+            value=value.read_only()
+            on_change
+        >
             {TaskStatus::ALL
                 .iter()
                 .map(|s| {
                     let s = *s;
                     view! {
                         <option value=s.as_str() prop:selected=move || value.with(|v| v == s.as_str())>
-                            {status_label(s)}
+                            {column_title(s)}
                         </option>
                     }
                 })
@@ -486,23 +606,27 @@ fn MoveSelect(
     }
 }
 
-/// "Modello: opus · Sub-agent: sonnet, max 3 (usati 1)" for the active attempt, without the
-/// parts it leaves to the defaults; `None` when it sets none.
-fn attempt_meta(a: &AttemptView) -> Option<String> {
-    meta_line(
+/// Label/value pairs of the active attempt: "Modello" and "Sub-agent" (e.g. "sonnet, max 3
+/// (usati 1)") only when it sets them, then its mode and where its branch starts.
+fn attempt_meta(a: &AttemptView) -> Vec<(&'static str, String)> {
+    let mut pairs = meta_pairs(
         a.model.as_deref(),
         a.subagent_model.as_deref(),
         a.max_subagents,
         a.subagents_used,
-    )
+    );
+    pairs.push(("Modalità", mode_label(a.permission_mode.as_str())));
+    let commit = short_commit(&a.base_commit);
+    pairs.push(("Da", format!("{} @ {commit}", a.target_branch)));
+    pairs
 }
 
-fn meta_line(
+fn meta_pairs(
     model: Option<&str>,
     subagent_model: Option<&str>,
     max_subagents: Option<u8>,
     used: u32,
-) -> Option<String> {
+) -> Vec<(&'static str, String)> {
     let subagents = match (max_subagents, subagent_model) {
         (Some(0), _) => Some("nessuno".to_owned()),
         (Some(max), Some(m)) => Some(format!("{m}, max {max} (usati {used})")),
@@ -510,24 +634,13 @@ fn meta_line(
         (None, Some(m)) => Some(m.to_owned()),
         (None, None) => None,
     };
-    let parts: Vec<String> = [
-        model.map(|m| format!("Modello: {m}")),
-        subagents.map(|s| format!("Sub-agent: {s}")),
+    [
+        model.map(|m| ("Modello", m.to_owned())),
+        subagents.map(|s| ("Sub-agent", s)),
     ]
     .into_iter()
     .flatten()
-    .collect();
-    (!parts.is_empty()).then(|| parts.join(" · "))
-}
-
-fn status_label(status: TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Todo => "Da fare",
-        TaskStatus::InProgress => "In corso",
-        TaskStatus::InReview => "In revisione",
-        TaskStatus::Done => "Completati",
-        TaskStatus::Cancelled => "Annullati",
-    }
+    .collect()
 }
 
 #[derive(Clone, Copy)]
@@ -566,31 +679,38 @@ fn attempt_command(ctx: AppCtx, active: Memo<Option<AttemptView>>, command: Comm
 
 #[cfg(test)]
 mod tests {
-    use super::meta_line;
+    use super::meta_pairs;
+
+    fn pairs(v: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        v.iter().map(|(k, v)| (*k, (*v).to_owned())).collect()
+    }
 
     #[test]
-    fn the_meta_line_omits_what_the_attempt_leaves_to_the_defaults() {
+    fn the_meta_pairs_omit_what_the_attempt_leaves_to_the_defaults() {
         assert_eq!(
-            meta_line(Some("opus"), Some("sonnet"), Some(3), 1).as_deref(),
-            Some("Modello: opus · Sub-agent: sonnet, max 3 (usati 1)")
+            meta_pairs(Some("opus"), Some("sonnet"), Some(3), 1),
+            pairs(&[
+                ("Modello", "opus"),
+                ("Sub-agent", "sonnet, max 3 (usati 1)")
+            ])
         );
         assert_eq!(
-            meta_line(None, None, Some(2), 0).as_deref(),
-            Some("Sub-agent: max 2 (usati 0)")
+            meta_pairs(None, None, Some(2), 0),
+            pairs(&[("Sub-agent", "max 2 (usati 0)")])
         );
         assert_eq!(
-            meta_line(Some("fable"), Some("haiku"), None, 0).as_deref(),
-            Some("Modello: fable · Sub-agent: haiku")
+            meta_pairs(Some("fable"), Some("haiku"), None, 0),
+            pairs(&[("Modello", "fable"), ("Sub-agent", "haiku")])
         );
         // No sub-agents at all: their model does not matter.
         assert_eq!(
-            meta_line(Some("opus"), Some("haiku"), Some(0), 0).as_deref(),
-            Some("Modello: opus · Sub-agent: nessuno")
+            meta_pairs(Some("opus"), Some("haiku"), Some(0), 0),
+            pairs(&[("Modello", "opus"), ("Sub-agent", "nessuno")])
         );
         assert_eq!(
-            meta_line(Some("sonnet"), None, None, 0).as_deref(),
-            Some("Modello: sonnet")
+            meta_pairs(Some("sonnet"), None, None, 0),
+            pairs(&[("Modello", "sonnet")])
         );
-        assert_eq!(meta_line(None, None, None, 0), None);
+        assert!(meta_pairs(None, None, None, 0).is_empty());
     }
 }

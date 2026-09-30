@@ -3,14 +3,15 @@
 //! the real commands (`NotFound`, `Invalid`, `Conflict`, `Busy` for running tasks), orders
 //! tasks with the positions of spec §5.2 and emits `changed` / `env_changed` after mutations.
 //!
-//! URL flags, combinable (`/?env=paused,billing&badges`):
+//! URL flags, combinable (`/?env=paused,billing&badges=0`):
 //! - `env=` comma-separated: `no_cli` (CLI not found; "Ricontrolla" with a "Percorso di
 //!   claude" finds it), `old` (CLI below the minimum), `logged_out` ("Accedi" completes the
 //!   login 4 s later), `unknown` (`auth status` failed), `paused` (usage-limit pause),
 //!   `billing` (Console login, billed via API), `api_key` (API key passthrough enabled),
 //!   `problems` (a non-blocking environment problem);
 //! - `projects=0`: no projects ("Aggiungi repository" cycles through a fixed list of folders);
-//! - `badges`: demo attempt fields on the cards `attempt.rs` knows nothing about.
+//! - `badges=0`: no demo attempt fields on the cards `attempt.rs` knows nothing about (by
+//!   default they show every agent state: waiting, failed, interrupted, ready, closed).
 
 use std::cell::RefCell;
 
@@ -32,11 +33,20 @@ const PICKS: &[Option<&str>] = &[
     Some("/Users/demo/Progetti/sito-web"),
 ];
 
-#[derive(Default)]
 struct Flags {
     env: Vec<String>,
     no_projects: bool,
     badges: bool,
+}
+
+impl Default for Flags {
+    fn default() -> Self {
+        Self {
+            env: Vec::new(),
+            no_projects: false,
+            badges: true,
+        }
+    }
 }
 
 impl Flags {
@@ -49,7 +59,7 @@ impl Flags {
             match pair.split_once('=').unwrap_or((pair, "")) {
                 ("env", v) => flags.env = v.split(',').map(str::to_owned).collect(),
                 ("projects", "0") => flags.no_projects = true,
-                ("badges", _) => flags.badges = true,
+                ("badges", "0") => flags.badges = false,
                 _ => {}
             }
         }
@@ -699,7 +709,7 @@ fn card(task: Task) -> TaskCard {
     card
 }
 
-/// `?badges`: attempt fields that exercise every card badge.
+/// Demo attempt fields (off with `?badges=0`) that exercise every card badge.
 fn demo_badges(card: &mut TaskCard) {
     use ProcessStatus::*;
     let (state, last_status, stop, worktree, running, approvals) = match card.task.id.as_str() {
@@ -732,6 +742,14 @@ fn demo_badges(card: &mut TaskCard) {
             Completed,
             None,
             WorktreeState::Removed,
+            false,
+            0,
+        ),
+        "task-images" => (
+            AttemptState::Active,
+            Completed,
+            None,
+            WorktreeState::Present,
             false,
             0,
         ),

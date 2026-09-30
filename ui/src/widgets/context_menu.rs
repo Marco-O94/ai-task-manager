@@ -173,7 +173,7 @@ fn MenuPanel(state: MenuState, label: Signal<String>, children: ChildrenFn) -> i
             aria-label=move || label.get()
             aria-orientation="vertical"
             data-name="ContextMenuContent"
-            class="bg-popover text-popover-foreground fixed z-50 flex min-w-48 flex-col rounded-md border p-1 shadow-md"
+            class="bg-popover text-popover-foreground border-border fixed z-50 flex min-w-56 flex-col rounded-lg border p-1 shadow-md"
             style:left=move || format!("{}px", corner().0)
             style:top=move || format!("{}px", corner().1)
             on:keydown=keys
@@ -192,14 +192,18 @@ pub fn ContextMenuItem(
     children: Children,
 ) -> impl IntoView {
     let state = expect_context::<MenuState>();
-    let tone = if destructive { "text-destructive" } else { "" };
+    let tone = if destructive {
+        "text-destructive hover:bg-destructive/10 focus:bg-destructive/10"
+    } else {
+        "hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground"
+    };
     view! {
         <button
             type="button"
             role="menuitem"
             tabindex="-1"
             class=format!(
-                "hover:bg-accent focus:bg-accent flex w-full items-center gap-2 rounded-sm px-2 py-1.5 text-left text-sm outline-none [&_svg]:size-4 [&_svg]:shrink-0 {tone}",
+                "flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[13px] outline-none [&_svg]:size-3.5 [&_svg]:shrink-0 {tone}",
             )
             on:click=move |_| {
                 state.close(true);
@@ -209,6 +213,12 @@ pub fn ContextMenuItem(
             {children()}
         </button>
     }
+}
+
+/// A line between groups of items; not an item for the arrow keys.
+#[component]
+pub fn ContextMenuSeparator() -> impl IntoView {
+    view! { <div role="separator" class="bg-border -mx-1 my-1 h-px" /> }
 }
 
 /// Focuses item `pick(index of the focused item, count)` of `menu`.
