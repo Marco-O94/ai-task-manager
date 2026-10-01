@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use atm_types::{
     Changed, EVENT_CHANGED, EVENT_ENV_CHANGED, EnvStatus, GetEnv, GetEnvReq, Id, ListProjects,
-    Project,
+    Project, TaskCard,
 };
 use leptos::ev;
 use leptos::prelude::*;
@@ -18,6 +18,7 @@ use crate::views::onboarding::{Onboarding, gate_passed};
 use crate::views::overview::Overview;
 use crate::views::settings::ProjectSettings;
 use crate::views::sidebar::{Sidebar, Topbar, projects_loaded};
+use crate::views::task_dialog::TaskDialogMode;
 use crate::views::task_panel::TaskPanel;
 use crate::widgets::toast::{Toaster, Toasts};
 
@@ -74,8 +75,14 @@ pub struct AppCtx {
     pub remove_target: RwSignal<Option<(Id, String)>>,
     /// Bumped when the board must refetch `get_board`.
     pub board_version: RwSignal<u64>,
+    /// The board's cards (`views/board.rs` owns them): the task panel and the approval cards
+    /// read task titles here. Empty while no board is mounted.
+    pub cards: RwSignal<Vec<TaskCard>>,
     /// Task shown in the side panel.
     pub open_task: RwSignal<Option<Id>>,
+    /// The board's one `TaskDialog` (`views/board.rs` mounts it): the task panel opens it for
+    /// "Aggiungi sotto task".
+    pub task_dialog: RwSignal<Option<TaskDialogMode>>,
     /// Bumped when the panel must refetch `get_task_detail`.
     pub detail_version: RwSignal<u64>,
     pub toasts: Toaster,
@@ -94,7 +101,9 @@ impl AppCtx {
             project_view: RwSignal::new(ProjectView::default()),
             remove_target: RwSignal::new(None),
             board_version: RwSignal::new(0),
+            cards: RwSignal::new(Vec::new()),
             open_task: RwSignal::new(None),
+            task_dialog: RwSignal::new(None),
             detail_version: RwSignal::new(0),
             toasts: Toaster::new(),
         }

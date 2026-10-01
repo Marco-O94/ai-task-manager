@@ -95,8 +95,16 @@ pub enum Inbound {
         result: Result<Value, String>,
     },
     CanUseTool(CanUseTool),
-    /// Any other subtype, or a `can_use_tool` missing a required field: answered with
-    /// [`control_error`] plus a warning Notice.
+    /// `mcp_message`: one JSON-RPC message for the in-process MCP server `server_name`
+    /// (spec §7.3), answered with [`mcp_response`] (a request or a notification alike).
+    McpMessage {
+        request_id: String,
+        server_name: String,
+        message: Value,
+    },
+    /// Any other subtype, an `mcp_message` without `server_name` or `message`, or a
+    /// `can_use_tool` missing a required field: answered with [`control_error`] plus a
+    /// warning Notice.
     ControlRequest {
         request_id: String,
         subtype: String,
@@ -169,6 +177,18 @@ pub fn parse(line: &[u8]) -> Inbound {
                         .unwrap_or(Value::Null),
                     request: request.clone(),
                 });
+            }
+            if subtype == "mcp_message"
+                && let (Some(server_name), Some(message)) = (
+                    str_field(request, "server_name"),
+                    request.get("message").filter(|m| m.is_object()),
+                )
+            {
+                return Inbound::McpMessage {
+                    request_id,
+                    server_name,
+                    message: message.clone(),
+                };
             }
             Inbound::ControlRequest {
                 request_id,
@@ -284,6 +304,12 @@ pub fn control_success(request_id: &str, response: Value) -> Value {
         "type": "control_response",
         "response": {"subtype": "success", "request_id": request_id, "response": response},
     })
+}
+
+/// The answer to an `mcp_message`: [`control_success`] with `{"mcp_response": <jsonrpc>}`,
+/// the JSON-RPC response (or `{"jsonrpc":"2.0","result":{}}` for a notification).
+pub fn mcp_response(request_id: &str, jsonrpc: Value) -> Value {
+    control_success(request_id, json!({ "mcp_response": jsonrpc }))
 }
 
 /// `control_response` with `{"subtype":"error","request_id":…,"error":<error>}`, e.g.

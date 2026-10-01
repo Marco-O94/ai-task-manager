@@ -186,6 +186,7 @@ impl Attempt {
                 pending_approvals: 0,
                 created_at: now_ms(),
                 closed_at: None,
+                started_by_attempt: None,
             },
             processes: Vec::new(),
             entries: Vec::new(),
@@ -520,6 +521,7 @@ fn with_attempt<R>(attempt_id: &str, f: impl FnOnce(&mut Attempt) -> R) -> Resul
 fn task_detail(task_id: &str) -> Result<TaskDetail, AppError> {
     let task = board::task(task_id)
         .ok_or_else(|| AppError::not_found(format!("Task {task_id} non trovato.")))?;
+    let subtasks = board::subtask_cards(task_id);
     Ok(STATE.with_borrow(|s| {
         let mine = || s.attempts.iter().filter(|a| a.view.task_id == task_id);
         let active = mine().find(|a| a.view.state == AttemptState::Active);
@@ -534,6 +536,7 @@ fn task_detail(task_id: &str) -> Result<TaskDetail, AppError> {
             processes: active.map(|a| a.processes.clone()).unwrap_or_default(),
             closed_attempts,
             attachments: super::attachments::of_task(task_id),
+            subtasks,
         }
     }))
 }

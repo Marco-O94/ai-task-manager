@@ -91,7 +91,28 @@ fn argv_snapshot(args: &TurnArgs) -> Vec<String> {
         settings[0]["permissions"]["deny"],
         json!(claude::DENY_RULES)
     );
-    assert_eq!(settings[0]["permissions"]["allow"], json!(args.allow_rules));
+    let mut allow: Vec<String> = claude::BOARD_ALLOW.iter().map(|&t| t.to_owned()).collect();
+    allow.extend(args.allow_rules.iter().cloned());
+    assert_eq!(settings[0]["permissions"]["allow"], json!(allow));
+    let ask = settings[0]["permissions"]["ask"].as_array().unwrap();
+    assert_eq!(
+        ask[..claude::BOARD_ASK.len()],
+        json!(claude::BOARD_ASK).as_array().unwrap()[..]
+    );
+    // The board tools' SDK server, always declared, right before the appended prompt: it
+    // never adds `--strict-mcp-config`, whose absence is what makes a turn Trusted.
+    let n = argv.len();
+    assert_eq!(argv[n - 2], format!("--mcp-config={}", claude::MCP_CONFIG));
+    assert_eq!(
+        argv.iter()
+            .filter(|a| a.starts_with("--mcp-config"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        argv.contains(&"--strict-mcp-config".to_owned()),
+        args.isolated
+    );
     let deny = serde_json::to_string(claude::DENY_RULES).unwrap();
     argv.into_iter()
         .map(|a| a.replace(&deny, "\"<DENY_RULES>\""))
@@ -163,7 +184,8 @@ fn argv_model_and_effort() {
 }
 
 /// Spec F6: a sub-agent limit with none left disallows every way to spawn one (`Workflow`
-/// runs agents without an `Agent` call); `ask` and `env` stay out of `--settings`.
+/// runs agents without an `Agent` call); `ask` holds only the board tools, `env` stays out of
+/// `--settings`.
 #[test]
 fn argv_no_subagent_left() {
     let args = TurnArgs {
@@ -208,7 +230,7 @@ fn argv_subagent_model_without_limit() {
 }
 
 /// Spec F5: the task's attachments folder, one argv element even with spaces, before the
-/// appended system prompt; no deny rule for it.
+/// MCP declaration and the appended system prompt; no deny rule for it.
 #[test]
 fn argv_attachments_dir() {
     let args = TurnArgs {
@@ -220,7 +242,7 @@ fn argv_attachments_dir() {
     let argv = argv_snapshot(&args);
     let n = argv.len();
     assert_eq!(
-        argv[n - 2],
+        argv[n - 3],
         "--add-dir=/Users/me/Library/Application Support/dev.aitaskmanager.desktop/\
          attachments/p/t"
     );
@@ -273,7 +295,12 @@ fn append_prompt_names_worktree_branch_and_target() {
     assert!(text.contains("Do not push"));
     // M5 saw the model refuse a follow-up it found unrelated to a finished task (spec §13.4).
     assert!(text.contains("The user's later messages continue this task"));
-    assert!(text.ends_with("read it first and follow its conventions."));
+    assert!(text.contains("read it first and follow its conventions. "));
+    // The board tools (spec §7.3): what they are for and how to make a subtask.
+    assert!(text.ends_with(
+        "The mcp__atm__* tools manage this project's task board. To split your work into \
+         subtasks, use mcp__atm__create_task with parent_id \"self\"."
+    ));
 }
 
 /// M6: the app launched from inside a Claude Code session (a Bash tool, its terminal) inherits
@@ -1057,6 +1084,79 @@ fn parse_classifies_every_route() {
     assert_eq!(wire::parse(b"[1,2]"), Inbound::NotJson);
 }
 
+/// The in-process MCP server (spec §7.3, spike 2026-09-30): an `mcp_message` with a server
+/// name and a JSON-RPC object is routed to it, notification included; one missing either is
+/// an unsupported request. The answer wraps the JSON-RPC response in `mcp_response`.
+#[test]
+fn mcp_message_is_routed_and_answered() {
+    let parse = |v: Value| wire::parse(v.to_string().as_bytes());
+    let list = json!({"method":"tools/list","jsonrpc":"2.0","id":1});
+    assert_eq!(
+        parse(
+            json!({"type":"control_request","request_id":"c1","request":{
+            "subtype":"mcp_message","server_name":"atm","message":list}})
+        ),
+        Inbound::McpMessage {
+            request_id: "c1".into(),
+            server_name: "atm".into(),
+            message: list,
+        }
+    );
+    let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+    assert_eq!(
+        parse(
+            json!({"type":"control_request","request_id":"c2","request":{
+            "subtype":"mcp_message","server_name":"other","message":initialized}})
+        ),
+        Inbound::McpMessage {
+            request_id: "c2".into(),
+            server_name: "other".into(),
+            message: initialized,
+        }
+    );
+    for request in [
+        json!({"subtype":"mcp_message","message":{"jsonrpc":"2.0","id":0}}),
+        json!({"subtype":"mcp_message","server_name":"atm","message":"tools/list"}),
+        json!({"subtype":"mcp_message","server_name":"atm"}),
+    ] {
+        assert_eq!(
+            parse(json!({"type":"control_request","request_id":"c3","request":request})),
+            Inbound::ControlRequest {
+                request_id: "c3".into(),
+                subtype: "mcp_message".into(),
+            }
+        );
+    }
+    assert_eq!(
+        wire::mcp_response("c1", json!({"jsonrpc":"2.0","id":1,"result":{"tools":[]}})),
+        json!({"type":"control_response","response":{"subtype":"success","request_id":"c1",
+               "response":{"mcp_response":{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}}}})
+    );
+}
+
+/// A board tool under an `ask` rule arrives without suggestions (spike 2026-09-30), or at most
+/// with a whole-tool rule: "Consenti sempre" allows that one call and remembers nothing.
+#[test]
+fn board_tool_approvals_never_remember_a_rule() {
+    for suggestions in [
+        Value::Null,
+        json!([add_rules(
+            json!([{"toolName":"mcp__atm__move_task"}]),
+            "allow"
+        )]),
+    ] {
+        let mut p = pending("mcp__atm__move_task", suggestions);
+        p.input = json!({"id":"t1","status":"done"});
+        assert!(!wire::can_remember(&p.suggestions));
+        let frame = wire::approval_response(&p, &ApprovalDecision::Allow { remember: true });
+        assert_eq!(
+            frame["response"]["response"],
+            json!({"behavior":"allow","updatedInput":{"id":"t1","status":"done"}})
+        );
+        assert!(wire::remembered_rules(&p).is_empty());
+    }
+}
+
 #[test]
 fn outbound_frames() {
     let id = wire::request_id(7);
@@ -1501,6 +1601,7 @@ async fn drive(
                             tx = None; // close stdin (spec §7.4 step 3)
                             None
                         }
+                        Inbound::McpMessage { .. } => mcp_ack(&inbound),
                         other => on_request(other),
                     };
                     if let (Some(reply), Some(tx)) = (reply, &tx) {
@@ -1537,7 +1638,7 @@ async fn spawn_scrubs_the_environment_and_sets_pwd() {
         "hello\n"
     );
 
-    let records = fx.records();
+    let records: Vec<Value> = fx.records().into_iter().filter(|r| !is_mcp(r)).collect();
     assert_eq!(records.len(), 2);
     let call = &records[0];
     // Then one line per user message, naming the scenario it played.
@@ -1614,7 +1715,7 @@ async fn approval_scenario_round_trip() {
     let records = fx.records();
     let answered = records
         .iter()
-        .find(|r| r["kind"] == "control_response")
+        .find(|r| r["kind"] == "control_response" && !is_mcp(r))
         .unwrap();
     assert_eq!(answered["kind"], "control_response");
     assert_eq!(
@@ -1641,7 +1742,7 @@ async fn control_scenario_records_the_error_reply() {
     let records = fx.records();
     let answered = records
         .iter()
-        .find(|r| r["kind"] == "control_response")
+        .find(|r| r["kind"] == "control_response" && !is_mcp(r))
         .unwrap();
     assert_eq!(answered["response"]["subtype"], "error");
     assert_eq!(
@@ -1662,6 +1763,25 @@ async fn limit_scenarios_end_with_classified_errors() {
         assert!(result.is_error);
         assert_eq!(result.limit, Some(kind), "{scenario}");
     }
+}
+
+/// A record of the fake's MCP handshake: the message, or the host's answer to it.
+fn is_mcp(record: &Value) -> bool {
+    record["kind"] == "mcp" || record["response"]["response"].get("mcp_response").is_some()
+}
+
+/// An empty JSON-RPC result for the fake's MCP handshake with `atm` (every argv declares it).
+fn mcp_ack(inbound: &Inbound) -> Option<Value> {
+    let Inbound::McpMessage {
+        request_id,
+        message,
+        ..
+    } = inbound
+    else {
+        return None;
+    };
+    let reply = json!({"jsonrpc": "2.0", "id": message["id"], "result": {}});
+    Some(wire::mcp_response(request_id, reply))
 }
 
 #[tokio::test]
@@ -1701,6 +1821,9 @@ async fn kill_tree_reaches_the_group_and_a_descendant_in_its_own_group() {
             .await
             .unwrap();
         assert_eq!(line, Line::Complete);
+        if let Some(reply) = mcp_ack(&wire::parse(&buf)) {
+            tx.send(reply).await.unwrap();
+        }
         if atm_core::normalize::init_session_id(&serde_json::from_slice(&buf).unwrap()).is_some() {
             break;
         }

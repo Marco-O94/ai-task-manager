@@ -2,8 +2,10 @@
 //! (spec §7.7–§7.9). Owner: M3-CORE. This file holds the pieces with a fixed contract
 //! (timings, classification table, capped logs), the registry of running turns, the turn
 //! planning shared by `start_attempt` and `send_follow_up`, and the startup recovery; the
-//! turn driver itself is in `runner/turn.rs`.
+//! turn driver itself is in `runner/turn.rs`, the board tools it serves in
+//! `runner/board_tools.rs`.
 
+mod board_tools;
 mod turn;
 
 pub use turn::{API_KEY_STOP_NOTICE, CHANGED_AT_START_NOTICE};

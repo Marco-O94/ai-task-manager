@@ -481,6 +481,24 @@ pub const SUBAGENT_TOOLS: &[&str] = &["Agent", "Task"];
 pub const WORKFLOW_TOOL: &str = "Workflow";
 /// Always disallowed: in v1 questions go in the reply's text (spec §7.8).
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
+/// The in-process MCP server of the board tools (spec §7.3, §7.8): declared by
+/// [`MCP_CONFIG`], its JSON-RPC travels on the control protocol as `mcp_message` requests.
+pub const MCP_SERVER: &str = "atm";
+/// `--mcp-config=` value: an SDK server, answered by the host itself (no process, no socket).
+pub const MCP_CONFIG: &str = r#"{"mcpServers":{"atm":{"type":"sdk","name":"atm"}}}"#;
+/// Board tools that read or create: `allow` rules, never asked.
+pub const BOARD_ALLOW: &[&str] = &[
+    "mcp__atm__list_tasks",
+    "mcp__atm__get_task",
+    "mcp__atm__create_task",
+];
+/// Board tools that change or start a task: `ask` rules, so that every call reaches the host
+/// (`can_use_tool`, whatever the mode) and waits for the user's approval.
+pub const BOARD_ASK: &[&str] = &[
+    "mcp__atm__update_task",
+    "mcp__atm__move_task",
+    "mcp__atm__start_task",
+];
 /// Model of the sub-agents that ask for none, set in the `env` of `--settings` (flag settings
 /// win over the user's and the repository's).
 pub const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
@@ -551,12 +569,12 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
     };
     argv.push(format!("{session_flag}={}", args.session_id));
     let mut disallowed = vec![ASK_USER_QUESTION];
-    let mut ask: &[&str] = &[];
+    let mut ask = BOARD_ASK.to_vec();
     if let Some(left) = args.subagents_left {
         if left == 0 {
             disallowed.extend(SUBAGENT_TOOLS);
         } else {
-            ask = SUBAGENT_TOOLS;
+            ask.extend(SUBAGENT_TOOLS);
         }
         disallowed.push(WORKFLOW_TOOL);
     }
@@ -566,9 +584,14 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
         .iter()
         .map(|model| (SUBAGENT_MODEL_ENV, model.as_str()))
         .collect();
+    let allow: Vec<String> = BOARD_ALLOW
+        .iter()
+        .map(|&tool| tool.to_owned())
+        .chain(args.allow_rules.iter().cloned())
+        .collect();
     let settings = SettingsParts {
-        allow: &args.allow_rules,
-        ask,
+        allow: &allow,
+        ask: &ask,
         env: &env,
     };
     argv.push(format!("--settings={}", settings_json(&settings)));
@@ -585,6 +608,7 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
     if let Some(dir) = &args.attachments_dir {
         argv.push(format!("--add-dir={}", dir.to_string_lossy()));
     }
+    argv.push(format!("--mcp-config={MCP_CONFIG}"));
     argv.push(format!("--append-system-prompt={}", args.append_prompt));
     argv
 }
@@ -592,7 +616,7 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
 /// What the `--settings` JSON carries besides [`DENY_RULES`] (spec §7.8).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SettingsParts<'a> {
-    /// `permissions.allow`: `attempts.allow_rules`.
+    /// `permissions.allow`: [`BOARD_ALLOW`], then `attempts.allow_rules`.
     pub allow: &'a [String],
     /// `permissions.ask`: whole tools each call of which goes to the host, whatever the mode;
     /// left out when empty.
@@ -651,7 +675,9 @@ pub fn append_prompt(worktree: &Path, branch: &str, target_branch: &str) -> Stri
          remotes/config. The host app commits your changes automatically after each turn. \
          The user's later messages continue this task, even once it looks done: carry out \
          what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it \
-         first and follow its conventions.",
+         first and follow its conventions. \
+         The mcp__atm__* tools manage this project's task board. To split your work into \
+         subtasks, use mcp__atm__create_task with parent_id \"self\".",
         worktree.display()
     )
 }

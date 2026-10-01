@@ -816,6 +816,7 @@ fn replay(fixture: &str, decide: impl Fn(&str) -> Option<ApprovalDecision>) -> V
             }
             Inbound::ControlResponse { .. }
             | Inbound::ControlRequest { .. }
+            | Inbound::McpMessage { .. }
             | Inbound::KeepAlive
             | Inbound::NotJson => {}
         }

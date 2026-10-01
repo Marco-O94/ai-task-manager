@@ -32,8 +32,22 @@ const MAX_DESCRIPTION: usize = 100_000;
 /// What the dialog is doing: create in a column, or edit an existing task.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TaskDialogMode {
-    Create(TaskStatus),
+    /// `parent`: a sub-task of that task, `(id, title)`, fixed by the task panel.
+    Create {
+        status: TaskStatus,
+        parent: Option<(Id, String)>,
+    },
     Edit(Task),
+}
+
+impl TaskDialogMode {
+    /// A top-level task in `status`.
+    pub fn create(status: TaskStatus) -> Self {
+        Self::Create {
+            status,
+            parent: None,
+        }
+    }
 }
 
 /// Open while `mode` is `Some`; closing or saving sets it to `None`.
@@ -46,6 +60,8 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let confirm_delete = RwSignal::new(false);
+    // Sub-tasks the confirmed delete takes along (the board's count when "Elimina" was hit).
+    let doomed_subtasks = RwSignal::new(0usize);
     let title_ref = NodeRef::<leptos::html::Input>::new();
     let files = AttachmentsState::new();
 
@@ -58,7 +74,7 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
         busy.set(false);
         if let Some(m) = &current {
             let (t, d) = match m {
-                TaskDialogMode::Create(_) => Default::default(),
+                TaskDialogMode::Create { .. } => Default::default(),
                 TaskDialogMode::Edit(task) => (task.title.clone(), task.description.clone()),
             };
             title.set(t);
@@ -84,6 +100,15 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
     });
 
     let is_edit = move || mode.with(|m| matches!(m, Some(TaskDialogMode::Edit(_))));
+    let parent_title = Memo::new(move |_| {
+        mode.with(|m| match m {
+            Some(TaskDialogMode::Create {
+                parent: Some((_, title)),
+                ..
+            }) => Some(title.clone()),
+            _ => None,
+        })
+    });
     // Cmd/Ctrl+Enter bypasses the disabled submit button.
     let submit = move || {
         if busy.get_untracked() || files.busy.get_untracked() {
@@ -108,13 +133,14 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
         busy.set(true);
         spawn_local(async move {
             let res = match current {
-                TaskDialogMode::Create(status) => match project_id {
+                TaskDialogMode::Create { status, parent } => match project_id {
                     Some(project_id) => {
                         let created = ipc::call::<CreateTask>(&CreateTaskReq {
                             project_id,
                             title: t,
                             description: d,
                             status: Some(status),
+                            parent_id: parent.map(|(id, _)| id),
                         })
                         .await;
                         if let Ok(card) = &created {
@@ -149,10 +175,20 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
         let Some(TaskDialogMode::Edit(task)) = mode.get_untracked() else {
             return;
         };
+        // The sub-tasks go with it (the core deletes them first).
+        let mut doomed: Vec<String> = ctx.cards.with_untracked(|cards| {
+            cards
+                .iter()
+                .filter(|c| c.task.parent_id.as_ref() == Some(&task.id))
+                .map(|c| c.task.id.clone())
+                .collect()
+        });
         if !confirm_delete.get_untracked() {
+            doomed_subtasks.set(doomed.len());
             confirm_delete.set(true);
             return;
         }
+        doomed.push(task.id.clone());
         let session = files.session.get_value();
         busy.set(true);
         spawn_local(async move {
@@ -166,7 +202,11 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
             }
             match res {
                 Ok(()) => {
-                    if ctx.open_task.get_untracked().as_ref() == Some(&task.id) {
+                    if ctx
+                        .open_task
+                        .get_untracked()
+                        .is_some_and(|open| doomed.contains(&open))
+                    {
                         ctx.open_task.try_set(None);
                     }
                     ctx.toasts.success("Task eliminato");
@@ -199,17 +239,39 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                     <DialogBody>
                         <DialogHeader>
                             <DialogTitle>
-                                {move || if is_edit() { "Modifica task" } else { "Nuovo task" }}
+                                {move || {
+                                    if is_edit() {
+                                        "Modifica task"
+                                    } else if parent_title.with(Option::is_some) {
+                                        "Nuovo sotto task"
+                                    } else {
+                                        "Nuovo task"
+                                    }
+                                }}
                             </DialogTitle>
                             <DialogDescription>
                                 {move || match mode.get() {
-                                    Some(TaskDialogMode::Create(status)) => {
+                                    Some(TaskDialogMode::Create { status, .. }) => {
                                         format!("Verrà aggiunto in fondo a «{}».", column_title(status))
                                     }
                                     _ => "Titolo, descrizione e allegati diventano il prompt dell'agente.".into(),
                                 }}
                             </DialogDescription>
                         </DialogHeader>
+                        {move || {
+                            parent_title
+                                .get()
+                                .map(|title| {
+                                    view! {
+                                        <p
+                                            class="text-muted-foreground truncate font-mono text-xs"
+                                            data-parent-title=""
+                                        >
+                                            {format!("↳ Sotto task di «{title}»")}
+                                        </p>
+                                    }
+                                })
+                        }}
                         <div class="flex flex-col gap-2">
                             <Label html_for="task-title">"Titolo"</Label>
                             <Input
@@ -242,6 +304,11 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                                     }
                                 })
                         }}
+                        <Show when=move || confirm_delete.get() && doomed_subtasks.get() != 0>
+                            <p class="text-destructive text-[13px]" role="alert" data-delete-warning="">
+                                {move || format!("Elimina anche {} sotto task.", doomed_subtasks.get())}
+                            </p>
+                        </Show>
                         <DialogFooter class="items-center">
                             <Show when=is_edit>
                                 <Button
@@ -419,7 +486,7 @@ impl AttachmentsState {
                 }
             };
             let existing = match &current {
-                TaskDialogMode::Create(_) => self.staged.with_untracked(Vec::len),
+                TaskDialogMode::Create { .. } => self.staged.with_untracked(Vec::len),
                 TaskDialogMode::Edit(_) => self
                     .saved
                     .with_untracked(|s| s.as_ref().map_or(0, Vec::len)),
@@ -431,7 +498,7 @@ impl AttachmentsState {
                 )));
             }
             match current {
-                TaskDialogMode::Create(_) => {
+                TaskDialogMode::Create { .. } => {
                     self.staged.try_update(|staged| staged.extend(kept));
                 }
                 TaskDialogMode::Edit(task) if !kept.is_empty() => {
@@ -459,7 +526,7 @@ impl AttachmentsState {
     /// "×" of a row: unstaged (create) or deleted at once (edit).
     fn remove(self, ctx: AppCtx, mode: RwSignal<Option<TaskDialogMode>>, key: Id) {
         match mode.get_untracked() {
-            Some(TaskDialogMode::Create(_)) => {
+            Some(TaskDialogMode::Create { .. }) => {
                 self.staged
                     .update(|staged| staged.retain(|f| f.token != key));
             }

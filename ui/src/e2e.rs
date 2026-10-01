@@ -14,10 +14,10 @@
 //!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
 //!   the security confirmations, then the feature round's checks (the task list view on main,
-//!   attachments and sub-agent limits on a scratch project, whose removal from the sidebar
-//!   menu comes last) and the report on stdout; the app then exits through `app.exit`
-//!   (`ExitRequested`) during one more `[fake:hang_ignore]` turn, which the script checks
-//!   afterwards;
+//!   attachments, sub-agent limits, sub-tasks and the agents' board tools on a scratch
+//!   project, whose removal from the sidebar menu comes last) and the report on stdout; the
+//!   app then exits through `app.exit` (`ExitRequested`) during one more `[fake:hang_ignore]`
+//!   turn, which the script checks afterwards;
 //! - phase 3 (M6, also alone with `scripts/e2e.sh --perf`): `[fake:flood]` on three concurrent
 //!   attempts, one of them open, with the page's responsiveness and the transcript's DOM window
 //!   measured ([`perf_flood`]).
@@ -54,7 +54,7 @@ use web_sys::{Element, HtmlElement};
 
 use crate::ipc;
 use crate::selftest::{channel_in_order, csp_violations, sleep};
-use crate::state::board::by_column;
+use crate::state::board::{by_column, nested};
 use crate::views::board::column_title;
 
 /// `sessionStorage` key carrying the run across the page reloads of phase 1.
@@ -122,6 +122,13 @@ const SCRATCH: &str = "da-rimuovere";
 /// The file attached to a task: `<dir>/attach/<name>`, created by the backend outside every
 /// folder the core refuses to copy from (src-tauri/src/e2e.rs).
 const ATTACHMENT: &str = "specifiche-e2e.txt";
+/// The parent and the sub-task created from its panel on the scratch project.
+const PARENT_TITLE: &str = "Padre con sotto task";
+const CHILD_TITLE: &str = "Figlio dal pannello";
+/// The task whose agent uses the board tools, and the sub-task that agent creates (and renames:
+/// fake-claude's `board_tools`).
+const BOARD_TITLE: &str = "Riorganizza [fake:board_tools]";
+const BOARD_CHILD: &str = "Sotto task dal fake";
 /// The `--disallowedTools` of a turn that may start no sub-agent (none allowed, or none left).
 const NO_SUBAGENTS: &str = "--disallowedTools=AskUserQuestion,Agent,Task,Workflow";
 /// Default wait of a UI reaction.
@@ -368,6 +375,13 @@ async fn phase2(run: &mut Run) -> R<Next> {
     run.check("attachment_to_the_agent", r)?;
     let r = subagent_limit(&mut scratch).await;
     run.check("subagent_limit", r)?;
+    // Round 2026-09-30, also on the scratch project: sub-tasks, then the board tools.
+    let r = subtasks_from_the_panel(&mut scratch).await;
+    run.check("subtasks_from_the_panel", r)?;
+    let r = board_tools_agent(&mut scratch).await;
+    run.check("board_tools_agent", r)?;
+    let r = subtask_cascade(&scratch).await;
+    run.check("subtask_cascade", r)?;
     let r = project_removal(&scratch).await;
     run.check("project_removal", r)?;
     let r = only_expected_failures(&EXPECTED_FAILURES_PHASE2).await;
@@ -1400,9 +1414,13 @@ async fn step_5(run: &mut Run) -> R<String> {
         return Err(format!("argv {argv:?}"));
     }
     run.st.session = flag(argv, "--session-id=").ok_or("no --session-id")?;
-    // What fake-claude received: allow, with the suggested rule remembered for the session.
+    // What fake-claude received: allow, with the suggested rule remembered for the session
+    // (after the answers to its MCP handshake).
     let answers = records("control_response").await?;
-    let answer = answers.first().ok_or("no control_response recorded")?;
+    let answer = answers
+        .iter()
+        .find(|a| a["response"]["response"].get("mcp_response").is_none())
+        .ok_or("no control_response recorded")?;
     let decision = &answer["response"]["response"];
     let rule = &decision["updatedPermissions"][0];
     if answer["response"]["subtype"] != "success"
@@ -2181,6 +2199,8 @@ struct Scratch {
     task: String,
     /// `(id, branch, worktree)` of its attempts.
     attempts: Vec<(String, String, String)>,
+    /// `(parent, sub-task)` of [`subtasks_from_the_panel`], deleted by [`subtask_cascade`].
+    family: Option<(String, String)>,
 }
 
 /// F5 on a project added for it (`repos/da-rimuovere`, removed at the end): "Aggiungi file…"
@@ -2284,6 +2304,7 @@ async fn attachment_to_the_agent(run: &Run) -> R<(Scratch, String)> {
         data_dir,
         task,
         attempts: vec![(attempt.id, attempt.branch, attempt.worktree_path)],
+        family: None,
     };
     Ok((
         scratch,
@@ -2298,9 +2319,9 @@ async fn attachment_to_the_agent(run: &Run) -> R<(Scratch, String)> {
 
 /// F6 with a limit: "Sub-agent (max)" 2 and "Modello dei sub-agent" haiku for a
 /// `[fake:subagents]` turn, which spawns three sub-agents. Its argv disallows only
-/// AskUserQuestion and Workflow, its `--settings` make Agent and Task ask the host and set
-/// CLAUDE_CODE_SUBAGENT_MODEL; the host allows two spawns and denies the third with the
-/// limit's text; the attempt counts 2 used, in the DB and in the panel.
+/// AskUserQuestion and Workflow, its `--settings` make Agent and Task ask the host (last, after
+/// the board tools) and set CLAUDE_CODE_SUBAGENT_MODEL; the host allows two spawns and denies
+/// the third with the limit's text; the attempt counts 2 used, in the DB and in the panel.
 async fn subagent_limit(scratch: &mut Scratch) -> R<String> {
     let task = quick_create("todo", "Sub-agent [fake:subagents]").await?;
     start_attempt_with(&task, "acceptEdits", Some(("2", "haiku"))).await?;
@@ -2311,13 +2332,20 @@ async fn subagent_limit(scratch: &mut Scratch) -> R<String> {
         .into_iter()
         .next()
         .ok_or("no fake-claude call in the attempt's worktree")?;
-    let settings = flag(&argv, "--settings=").unwrap_or_default();
+    let settings: Value = flag(&argv, "--settings=")
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    // After the board tools' own ask rules (spec §7.8).
+    let ask: Vec<&str> = settings["permissions"]["ask"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
     if !argv
         .iter()
         .any(|a| a == "--disallowedTools=AskUserQuestion,Workflow")
         || argv.iter().any(|a| a.starts_with("--add-dir="))
-        || !settings.contains(r#""ask":["Agent","Task"]"#)
-        || !settings.contains(r#""env":{"CLAUDE_CODE_SUBAGENT_MODEL":"haiku"}"#)
+        || !ask.ends_with(&["Agent", "Task"])
+        || settings["env"] != json!({"CLAUDE_CODE_SUBAGENT_MODEL": "haiku"})
     {
         return Err(format!("argv {argv:?}"));
     }
@@ -2356,6 +2384,362 @@ async fn subagent_limit(scratch: &mut Scratch) -> R<String> {
         "max 2 + haiku: --disallowedTools=AskUserQuestion,Workflow, --settings ask \
          [Agent, Task] and CLAUDE_CODE_SUBAGENT_MODEL=haiku; three spawns answered {answers:?} \
          («{denial}»); DB and panel «{meta}»"
+    ))
+}
+
+/// Sub-tasks: "Aggiungi sotto task" in a task's panel opens TaskDialog as "Nuovo sotto task" of
+/// it, and the child is created with its `parent_id`. The parent's panel lists it under
+/// `[data-subtasks]`, the parent's card shows "↳ 0/1" and the child's card "↳ <parent>". Lista
+/// puts the child's row right under its parent's (the order of `state::board::nested`) with
+/// "↳", and the parent's fold toggle hides it and shows it again.
+async fn subtasks_from_the_panel(scratch: &mut Scratch) -> R<String> {
+    let parent = quick_create("todo", PARENT_TITLE).await?;
+    open_panel(&parent).await?;
+    click(&wait_q("[data-view=task-panel] [data-subtasks] [data-action=add-subtask]").await?);
+    let before = card_ids();
+    let dialog = until("sub-task dialog", UI, || open_dialog("TaskDialog")).await?;
+    let named = find_in(&dialog, "[data-parent-title]")
+        .map(|p| text(&p))
+        .unwrap_or_default();
+    if !text(&dialog).contains("Nuovo sotto task")
+        || named.trim() != format!("↳ Sotto task di «{PARENT_TITLE}»")
+    {
+        return Err(format!("sub-task dialog {:?}", text(&dialog)));
+    }
+    set_value(
+        &find_in(&dialog, "#task-title").ok_or("no title")?,
+        CHILD_TITLE,
+    )?;
+    let create = until("Crea task enabled", UI, || {
+        button_in(&dialog, "Crea task").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&create);
+    until("task dialog closed", UI, || {
+        open_dialog("TaskDialog").is_none().then_some(())
+    })
+    .await?;
+    let child = new_card(&before, CHILD_TITLE).await?;
+    let d = detail(&child).await?;
+    if d.task.parent_id.as_deref() != Some(parent.as_str()) || d.task.status != TaskStatus::Todo {
+        return Err(format!("sub-task in the DB {:?}", d.task));
+    }
+    until(
+        "sub-task in the panel, 0/1 on the parent's card, the parent on the child's",
+        UI,
+        || {
+            let listed = q(&format!(
+                "[data-view=task-panel][data-task-id=\"{parent}\"] [data-subtasks] \
+                 [data-subtask-id=\"{child}\"]"
+            ))?;
+            let progress = find_in(&card(&parent)?, "[data-subtask-progress]")?
+                .get_attribute("data-subtask-progress")?;
+            (text(&listed).contains(CHILD_TITLE)
+                && progress == "0/1"
+                && text(&card(&child)?).contains(&format!("↳ {PARENT_TITLE}")))
+            .then_some(())
+        },
+    )
+    .await?;
+
+    let expected: Vec<String> = nested(&board(&scratch.repo).await?)
+        .into_iter()
+        .map(|c| c.task.id)
+        .collect();
+    let at = expected.iter().position(|id| *id == parent);
+    if at.and_then(|at| expected.get(at + 1)) != Some(&child) {
+        return Err(format!("nested order {expected:?}"));
+    }
+    let row = |id: &str| {
+        q(&format!(
+            "[data-view=task-list] tr[data-row-task-id=\"{id}\"]"
+        ))
+    };
+    let row_ids = || {
+        q_all("[data-view=task-list] tr[data-row-task-id]")
+            .iter()
+            .filter_map(|r| r.get_attribute("data-row-task-id"))
+            .collect::<Vec<_>>()
+    };
+    click(&wait_q("[data-task-view=list]").await?);
+    until("nested list rows", UI, || {
+        (row_ids() == expected).then_some(())
+    })
+    .await?;
+    if !row(&child).is_some_and(|r| text(&r).contains('↳')) {
+        return Err("no ↳ in the sub-task's row".into());
+    }
+    let toggle = || find_in(&row(&parent)?, "[data-action=toggle-subtasks]");
+    click(&toggle().ok_or("no fold toggle on the parent's row")?);
+    until("sub-task folded", UI, || {
+        (row(&child).is_none() && toggle()?.get_attribute("aria-expanded")? == "false")
+            .then_some(())
+    })
+    .await?;
+    click(&toggle().ok_or("no fold toggle on the parent's row")?);
+    until("sub-task unfolded", UI, || {
+        (row_ids() == expected).then_some(())
+    })
+    .await?;
+    click(&wait_q("[data-task-view=kanban]").await?);
+    until("columns back", UI, || {
+        (q("[data-view=task-list]").is_none() && q("[data-column=todo] [data-card-list]").is_some())
+            .then_some(())
+    })
+    .await?;
+    scratch.family = Some((parent, child));
+    Ok(format!(
+        "Aggiungi sotto task → «Nuovo sotto task» of «{PARENT_TITLE}» → child with parent_id; \
+         panel [data-subtasks] lists it, parent card ↳ 0/1, child card ↳ {PARENT_TITLE}; Lista: \
+         {} rows as state::board::nested, child right under its parent with ↳, folded and \
+         unfolded",
+        expected.len()
+    ))
+}
+
+/// Board tools: a `[fake:board_tools]` task started with the Avvia dialog, with Agenti in
+/// parallelo = 1 (restored to 2, the default, afterwards). Its `create_task` of a sub-task of
+/// itself needs no approval: the sub-task is on the board, under its parent, while the agent
+/// waits for the first approval. `update_task`, `move_task` and `start_task` each ask with the
+/// approval card, which reads as a sentence and has no "Approva sempre"; approved, the sub-task
+/// is renamed, then moves to In revisione, and its start is a tool error for the agent
+/// (`ConcurrencyLimit`: the caller holds the only slot). fake-claude's record has the answers
+/// to its `mcp_message` requests (handshake, `tools/list`, six `tools/call`).
+async fn board_tools_agent(scratch: &mut Scratch) -> R<String> {
+    set_max_running(1).await?;
+    select_tasks(SCRATCH).await?;
+    let task = quick_create("todo", BOARD_TITLE).await?;
+    start_attempt(&task, "acceptEdits").await?;
+    let first = board_approval(None, "update_task").await?;
+    let sub = board(&scratch.repo)
+        .await?
+        .into_iter()
+        .find(|c| c.task.parent_id.as_deref() == Some(task.as_str()))
+        .ok_or("no sub-task in the DB while update_task waits")?
+        .task;
+    if sub.title != BOARD_CHILD || sub.status != TaskStatus::Todo {
+        return Err(format!("created sub-task {sub:?}"));
+    }
+    until(
+        "the agent's sub-task on the board and in the panel",
+        UI,
+        || {
+            (column_of(&sub.id)? == "todo"
+                && text(&card(&sub.id)?).contains(&format!("↳ {BOARD_TITLE}"))
+                && q(&format!(
+                    "[data-view=task-panel] [data-subtasks] [data-subtask-id=\"{}\"]",
+                    sub.id
+                ))
+                .is_some())
+            .then_some(())
+        },
+    )
+    .await?;
+    // The label names the task by its title once the board has its card, else by its id.
+    let renamed = format!("{BOARD_CHILD} (rivisto)");
+    let named = |label: &str, verb: &str, titles: &[&str], tail: &str| {
+        titles
+            .iter()
+            .chain([&sub.id.as_str()])
+            .any(|t| label == format!("{verb} «{t}»{tail}"))
+    };
+    let mut labels = vec![first.1.clone()];
+    if !named(&first.1, "Modifica", &[BOARD_CHILD], "") {
+        return Err(format!("update_task label {:?}", first.1));
+    }
+    allow_board(&first.0).await?;
+    let second = board_approval(Some(&first.0), "move_task").await?;
+    labels.push(second.1.clone());
+    if !named(
+        &second.1,
+        "Sposta",
+        &[&renamed, BOARD_CHILD],
+        " in In revisione",
+    ) {
+        return Err(format!("move_task label {:?}", second.1));
+    }
+    if detail(&sub.id).await?.task.title != renamed || column_of(&sub.id).as_deref() != Some("todo")
+    {
+        return Err("update_task not applied, or move_task applied before its approval".into());
+    }
+    allow_board(&second.0).await?;
+    until("sub-task moved to In revisione", UI, || {
+        (column_of(&sub.id)? == "inreview").then_some(())
+    })
+    .await?;
+    let third = board_approval(Some(&second.0), "start_task").await?;
+    labels.push(third.1.clone());
+    if !named(&third.1, "Avvia l'agente su", &[&renamed], "") {
+        return Err(format!("start_task label {:?}", third.1));
+    }
+    allow_board(&third.0).await?;
+    wait_turn(&task, "inreview").await?;
+
+    let d = detail(&sub.id).await?;
+    if (
+        d.task.status,
+        d.task.parent_id.as_deref(),
+        d.attempt.is_some(),
+    ) != (TaskStatus::InReview, Some(task.as_str()), false)
+    {
+        return Err(format!(
+            "sub-task after the turn {:?}, attempt {:?}",
+            d.task, d.attempt
+        ));
+    }
+    let outcomes: Vec<(String, bool)> = records("board")
+        .await?
+        .iter()
+        .map(|b| {
+            (
+                b["tool"].as_str().unwrap_or("?").to_owned(),
+                b["is_error"] == true,
+            )
+        })
+        .collect();
+    let wanted = [
+        ("create_task", false),
+        ("list_tasks", false),
+        ("get_task", false),
+        ("update_task", false),
+        ("move_task", false),
+        ("start_task", true),
+    ]
+    .map(|(t, e)| (t.to_owned(), e));
+    let refused = records("board")
+        .await?
+        .last()
+        .and_then(|b| b["text"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if outcomes != wanted || !refused.contains("ConcurrencyLimit") {
+        return Err(format!(
+            "board tool outcomes {outcomes:?}, start: {refused:?}"
+        ));
+    }
+    // This agent's process only: every other one has its MCP handshake too.
+    let attempt = detail(&task).await?.attempt.ok_or("no attempt")?;
+    let pid = call_records_in(&attempt.worktree_path)
+        .await?
+        .first()
+        .map(|c| c["pid"].clone())
+        .ok_or("no fake-claude call in the worktree")?;
+    let mcp: Vec<Value> = records("mcp")
+        .await?
+        .into_iter()
+        .filter(|m| m["pid"] == pid)
+        .collect();
+    let methods: Vec<&str> = mcp
+        .iter()
+        .filter_map(|m| m["message"]["method"].as_str())
+        .collect();
+    let answer = |i: usize| &mcp[i]["response"]["response"]["mcp_response"];
+    let tools = answer(2)["result"]["tools"].as_array().map_or(0, Vec::len);
+    if methods[..]
+        != ["initialize", "notifications/initialized", "tools/list"]
+            .into_iter()
+            .chain(["tools/call"; 6])
+            .collect::<Vec<_>>()[..]
+        || answer(0)["result"]["serverInfo"]["name"] != "atm"
+        || tools != 6
+        || !mcp.iter().all(|m| m["response"]["subtype"] == "success")
+    {
+        return Err(format!("mcp_message answers {mcp:?}"));
+    }
+    if attempt.started_by_attempt.is_some() {
+        return Err(format!(
+            "started_by_attempt {:?}",
+            attempt.started_by_attempt
+        ));
+    }
+    scratch
+        .attempts
+        .push((attempt.id, attempt.branch, attempt.worktree_path));
+    set_max_running(2).await?;
+    select_tasks(SCRATCH).await?;
+    Ok(format!(
+        "Agenti in parallelo 1: create_task(parent self) at once (sub-task on the board and in \
+         the panel before any approval); approval cards {labels:?}, each Approva → renamed, \
+         moved to In revisione, start refused ({refused:?}); fake-claude got {} mcp answers \
+         ({methods:?}, {tools} tools)",
+        mcp.len()
+    ))
+}
+
+/// The next approval card of `mcp__atm__<tool>` in the open panel (after the one `after`
+/// answered): its `data-approval` and its sentence. A board tool never offers "Approva sempre".
+async fn board_approval(after: Option<&str>, tool: &str) -> R<(String, String)> {
+    let name = format!("mcp__atm__{tool}");
+    let card_ = until(&format!("approval of {name}"), TURN, || {
+        q("[data-view=task-panel] [data-approval]").filter(|c| {
+            c.get_attribute("data-approval").as_deref() != after && text(c).contains(&name)
+        })
+    })
+    .await?;
+    if find_in(&card_, "[data-action=allow-always]").is_some() {
+        return Err(format!("Approva sempre offered for {name}"));
+    }
+    let label = find_in(&card_, "[data-board-tool]")
+        .map(|l| text(&l).trim().to_owned())
+        .ok_or(format!("no sentence on the approval of {name}"))?;
+    Ok((
+        card_.get_attribute("data-approval").unwrap_or_default(),
+        label,
+    ))
+}
+
+/// "Approva" on the approval card `id`, until the card is gone.
+async fn allow_board(id: &str) -> R {
+    let sel = format!("[data-view=task-panel] [data-approval=\"{id}\"]");
+    let card_ = q(&sel).ok_or("approval card gone")?;
+    click(&find_in(&card_, "[data-action=allow]").ok_or("no Approva")?);
+    until("approval answered", UI, || q(&sel).is_none().then_some(())).await
+}
+
+/// Deleting a parent takes its sub-task along: TaskDialog (Modifica on the parent's card, the
+/// panel showing another task) warns "Elimina anche 1 sotto task." on "Elimina", and
+/// "Conferma eliminazione" removes both from the board and from the DB (`get_board`).
+async fn subtask_cascade(scratch: &Scratch) -> R<String> {
+    let (parent, child) = scratch.family.clone().ok_or("no sub-task to delete")?;
+    if q(&format!(
+        "[data-view=task-panel][data-task-id=\"{parent}\"]"
+    ))
+    .is_some()
+    {
+        return Err("the parent's panel is open".into());
+    }
+    let edit = card(&parent)
+        .and_then(|c| find_in(&c, "button[aria-label=\"Modifica il task\"]"))
+        .ok_or("no Modifica on the parent's card")?;
+    click(&edit);
+    let dialog = until("edit dialog", UI, || open_dialog("TaskDialog")).await?;
+    click(&button_in(&dialog, "Elimina").ok_or("no Elimina")?);
+    let warning = until("delete warning", UI, || {
+        find_in(&dialog, "[data-delete-warning]")
+    })
+    .await?;
+    let warned = text(&warning).trim().to_owned();
+    if warned != "Elimina anche 1 sotto task." {
+        return Err(format!("delete warning {warned:?}"));
+    }
+    let since = last_toast();
+    click(&button_in(&dialog, "Conferma eliminazione").ok_or("no Conferma eliminazione")?);
+    toast_after(since, "task deleted", |t| t.contains("Task eliminato")).await?;
+    until("parent and sub-task gone from the board", UI, || {
+        (card(&parent).is_none() && card(&child).is_none() && open_dialog("TaskDialog").is_none())
+            .then_some(())
+    })
+    .await?;
+    let left = board(&scratch.repo).await?;
+    if left
+        .iter()
+        .any(|c| c.task.id == parent || c.task.id == child)
+    {
+        return Err("still in get_board".into());
+    }
+    Ok(format!(
+        "Modifica → Elimina: «{warned}» → Conferma eliminazione: parent and sub-task gone from \
+         the board and get_board ({} tasks left)",
+        left.len()
     ))
 }
 

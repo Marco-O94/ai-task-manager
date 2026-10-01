@@ -16,8 +16,9 @@ expression: argv
   "--permission-mode=acceptEdits",
   "--session-id=3f1c2b9e-0d4a-4c1e-9a55-1b2c3d4e5f60",
   "--disallowedTools=AskUserQuestion,Agent,Task,Workflow",
-  "--settings={\"permissions\":{\"deny\":\"<DENY_RULES>\",\"allow\":[]}}",
+  "--settings={\"permissions\":{\"deny\":\"<DENY_RULES>\",\"allow\":[\"mcp__atm__list_tasks\",\"mcp__atm__get_task\",\"mcp__atm__create_task\"],\"ask\":[\"mcp__atm__update_task\",\"mcp__atm__move_task\",\"mcp__atm__start_task\"]}}",
   "--setting-sources=user",
   "--strict-mcp-config",
-  "--append-system-prompt=You are working on a task from AI Task Manager inside a dedicated git worktree `/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello` on branch `atm/1-hello` (created from `main`). Work only inside this directory. Do not push, switch or delete branches, rewrite history, or change git remotes/config. The host app commits your changes automatically after each turn. The user's later messages continue this task, even once it looks done: carry out what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow its conventions."
+  "--mcp-config={\"mcpServers\":{\"atm\":{\"type\":\"sdk\",\"name\":\"atm\"}}}",
+  "--append-system-prompt=You are working on a task from AI Task Manager inside a dedicated git worktree `/Users/me/.ai-task-manager/worktrees/demo/atm-1-hello` on branch `atm/1-hello` (created from `main`). Work only inside this directory. Do not push, switch or delete branches, rewrite history, or change git remotes/config. The host app commits your changes automatically after each turn. The user's later messages continue this task, even once it looks done: carry out what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow its conventions. The mcp__atm__* tools manage this project's task board. To split your work into subtasks, use mcp__atm__create_task with parent_id \"self\"."
 ]

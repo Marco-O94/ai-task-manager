@@ -23,10 +23,13 @@ use serde::de::DeserializeOwned;
 /// Applied on every open (spec §5.1).
 pub const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;";
 
-/// Migration `i` brings `PRAGMA user_version` from `i` to `i + 1`.
+/// Migration `i` brings `PRAGMA user_version` from `i` to `i + 1`: 0001 the base schema,
+/// 0002 overview, attachments and sub-agent limits, 0003 sub-tasks (`tasks.parent_id`) and
+/// `attempts.started_by_attempt`.
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_overview_attachments_subagents.sql"),
+    include_str!("../migrations/0003_subtasks.sql"),
 ];
 
 /// Gap between consecutive positions (appends use `max + GAP`, renumbering uses `k * GAP`).
@@ -141,6 +144,9 @@ pub struct AttemptRow {
     pub max_subagents: Option<u8>,
     /// Sub-agent spawns allowed so far ([`Db::count_subagent`]).
     pub subagents_used: u32,
+    /// Attempt whose agent started this one via the board tools; `None` = the user. Plain
+    /// text, no foreign key.
+    pub started_by_attempt: Option<Id>,
     /// `Tool(ruleContent)` strings from "Consenti sempre" (spec §7.8); JSON array in the DB.
     pub allow_rules: Vec<String>,
     pub merge_commit: Option<String>,
@@ -173,6 +179,7 @@ impl AttemptRow {
             pending_approvals,
             created_at: self.created_at,
             closed_at: self.closed_at,
+            started_by_attempt: self.started_by_attempt.clone(),
         }
     }
 }
@@ -550,8 +557,10 @@ impl Db {
 
     // ---- tasks ----------------------------------------------------------------------------
 
-    /// Inserts task `id` at the end of column `req.status` (default todo): `max + GAP`.
-    /// Errors: `NotFound` (project), `Invalid` (CHECK: title 1..=200, description ≤ 100000).
+    /// Inserts task `id` at the end of column `req.status` (default todo): `max + GAP`, with
+    /// `req.parent_id` stored as is (the one-level, same-project rule is the caller's).
+    /// Errors: `NotFound` (project), `Invalid` (CHECK: title 1..=200, description ≤ 100000),
+    /// `Db` (unknown parent: foreign key).
     pub fn insert_task(
         &self,
         id: &str,
@@ -563,8 +572,8 @@ impl Db {
             let position = end_of_column(c, &req.project_id, status, id)?;
             Ok(c.query_row(
                 "INSERT INTO tasks (id, project_id, title, description, status, position,
-                    created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING *",
+                    created_at, updated_at, parent_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8) RETURNING *",
                 params![
                     id,
                     req.project_id,
@@ -572,7 +581,8 @@ impl Db {
                     req.description,
                     status.as_str(),
                     position,
-                    now
+                    now,
+                    req.parent_id
                 ],
                 task_row,
             )?)
@@ -688,6 +698,33 @@ impl Db {
         Ok(cards)
     }
 
+    /// Ids of the task's sub-tasks, oldest first (empty for an unknown task).
+    pub fn task_children(&self, task_id: &str) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT id FROM tasks WHERE parent_id = ?1 ORDER BY created_at, rowid",
+                [task_id],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    /// Cards of the task's sub-tasks in board order (column, then position), same rules as
+    /// [`Db::board`] (empty for an unknown task).
+    pub fn subtask_cards(&self, task_id: &str) -> Result<Vec<TaskCard>, AppError> {
+        let mut cards = self.read(|c| {
+            all(
+                c,
+                &format!("{CARD_SELECT} WHERE t.parent_id = ?1 ORDER BY t.position"),
+                [task_id],
+                card_row,
+            )
+        })?;
+        cards.sort_by_key(|card| card.task.status as u8);
+        Ok(cards)
+    }
+
     /// One card, same rules as [`Db::board`]. Errors: `NotFound`.
     pub fn task_card(&self, task_id: &str) -> Result<TaskCard, AppError> {
         self.read(|c| {
@@ -717,9 +754,9 @@ impl Db {
                 "INSERT INTO attempts (id, task_id, state, branch, target_branch, base_commit,
                     worktree_path, worktree_state, session_id, session_started, permission_mode,
                     model, effort, allow_rules, merge_commit, created_at, updated_at, closed_at,
-                    subagent_model, max_subagents, subagents_used)
+                    subagent_model, max_subagents, subagents_used, started_by_attempt)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21)",
+                    ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     a.id,
                     a.task_id,
@@ -742,6 +779,7 @@ impl Db {
                     a.subagent_model,
                     a.max_subagents,
                     a.subagents_used,
+                    a.started_by_attempt,
                 ],
             )?;
             insert_process(c, process)?;
@@ -1423,6 +1461,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         position: r.get("position")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
+        parent_id: r.get("parent_id")?,
     })
 }
 
@@ -1444,6 +1483,7 @@ fn attempt_row(r: &Row<'_>) -> rusqlite::Result<AttemptRow> {
         subagent_model: r.get("subagent_model")?,
         max_subagents: r.get("max_subagents")?,
         subagents_used: r.get("subagents_used")?,
+        started_by_attempt: r.get("started_by_attempt")?,
         allow_rules: r.get::<_, Json<_>>("allow_rules")?.0,
         merge_commit: r.get("merge_commit")?,
         created_at: r.get("created_at")?,
@@ -1495,8 +1535,12 @@ fn entry_row(r: &Row<'_>) -> rusqlite::Result<Entry> {
     Ok(r.get::<_, Json<Entry>>("payload")?.0)
 }
 
-/// A task with its active (else most recent) attempt and that attempt's latest process.
+/// A task with its active (else most recent) attempt, that attempt's latest process and the
+/// counts of its sub-tasks.
 const CARD_SELECT: &str = "SELECT t.*,
+        (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id AND s.status = 'done')
+            AS subtasks_done,
+        (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtasks_total,
         a.id AS attempt_id, a.state AS attempt_state, a.branch, a.worktree_state,
         p.status AS last_status, p.stop_reason AS last_stop_reason,
         EXISTS (SELECT 1 FROM processes r WHERE r.attempt_id = a.id AND r.status = 'running')
@@ -1518,6 +1562,8 @@ fn card_row(r: &Row<'_>) -> rusqlite::Result<TaskCard> {
         last_status: opt_text(r, "last_status")?,
         last_stop_reason: opt_text(r, "last_stop_reason")?,
         worktree_state: opt_text(r, "worktree_state")?,
+        subtasks_done: r.get("subtasks_done")?,
+        subtasks_total: r.get("subtasks_total")?,
     })
 }
 

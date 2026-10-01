@@ -105,6 +105,7 @@ fn replay(label: &str) -> Replay {
             }
             Inbound::ControlResponse { .. }
             | Inbound::ControlRequest { .. }
+            | Inbound::McpMessage { .. }
             | Inbound::KeepAlive
             | Inbound::NotJson => {}
         }

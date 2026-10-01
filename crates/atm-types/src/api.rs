@@ -122,6 +122,10 @@ pub struct CreateTaskReq {
     pub description: String,
     /// Column to append to; `None` = todo.
     pub status: Option<TaskStatus>,
+    /// Creates a sub-task of this task (same project, not itself a sub-task: `Invalid`
+    /// otherwise); `None` = top-level task.
+    #[serde(default)]
+    pub parent_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

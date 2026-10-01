@@ -2,6 +2,7 @@
 //! `initialize` then the user message, stdout routing, approvals, the stop sequence and
 //! finalize. The loop below owns the normalizer; everything reaches it as a message.
 
+use std::collections::HashSet;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,7 +19,7 @@ use tokio::time::{Instant, sleep_until};
 
 use super::{
     CappedLog, Cmd, EXIT_AFTER_RESULT, INIT_TIMEOUT, MAX_STDERR_LOG, MAX_STDOUT_LOG, StopCause,
-    StopTimings, TurnHandle, TurnOutcome, TurnPlan, classify, log_dir, not_pending,
+    StopTimings, TurnHandle, TurnOutcome, TurnPlan, board_tools, classify, log_dir, not_pending,
 };
 use crate::claude;
 use crate::db::ProcessFinish;
@@ -35,6 +36,9 @@ const DRAIN_AFTER_KILL: Duration = Duration::from_secs(1);
 const IO_CHANNEL: usize = 64;
 /// Disallowed in v1 but may still ask (spec §7.8): answered at once, never shown as pending.
 const ASK_USER_QUESTION: &str = "AskUserQuestion";
+/// Tool error of a `claude::BOARD_ASK` call the user did not allow (spec §7.8).
+const BOARD_NOT_APPROVED: &str = "Not approved: the user did not allow this call, so nothing \
+                                  was changed.";
 const RESUME_FAILED_NOTICE: &str =
     "La sessione di Claude Code non si può riprendere: avvia una nuova sessione";
 /// A Trusted turn whose configuration changed while the CLI started (checked again at
@@ -103,6 +107,7 @@ pub(super) async fn run_turn(
         stderr_log: None,
         requests: 0,
         resume_noticed: false,
+        approved_board: HashSet::new(),
         error: None,
     };
     let ops = turn
@@ -147,6 +152,9 @@ struct Turn {
     requests: u64,
     /// The resume-failure Notice goes once per turn.
     resume_noticed: bool,
+    /// `tool_use_id`s of the `claude::BOARD_ASK` calls the user allowed: each lets one
+    /// `tools/call` through ([`Self::mcp_reply`]).
+    approved_board: HashSet<String>,
     /// `processes.error`.
     error: Option<String>,
 }
@@ -529,6 +537,23 @@ impl Turn {
                     &format!("Richiesta di controllo non supportata: {subtype}"),
                 );
             }
+            Inbound::McpMessage {
+                request_id,
+                server_name,
+                message,
+            } => {
+                if server_name != claude::MCP_SERVER {
+                    let error = format!("Unknown MCP server: {server_name}");
+                    d.send(wire::control_error(&request_id, &error));
+                    self.notice(
+                        Level::Warn,
+                        &format!("Richiesta per un server MCP sconosciuto: {server_name}"),
+                    );
+                    return;
+                }
+                let reply = self.mcp_reply(&message).await;
+                d.send(wire::mcp_response(&request_id, reply));
+            }
             Inbound::ControlCancel { request_id } => {
                 let cancelled = {
                     let mut pending = guard(&self.handle.pending);
@@ -734,6 +759,54 @@ impl Turn {
         }
     }
 
+    /// The JSON-RPC answer of the `atm` server (spec §7.3), never pending, like
+    /// [`Self::count_subagent`]: the handshake, `tools/list`, and `tools/call` run through
+    /// [`board_tools`]. A call that needs approval must have been approved by now: the CLI
+    /// asked first (`can_use_tool` under an `ask` rule), through the ordinary pending path,
+    /// and the user allowed that very `tool_use_id` (`_meta."claudecode/toolUseId"`), else it
+    /// is refused. A notification (no `id`) gets an empty result.
+    async fn mcp_reply(&mut self, message: &Value) -> Value {
+        let Some(id) = message.get("id").cloned() else {
+            return json!({"jsonrpc": "2.0", "result": {}});
+        };
+        let result = match message["method"].as_str().unwrap_or_default() {
+            "initialize" => json!({
+                "protocolVersion": message["params"]["protocolVersion"],
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": claude::MCP_SERVER, "version": env!("CARGO_PKG_VERSION")},
+            }),
+            "ping" => json!({}),
+            "tools/list" => json!({"tools": board_tools::list()}),
+            "tools/call" if !self.board_approved(&message["params"]) => json!({
+                "content": [{"type": "text", "text": BOARD_NOT_APPROVED}], "isError": true}),
+            "tools/call" => {
+                board_tools::call(&self.inner, &self.plan.ctx, &message["params"]).await
+            }
+            method => {
+                return json!({"jsonrpc": "2.0", "id": id, "error": {
+                    "code": -32601, "message": format!("Method not found: {method}")}});
+            }
+        };
+        json!({"jsonrpc": "2.0", "id": id, "result": result})
+    }
+
+    /// Whether the `tools/call` of `params` may run: any tool that is not asked, or an asked
+    /// one whose approval it consumes.
+    fn board_approved(&mut self, params: &Value) -> bool {
+        let name = format!(
+            "mcp__{}__{}",
+            claude::MCP_SERVER,
+            params["name"].as_str().unwrap_or_default()
+        );
+        if !claude::BOARD_ASK.contains(&name.as_str()) {
+            return true;
+        }
+        let tool_use_id = params["_meta"]["claudecode/toolUseId"]
+            .as_str()
+            .unwrap_or_default();
+        self.approved_board.remove(tool_use_id)
+    }
+
     /// A sub-agent spawn under the attempt's limit of `max` (spec F6): allowed and counted
     /// (`subagents_used`, persisted) while the limit allows it, else denied with a text for the
     /// model rather than the user's deny wording. A count that cannot be written denies too.
@@ -793,6 +866,11 @@ impl Turn {
             .normalizer
             .on_approval_resolved(&approval_id, &decision);
         self.publish(ops);
+        if matches!(decision, ApprovalDecision::Allow { .. })
+            && claude::BOARD_ASK.contains(&pending.tool_name.as_str())
+        {
+            self.approved_board.insert(pending.tool_use_id.clone());
+        }
         if decision == (ApprovalDecision::Allow { remember: true }) {
             let rules = wire::remembered_rules(&pending);
             if !rules.is_empty()

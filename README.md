@@ -177,6 +177,33 @@ ordine di colonna e posizione; il titolo apre il task, la matita lo modifica, "N
 pannello aperto Branch e Aggiornato si nascondono. Niente ricerca, filtri né ordinamento, e la scelta non viene
 ricordata (a ogni visita si riparte dalla kanban).
 
+**Sotto task.** Un sotto task è un task completo (stato, agente, worktree e allegati propri) legato a un padre; c'è un
+solo livello, quindi un sotto task non ha sotto task. Si crea dal pannello del padre, nella sezione **Sotto task**, con
+"Aggiungi sotto task" (il dialog diventa "Nuovo sotto task"), oppure lo crea l'agente del padre (sotto). I sotto task
+stanno nelle colonne della kanban come gli altri task: la card del padre mostra "↳ fatti/totali" con una barra
+sottile, quella del figlio "↳ titolo del padre". Nella Lista i figli stanno subito sotto il padre, rientrati, e il
+toggle "↳ n/m" accanto al titolo del padre li nasconde o li mostra (non ricordato). Il pannello del padre elenca i
+figli con stato, titolo (apre il figlio) e badge dell'agente; il pannello di un figlio ha in alto il link al padre. Il
+primo prompt di un sotto task (e quello di una "Nuova sessione") riporta titolo e descrizione del padre in una sezione
+`## Parent task`, solo come contesto. Lo stato del padre non si aggiorna da solo. **Eliminare un padre elimina anche i
+suoi sotto task** (il dialog lo avvisa: "Elimina anche N sotto task."), ciascuno con worktree, allegati e log; se
+l'agente del padre o di un sotto task è in esecuzione l'eliminazione è rifiutata e non tocca nulla.
+
+**Tool board per gli agenti.** Ogni agente dei task ha i tool `mcp__atm__*` per gestire la board del suo progetto,
+serviti dall'app stessa sulla stdio del CLI (un server MCP "in-process": nessun processo, socket o porta in più). Sono
+limitati al progetto del tentativo (un task di un altro progetto è "non trovato"), e `"self"` indica il task
+dell'agente. L'autonomia è **"crea libero, il resto chiede"**, in ogni modalità, Autonomo compreso:
+- senza chiedere: `list_tasks`, `get_task` e `create_task` (con `parent_id: "self"` crea un sotto task del proprio
+  task);
+- con la tua approvazione: `update_task` (titolo e descrizione), `move_task` (cambio di colonna; un task con l'agente
+  in esecuzione non va in Fatto o Annullati) e `start_task` (avvia l'agente di un task con i default del progetto; un
+  sotto task parte nella modalità dell'agente che lo avvia). La card di approvazione mostra una frase leggibile, per
+  esempio «Sposta «X» in Fatto», e non offre "Approva sempre": ogni chiamata chiede di nuovo. L'app esegue solo la
+  chiamata che hai approvato, anche se il CLI non chiedesse.
+
+`start_task` rispetta "agenti in parallelo" (oltre il limite l'agente riceve un errore e il task non parte) e le
+opzioni sub-agent del chiamante; un agente avviato da un altro agente non può a sua volta avviare agenti.
+
 **Allegati.** Nel dialog del task, "Aggiungi file…" apre il selettore nativo del Mac: file qualsiasi (immagini
 comprese), al massimo 20 per task e 25 MB l'uno. L'app ne fa una **copia** in
 `~/Library/Application Support/dev.aitaskmanager.desktop/attachments/<progetto>/<task>/…`, fuori dal repository e mai
@@ -192,7 +219,8 @@ dell'app, i link che portano lì e tutto ciò che non è un file normale; alla c
 quello scelto (sostituito o spostato nel frattempo, va scelto di nuovo). "Sola lettura" è solo un'istruzione: l'agente
 con Bash può modificare o cancellare le copie. Niente trascinamento di file nella finestra.
 
-**Sub-agent** (dialog Avvia). **Sub-agent (max)**: "Predefinito del CLI" (nessun limite, l'argv resta quello di sempre),
+**Sub-agent** (dialog Avvia). **Sub-agent (max)**: "Predefinito del CLI" (nessun limite: niente regole sui sub-agent,
+solo quelle dei tool board che ogni turno ha),
 "Nessun sub-agent" (0) o da 1 a 10, per tutto il tentativo. Con un limite l'app vieta il tool `Workflow` (che avvia
 agenti senza passare da Agent) e fa arrivare a sé ogni avvio di un sub-agent: lo concede e lo conta finché resta
 spazio, poi risponde al modello "Sub-agent limit for this task reached (N). Complete the work directly without
@@ -296,8 +324,13 @@ Nel prompt `[fake:NOME]` sceglie lo scenario (`simple`, `append`, `approval`, `s
 `noinit`, `big`, `flood`, `control`, `usage_limit`, `auth_fail`, `resolve_merge`, `resume_fail`, `background`,
 `subagents`; `append` aggiunge a `hello.txt` la prima riga del messaggio, così due task sullo stesso file vanno in
 conflitto; `background` lascia un `sleep 300` in un process group suo, che l'app chiude a fine turno; `subagents` avvia
-`FAKE_CLAUDE_SUBAGENTS` sub-agent, default 3, e registra per ciascuno se l'app l'ha concesso o negato); il follow-up di "Risolvi
-con l'agente" gioca da solo `resolve_merge`, sul target che il prompt dell'app nomina. Variabili:
+`FAKE_CLAUDE_SUBAGENTS` sub-agent, default 3, e registra per ciascuno se l'app l'ha concesso o negato; `board_tools` usa i
+tool board come un agente: crea un sotto task di sé, elenca e legge, poi chiede di modificare, spostare (a
+`[status:S]` del messaggio, default `inreview`) e avviare (`[target:ID]`, default il sotto task creato), e con
+`[ask:skip]` chiama questi tre senza chiedere, per provare che l'app li rifiuta; `mcp_other` interroga un server MCP
+che l'app non ha). Scenario e tag si leggono fuori dalla sezione `## Parent task` del prompt di un sotto task. Come il
+CLI reale, fake-claude fa l'handshake MCP con il server `atm` dell'app prima di `system/init`, a ogni processo. Il
+follow-up di "Risolvi con l'agente" gioca da solo `resolve_merge`, sul target che il prompt dell'app nomina. Variabili:
 `FAKE_CLAUDE_AUTH=in|out` (stato di `auth status`), `FAKE_CLAUDE_AUTH_FILE` (file con `in`/`out` che la vince sulla
 variabile e che `auth_fail` porta a `out` con una scrittura atomica, come il CLI vero dopo un login scaduto),
 `FAKE_CLAUDE_SCENARIO` (scenario di default),
@@ -446,9 +479,14 @@ passaggio alla Lista su `main` (righe nell'ordine della kanban) e il ritorno all
 sul progetto `da-rimuovere`, un allegato scelto con il selettore in coda che arriva all'agente (fake-claude registra
 la sezione `## Attachments` del prompt e `--add-dir=` nell'argv) in un tentativo con "Nessun sub-agent", che dà
 `--disallowedTools` con `Agent`, `Task` e `Workflow`; `subagent_limit`, sullo stesso progetto con max 2 e modello
-haiku, dove tre avvii di sub-agent ricevono allow, allow, deny e DB e pannello dicono «usati 2»; `project_removal`, il
-menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic fuori, e la sua rimozione dalla lista,
-mentre `main` resta selezionato.
+haiku, dove tre avvii di sub-agent ricevono allow, allow, deny e DB e pannello dicono «usati 2»; poi, dal round del
+2026-09-30, `subtasks_from_the_panel` ("Aggiungi sotto task" nel pannello crea un figlio con `parent_id` nel DB, che il
+pannello del padre elenca, la card del padre conta "0/1" e la Lista mostra annidato e comprimibile),
+`board_tools_agent` (un task `[fake:board_tools]` con agenti in parallelo = 1: il sotto task nasce subito, modifica,
+spostamento e avvio chiedono con la frase leggibile e senza "Approva sempre", e l'avvio torna all'agente come errore
+`ConcurrencyLimit`) e `subtask_cascade` (eliminare il padre avvisa "Elimina anche 1 sotto task." e toglie padre e
+figlio); infine `project_removal`, il menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic
+fuori, e la sua rimozione dalla lista, mentre `main` resta selezionato.
 
 L'app gira con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, `GIT_DIR`, le variabili di cmux e il suo
@@ -468,7 +506,8 @@ passo 3; nella fase 2, tutti dopo i merge del passo 10 (che non devono farne fal
 `get_task_detail` (NotFound) sul task del progetto `da-rimuovere` appena rimosso; nella fase 3 nessuno.
 
 I report JSON delle fasi 2 e 3 (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
-`security_confirmations`, `task_list_view`, `attachment_to_the_agent`, `subagent_limit`, `project_removal`,
+`security_confirmations`, `task_list_view`, `attachment_to_the_agent`, `subagent_limit`, `subtasks_from_the_panel`,
+`board_tools_agent`, `subtask_cascade`, `project_removal`,
 `command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
 `perf_flood`, `csp_violations` sommate su tutti i caricamenti di pagina, `details` con cosa è stato verificato, con le
 misure della fase 3, o perché è fallito) sono l'unica cosa su stdout (i log di build vanno su stderr); lo script esce
@@ -525,7 +564,8 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   nomina (`ls`, `touch approved.txt`, l'attesa `python3 -c 'import time; time.sleep(4x)'`, la lettura di
   `CLAUDE.md`); qualunque altra richiesta riceve "Nega e ferma" e fa fallire il run.
 - **Quota.** `sonnet`, effort `low`, prompt minimi, nessun retry: 8 turni reali (probe 1, checklist 5, push 1,
-  isolamento 1), circa 0,15–0,25 USD l'uno nella stima del CLI.
+  isolamento 1), circa 0,15–0,25 USD l'uno nella stima del CLI. Un giro completo con `--ignored` esegue anche i test
+  dei round successivi (sotto): 7 turni dei sub-agent e 3 dei tool board, questi ultimi su `haiku`.
 - **Sub-agent e allegati (round feature del 2026-09-29): eseguiti il 2026-09-29 con il CLI 2.1.284, 4 su 4
   passati.** Quattro test verificano ciò che il round aveva preso dalla documentazione e dal bundle del CLI:
   - la regola `ask` su `Agent` arriva all'app in Supervisionato, Auto-edit e Autonomo (3 turni): ogni spawn è un
@@ -542,6 +582,18 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
 
   ```bash
   ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-threads=1 subagent add_dir
+  ```
+- **Tool board (round del 2026-09-30): verificati il 2026-10-01 con il CLI 2.1.286, test passato.** Lo spike del 2026-09-30
+  (CLI 2.1.285, haiku, 2 turni, circa 0,11 USD) ha verificato il server MCP `sdk` sulla stdio del CLI: dichiarazione con
+  `--mcp-config`, richieste `mcp_message`, risposte `{"mcp_response": …}`, nomi `mcp__atm__<tool>` e la regola `ask`
+  che fa arrivare `can_use_tool` all'app in Supervisionato e in Autonomo. Il test dell'app,
+  `real_cli_board_tools_ask_in_every_mode`, ripete la prova con i tool veri in Supervisionato, Auto-edit (mai provato
+  finora) e Autonomo: l'agente crea un sotto task di sé senza chiedere e sposta un altro task in Fatto dopo
+  l'approvazione. Sono 3 turni reali su `haiku` (circa 0,19 USD stimati); il 2026-10-01 è passato in tutte e tre le
+  modalità. Per ripeterlo (consuma quota):
+
+  ```bash
+  ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-threads=1 board_tools
   ```
 - **Repo.** Ogni test lavora in una cartella temporanea, cancellata alla fine: un clone locale del repo giocattolo
   (`ATM_REAL_CLAUDE_REPO`, default `~/Desktop/Repositories/test-rust`, mai modificato: anche i suoi `git status`
@@ -576,15 +628,20 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   composer né trascinamento di file).
 - Il modello dei sub-agent scelto nel dialog Avvia è la fonte con la priorità più bassa per Claude Code: il modello
   che una chiamata Agent chiede, o quello della definizione dell'agente (Explore), vince. Il limite conta i sub-agent
-  concessi, non quelli finiti, e non copre modi di avviarli diversi da `Agent`, `Task` e `Workflow`. Il suo
-  funzionamento con il CLI reale (regola `ask` in ogni modalità) e `--add-dir` con uno spazio non sono ancora stati
-  verificati (sopra).
+  concessi, non quelli finiti, e non copre modi di avviarli diversi da `Agent`, `Task` e `Workflow`. La regola `ask`
+  su cui si basa è comportamento osservato del CLI 2.1.284 (verificato il 2026-09-29, sopra), non documentato.
 - Gli allegati sono copie che l'agente può modificare o cancellare con Bash; gli originali non vengono mai toccati. Un
   gettone del selettore scade dopo 10 minuti: un dialog di creazione lasciato aperto più a lungo crea il task senza
   allegati (con l'avviso).
 - Il Riepilogo non mostra i server MCP di `~/.claude.json` (`claude mcp add`), `.claude/settings.local.json` né i file
   dietro un symlink; non ha cache (ogni visita rilegge il commit) e non rende il markdown.
 - La Lista non ha ricerca, filtri né ordinamento; pagina e vista non vengono ricordate.
+- Sotto task: un solo livello; lo stato del padre non segue quello dei figli; eliminare un padre elimina sempre i suoi
+  sotto task; la Lista non ricorda quali padri sono compressi.
+- Tool board: "Approva sempre" non esiste per loro, quindi ogni modifica, spostamento o avvio chiede di nuovo; un
+  agente avviato da un agente non può avviarne altri; l'approvazione di `start_task` non mostra la modalità che avrà il
+  nuovo agente; il loro funzionamento con il CLI reale dipende da un protocollo non documentato di Claude Code,
+  verificato solo dallo spike (sopra).
 - L'E2E non automatizza i selettori nativi di cartelle e di file né il drag nativo col mouse; i tempi della sua fase 3
   si misurano solo con lo schermo sbloccato e la finestra visibile (altrimenti il report li dà come non misurati).
 
@@ -661,3 +718,6 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | Allegati (round feature del 2026-09-29) | confermato con fake-claude: sezione `## Attachments` nel primo prompt e `--add-dir` a ogni turno, file e log cancellati con il task e con il progetto (`tests/flow.rs::attachments_reach_the_agent_and_go_with_the_task`, `removing_the_project_removes_its_attachments_and_logs`); percorsi rifiutati, gettoni monouso e scaduti, limite di 20 senza copie orfane (`picks_outside_the_rules_are_refused`, `tokens_are_single_use_and_the_copy_checks_again`, `the_attachment_limit_removes_the_copies_it_refuses`, `staged_picks_expire_and_the_oldest_go_first`) | round 2026-09-29 |
 | Riepilogo del progetto (round feature del 2026-09-29) | confermato: file nell'ordine atteso dal tip del branch target, mai dal checkout né dalla home, segreti mascherati (nessun "secret" nel riepilogo serializzato), note per file grandi, binari, link e JSON non valido (`tests/git.rs::overview_shows_the_committed_context_in_order`, `overview_notes_what_it_does_not_show`, `overview_masks_every_secret`, `core_overview_reads_the_target_tip_and_never_home`) | round 2026-09-29 |
 | Regola `ask` su `Agent` con il CLI reale in ogni modalità, deny del limite, `CLAUDE_CODE_SUBAGENT_MODEL`, `--add-dir` con spazi | **verificato** il 2026-09-29 con il CLI 2.1.284: 4 test `#[ignore]` di `tests/real_cli.rs` passati, 7 turni reali (sopra) | round 2026-09-29 |
+| Server MCP `sdk` in-process sul control protocol (spike del 2026-09-30) | **verificato** con il CLI 2.1.285 (2 turni haiku): `--mcp-config={"mcpServers":{"atm":{"type":"sdk","name":"atm"}}}` compatibile con `--strict-mcp-config`; handshake `initialize`, `notifications/initialized`, `tools/list` come `mcp_message` prima di `system/init`; `tools/call` con `_meta."claudecode/toolUseId"`; risposte `{"mcp_response": …}`; tool `mcp__atm__<nome>`; la regola `ask` manda `can_use_tool` (con `mcp_server.source = "sdk"`) in `default` e in `bypassPermissions` | round 2026-09-30 |
+| Sotto task e tool board con fake-claude | confermato: sotto task validati (un livello, stesso progetto), eliminazione a cascata con worktree, allegati e log, `Busy` senza toccare nulla se gira il padre o un figlio (`tests/flow.rs::deleting_a_parent_deletes_its_subtasks_and_their_files`, `deleting_a_running_parent_removes_nothing`), sezione `## Parent task` nel prompt (`a_subtask_prompt_carries_its_parent`); tool board: creazione immediata, modifica, spostamento e avvio solo dopo l'approvazione, rifiuto rispettato, chiamata non approvata rifiutata dall'app, `ConcurrencyLimit`, profondità 2, modalità del progetto per un task non figlio, nessun accesso ad altri progetti (`board_tools_*`, `board_start_*`, `a_denied_board_tool_changes_nothing`, `an_unapproved_board_call_is_refused`); E2E `subtasks_from_the_panel`, `board_tools_agent`, `subtask_cascade` | round 2026-09-30 |
+| Tool board con il CLI reale nell'app, in Supervisionato, Auto-edit e Autonomo | **verificato** il 2026-10-01 con il CLI 2.1.286: `real_cli_board_tools_ask_in_every_mode`, 3 turni haiku, circa 0,19 USD | round 2026-09-30 |

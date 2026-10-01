@@ -15,7 +15,8 @@
 //!   `{"kind":"grandchild","pid":…}` for the `sleep` of `hang_ignore`, `{"kind":"background",
 //!   "pid":…}` for the `sleep` of `background`.
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
-//!   `[fake:NAME]` in its text, else `resolve_merge` for the app's "Risolvi con l'agente"
+//!   `[fake:NAME]` in its text (never in the `## Parent task` section of a sub-task's prompt:
+//!   the same holds for the `[target:…]`/`[status:…]` tags), else `resolve_merge` for the app's "Risolvi con l'agente"
 //!   prompt, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
 //!   An interrupt is answered with success (`{"still_queued":[]}`), the user line `[Request
 //!   interrupted by user]` and a `result` `error_during_execution` (except `hang_ignore`).
@@ -36,7 +37,15 @@
 //! real Bash tool, then succeeds and exits at EOF as usual), subagents (spawns
 //! `FAKE_CLAUDE_SUBAGENTS` sub-agents one after the other, default 3: for each an `Agent`
 //! `tool_use` and its `can_use_tool`, as the real CLI asks under an `ask` rule; an allowed one
-//! returns a result, a denied one the host's message; then succeeds).
+//! returns a result, a denied one the host's message; then succeeds), board_tools (only when
+//! `--mcp-config` declares the SDK server `atm`, else an unknown scenario:
+//! [`Session::board_tools`]; each tool's outcome is recorded as
+//! `{"kind":"board","tool":…,"is_error":…,"text":…}` or `{…,"denied":…}`; with `[ask:skip]`
+//! the tools that ask call at once, without `can_use_tool`), mcp_other (one `tools/list` to a
+//! server named `other`; then succeeds). Whenever `--mcp-config` declares `atm`, every
+//! scenario that initializes first runs the MCP handshake as `mcp_message` requests before
+//! `system/init`, like the real CLI; each MCP message and its answer is recorded as
+//! `{"kind":"mcp","pid":…,"message":…,"response":…}`.
 //! Counts: `FAKE_CLAUDE_SLOW_EVENTS` (default 20), `FAKE_CLAUDE_FLOOD_EVENTS` (default 10000).
 //! `FAKE_CLAUDE_FLOOD_PAUSE_MS` (default 0): pause after every 100 texts of `flood`, so that
 //! several floods started one after the other overlap (the E2E's perf phase, M6).
@@ -176,6 +185,10 @@ struct Session {
     prompt: String,
     /// Project MCP servers started at startup (`system/init.mcp_servers`).
     mcp_servers: Vec<String>,
+    /// The host declared its SDK server `atm` (`--mcp-config`).
+    atm_server: bool,
+    /// `server_name` of the `mcp_message` requests: `atm`, `other` in `mcp_other`.
+    mcp_server: &'static str,
     /// `system/init.apiKeySource`.
     api_key_source: String,
 }
@@ -199,6 +212,11 @@ impl Session {
             counter: 0,
             prompt: String::new(),
             mcp_servers: Vec::new(),
+            atm_server: flag("--mcp-config=").is_some_and(|config| {
+                serde_json::from_str::<Value>(&config)
+                    .is_ok_and(|v| v["mcpServers"]["atm"]["type"] == "sdk")
+            }),
+            mcp_server: "atm",
             api_key_source: if std::env::var_os("ANTHROPIC_API_KEY").is_some_and(|k| !k.is_empty())
             {
                 "ANTHROPIC_API_KEY".into()
@@ -427,13 +445,18 @@ impl Session {
                 eprintln!("No conversation found with session ID: {}", self.session_id);
                 exit(1);
             }
-            "hang_ignore" => {
-                let pid = ignore_sigterm_with_grandchild();
-                self.record(json!({"kind": "grandchild", "pid": pid}));
-                self.init();
-            }
-            _ => self.init(),
+            _ => {}
         }
+        // The real CLI (spike 2026-09-30) connects the SDK server before `system/init`, on
+        // every process.
+        if self.atm_server {
+            self.mcp_handshake()?;
+        }
+        if scenario == "hang_ignore" {
+            let pid = ignore_sigterm_with_grandchild();
+            self.record(json!({"kind": "grandchild", "pid": pid}));
+        }
+        self.init();
         match scenario {
             "simple" => self.simple(),
             "append" => self.append(),
@@ -508,6 +531,15 @@ impl Session {
             }
             "resolve_merge" => self.resolve_merge(),
             "subagents" => self.subagents()?,
+            "board_tools" if self.atm_server => self.board_tools()?,
+            "mcp_other" => {
+                self.mcp_server = "other";
+                let answer = self.mcp(json!({"jsonrpc": "2.0", "id": 0, "method": "tools/list"}));
+                self.mcp_server = "atm";
+                let answer = answer?;
+                self.text(&format!("Risposta del server other: {}", answer["subtype"]));
+                self.result("success", false, Some("Server MCP sconosciuto provato."));
+            }
             other => self.result(
                 "error_during_execution",
                 true,
@@ -631,6 +663,106 @@ impl Session {
             Some(&format!("Sub-agent avviati: {allowed} su {n}.")),
         );
         Ok(())
+    }
+
+    /// The MCP handshake of the real CLI with an SDK server: `initialize` (id 0), the
+    /// `notifications/initialized` notification, `tools/list` (id 1).
+    fn mcp_handshake(&mut self) -> Step {
+        self.mcp(
+            json!({"method": "initialize", "params": {"protocolVersion": "2025-11-25",
+            "capabilities": {}, "clientInfo": {"name": "claude-code",
+            "version": atm_types::CLAUDE_TESTED_VERSION}}, "jsonrpc": "2.0", "id": 0}),
+        )?;
+        self.mcp(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))?;
+        self.mcp(json!({"method": "tools/list", "jsonrpc": "2.0", "id": 1}))?;
+        Ok(())
+    }
+
+    /// Sends one JSON-RPC message to the host's `atm` server (`mcp_message`), records it with
+    /// the host's answer (`kind: "mcp"`) and returns that `control_response`.
+    fn mcp(&mut self, message: Value) -> Result<Value, Stop> {
+        let request_id = self.next_id("fake_mcp");
+        self.send(
+            json!({"type": "control_request", "request_id": request_id, "request": {
+            "subtype": "mcp_message", "server_name": self.mcp_server, "message": message}}),
+        );
+        let response = self.await_response(&request_id)?;
+        self.record(
+            json!({"kind": "mcp", "pid": std::process::id(), "message": message,
+                           "response": response}),
+        );
+        Ok(response)
+    }
+
+    /// The board tools as an agent uses them: `create_task` of a subtask of its own task,
+    /// `list_tasks` of its subtasks and `get_task` of itself (allowed, called at once), then
+    /// `update_task` (title + " (rivisto)"), `move_task` to the message's `[status:S]` (default
+    /// `inreview`) and `start_task` of its `[target:ID]` (default: that subtask), each after
+    /// its `can_use_tool` (an `ask` rule). Every outcome is recorded (`kind: "board"`).
+    fn board_tools(&mut self) -> Step {
+        let created = self.board_call(
+            "create_task",
+            json!({"title": "Sotto task dal fake", "description": "Creato con create_task.",
+                   "parent_id": "self"}),
+            false,
+        )?;
+        let created_id = serde_json::from_str::<Value>(&created)
+            .ok()
+            .and_then(|v| v["id"].as_str().map(str::to_owned));
+        let target = tag(&self.prompt, "target")
+            .map(str::to_owned)
+            .or(created_id)
+            .unwrap_or_default();
+        let status = tag(&self.prompt, "status").unwrap_or("inreview").to_owned();
+        self.board_call("list_tasks", json!({"parent_id": "self"}), false)?;
+        self.board_call("get_task", json!({"id": "self"}), false)?;
+        let title = "Sotto task dal fake (rivisto)";
+        self.board_call("update_task", json!({"id": target, "title": title}), true)?;
+        self.board_call("move_task", json!({"id": target, "status": status}), true)?;
+        self.board_call("start_task", json!({"id": target}), true)?;
+        self.result("success", false, Some("Board aggiornata."));
+        Ok(())
+    }
+
+    /// One call of `mcp__atm__<tool>`: its `tool_use`, the `can_use_tool` first if `ask` (the
+    /// arguments are then the host's `updatedInput`; a deny skips the call), the `tools/call`,
+    /// and the `tool_result` with the text the host returned, which is also returned.
+    fn board_call(&mut self, tool: &str, input: Value, ask: bool) -> Result<String, Stop> {
+        let name = format!("mcp__atm__{tool}");
+        let tool_use_id = self.tool_use(&name, input.clone());
+        let mut arguments = input;
+        if ask && tag(&self.prompt, "ask") != Some("skip") {
+            let response = self.can_use_tool(json!({
+                "tool_name": name,
+                "mcp_server": {"name": "atm", "source": "sdk"},
+                "display_name": tool,
+                "input": arguments,
+                "decision_reason_type": "rule",
+                "tool_use_id": tool_use_id,
+            }))?;
+            let decision = &response["response"];
+            if response["subtype"] != "success" || decision["behavior"] != "allow" {
+                let message = decision["message"].as_str().unwrap_or("denied").to_owned();
+                self.record(json!({"kind": "board", "tool": tool, "denied": message}));
+                self.tool_result(&tool_use_id, &message, true);
+                return Ok(message);
+            }
+            arguments = decision["updatedInput"].clone();
+        }
+        self.counter += 1;
+        let response = self.mcp(json!({"method": "tools/call", "params": {"name": tool,
+            "arguments": arguments, "_meta": {"claudecode/toolUseId": tool_use_id}},
+            "jsonrpc": "2.0", "id": self.counter}))?;
+        let result = &response["response"]["mcp_response"]["result"];
+        let text = result["content"][0]["text"]
+            .as_str()
+            .or(response["error"].as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let is_error = response["subtype"] != "success" || result["isError"] == true;
+        self.record(json!({"kind": "board", "tool": tool, "is_error": is_error, "text": text}));
+        self.tool_result(&tool_use_id, &text, is_error);
+        Ok(text)
     }
 
     /// Sends a `can_use_tool` with the fields of `request` and waits for the host's answer; an
@@ -928,6 +1060,19 @@ fn user_text(msg: &Value) -> String {
     }
 }
 
+/// The message without the `## Parent task` section the app adds to a sub-task's prompt: the
+/// parent's tags (its scenario above all) are context, never the sub-task's own.
+fn own_text(text: &str) -> &str {
+    text.split_once("\n\n## Parent task\n")
+        .map_or(text, |(own, _)| own)
+}
+
+/// `VALUE` of the first `[name:VALUE]` in `text` (outside the parent's section).
+fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let (_, rest) = own_text(text).split_once(&format!("[{name}:"))?;
+    rest.split_once(']').map(|(value, _)| value.trim())
+}
+
 /// The target branch of the app's "Risolvi con l'agente" prompt: "This branch conflicts with
 /// `<target>` in: …".
 fn conflict_target(text: &str) -> Option<String> {
@@ -961,7 +1106,8 @@ fn write_atomically(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 fn pick_scenario(text: &str) -> String {
-    text.split_once("[fake:")
+    own_text(text)
+        .split_once("[fake:")
         .and_then(|(_, rest)| rest.split_once(']'))
         .map(|(name, _)| name.trim().to_owned())
         .or_else(|| {
@@ -1047,6 +1193,15 @@ mod tests {
         assert_eq!(append_line("\nSaluta [fake:append] tutti"), "Saluta  tutti");
         assert_eq!(append_line("Solo testo"), "Solo testo");
         assert_eq!(pick_scenario("# Conflitto [fake:append]"), "append");
+        let prompt = "# Padre\n\n[fake:board_tools] [target: t-9 ] [status:done]";
+        assert_eq!(pick_scenario(prompt), "board_tools");
+        assert_eq!(tag(prompt, "target"), Some("t-9"));
+        assert_eq!(tag(prompt, "status"), Some("done"));
+        assert_eq!(tag(prompt, "server"), None);
+        let sub =
+            "# Figlio\n\nNiente\n\n## Parent task\n\n### Padre\n\n[fake:board_tools] [target:t-9]";
+        assert_eq!(pick_scenario(sub), "simple");
+        assert_eq!(tag(sub, "target"), None);
     }
 
     #[test]

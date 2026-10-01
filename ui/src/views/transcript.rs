@@ -26,7 +26,7 @@ use crate::ui::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::marker::{Marker, MarkerContent, MarkerVariant};
 use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
-use crate::views::approval::ApprovalCard;
+use crate::views::approval::{ApprovalCard, board_tool_label};
 use crate::widgets::status::{FOCUS_RING, Status, StatusDot};
 
 /// "In fondo" = less than this many pixels from the bottom (spec §9.4).
@@ -429,6 +429,16 @@ fn entry_view(
                 return view! { <ApprovalCard attempt_id=attempt_id.get_value() entry=signal /> }
                     .into_any();
             }
+            // A board tool reads as a sentence; its raw input stays in the folded body.
+            let label = name
+                .starts_with("mcp__atm__")
+                .then(|| {
+                    use_app()
+                        .cards
+                        .with_untracked(|c| board_tool_label(name, input, c))
+                })
+                .flatten();
+            let summary = label.as_deref().unwrap_or(summary);
             tool_view(name, summary, input, status, output.as_ref(), open)
         }
         EntryBody::SessionInit {

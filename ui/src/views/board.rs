@@ -25,7 +25,7 @@ use tw_merge::tw_merge;
 
 use crate::app::{AppCtx, use_app};
 use crate::ipc;
-use crate::state::board::{apply_move, column, drop_before};
+use crate::state::board::{apply_move, column, drop_before, title_of};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::input::Input;
@@ -158,6 +158,7 @@ impl BoardState {
                 title,
                 description: String::new(),
                 status: Some(status),
+                parent_id: None,
             };
             match ipc::call::<CreateTask>(&req).await {
                 Ok(card) => self.edit(|cards| {
@@ -178,16 +179,21 @@ pub fn Board() -> impl IntoView {
     let ctx = use_app();
     // A drop on "In corso" of a task without attempt opens the Start dialog instead of moving.
     let start_for = RwSignal::new(None::<Id>);
-    let task_dialog = RwSignal::new(None::<TaskDialogMode>);
+    let task_dialog = ctx.task_dialog;
     let board = BoardState {
         ctx,
-        cards: RwSignal::new(Vec::new()),
+        cards: ctx.cards,
         loaded: RwSignal::new(false),
         generation: StoredValue::new(0),
         drag: DragCtx::new(),
         start_for,
         task_dialog,
     };
+    // The cards and the dialog live in `AppCtx` for the task panel; they go with the board.
+    on_cleanup(move || {
+        ctx.cards.try_set(Vec::new());
+        ctx.task_dialog.try_set(None);
+    });
     let shown = StoredValue::new(None::<Id>);
     Effect::new(move |_| {
         ctx.board_version.track();
@@ -248,7 +254,7 @@ fn Toolbar(board: BoardState, task_view: RwSignal<TaskView>) -> impl IntoView {
                 size=ButtonSize::Sm
                 class="bg-card dark:bg-card dark:border-border dark:hover:bg-accent ml-auto text-[13px]"
                 attr:data-action="new-task"
-                on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(TaskStatus::Todo)))
+                on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::create(TaskStatus::Todo)))
             >
                 <Plus />
                 "Nuovo task"
@@ -335,7 +341,7 @@ fn Column(board: BoardState, status: TaskStatus) -> impl IntoView {
                     class="text-muted-foreground ml-auto size-7"
                     attr:title="Nuovo task"
                     attr:aria-label=format!("Nuovo task in {title}")
-                    on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::Create(status)))
+                    on:click=move |_| board.task_dialog.set(Some(TaskDialogMode::create(status)))
                 >
                     <Plus />
                 </Button>
@@ -473,6 +479,8 @@ fn TaskCardView(
     // Closed tasks recede: Fatto muted, Annullati also struck through.
     let status = Memo::new(move |_| card.with(|c| c.task.status));
     let closed = move || matches!(status.get(), TaskStatus::Done | TaskStatus::Cancelled);
+    let parent_id = Memo::new(move |_| card.with(|c| c.task.parent_id.clone()));
+    let progress = Memo::new(move |_| card.with(|c| (c.subtasks_done, c.subtasks_total)));
 
     view! {
         <div class="flex flex-col gap-2">
@@ -507,6 +515,9 @@ fn TaskCardView(
                     }
                 }
             >
+                {move || {
+                    parent_id.get().map(|parent_id| view! { <ParentLine cards=board.cards parent_id /> })
+                }}
                 <div class="flex items-start gap-2">
                     <p
                         class="line-clamp-2 flex-1 text-[13px] leading-[18px] font-medium text-pretty break-words"
@@ -528,13 +539,16 @@ fn TaskCardView(
                     </button>
                 </div>
                 {move || {
+                    let (done, total) = progress.get();
+                    let subtasks = (total > 0).then(|| view! { <SubtaskProgress done total /> });
                     card.with(|c| {
                         let badges = card_badges(ctx, c);
                         let branch = branch_line(c);
-                        (badges.is_some() || branch.is_some())
+                        (badges.is_some() || branch.is_some() || subtasks.is_some())
                             .then(|| {
                                 view! {
                                     <div class="mt-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1.5">
+                                        {subtasks}
                                         {badges}
                                         {branch}
                                     </div>
@@ -544,6 +558,49 @@ fn TaskCardView(
                 }}
             </div>
         </div>
+    }
+}
+
+/// "↳ done/total" with a thin bar (not when `compact`): the sub-tasks of a parent task (card,
+/// list, panel).
+#[component]
+pub(crate) fn SubtaskProgress(
+    done: u32,
+    total: u32,
+    #[prop(optional)] compact: bool,
+) -> impl IntoView {
+    let percent = (done * 100).checked_div(total).unwrap_or(0);
+    view! {
+        <span
+            class="text-muted-foreground inline-flex items-center gap-1.5 font-mono text-[11px] tabular-nums"
+            title=format!("Sotto task fatti: {done} su {total}")
+            data-subtask-progress=format!("{done}/{total}")
+        >
+            {format!("↳ {done}/{total}")}
+            {(!compact)
+                .then(|| {
+                    view! {
+                        <span class="bg-muted h-1 w-8 overflow-hidden rounded-full" aria-hidden="true">
+                            <span class="bg-status-done block h-full rounded-full" style:width=format!("{percent}%") />
+                        </span>
+                    }
+                })}
+        </span>
+    }
+}
+
+/// "↳ <parent title>" of a sub-task's card, from the board's cards (the id until they have it).
+#[component]
+fn ParentLine(cards: RwSignal<Vec<TaskCard>>, parent_id: Id) -> impl IntoView {
+    let title = Memo::new(move |_| {
+        cards
+            .with(|c| title_of(c, &parent_id))
+            .unwrap_or_else(|| parent_id.clone())
+    });
+    view! {
+        <p class="text-muted-foreground mb-1 truncate font-mono text-[11px]" title=title>
+            {move || format!("↳ {}", title.get())}
+        </p>
     }
 }
 
@@ -770,6 +827,7 @@ mod tests {
                     position: 1.0,
                     created_at: 0,
                     updated_at: 0,
+                    parent_id: None,
                 },
                 attempt_id: Some("a".into()),
                 attempt_state: Some(AttemptState::Active),
@@ -779,6 +837,8 @@ mod tests {
                 last_status: Some(ProcessStatus::Running),
                 last_stop_reason: None,
                 worktree_state: None,
+                subtasks_done: 0,
+                subtasks_total: 0,
             };
             f(&mut card);
             let (_, status) = agent_state(&card)?;

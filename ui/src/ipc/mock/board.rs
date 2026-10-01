@@ -165,7 +165,7 @@ pub fn set_task_status(id: &str, status: TaskStatus) {
         move_to(&mut m.tasks, id, status, None).then(|| m.touch(id))
     });
     if let Some(project) = project {
-        changed(Some(project), Some(id.to_owned()));
+        task_changed(project, id);
     }
 }
 
@@ -188,6 +188,18 @@ fn changed(project_id: Option<Id>, task_id: Option<Id>) {
             task_id,
         },
     );
+}
+
+/// `changed` for a task, and for its parent if it is a sub-task (the parent's panel lists it).
+fn task_changed(project_id: Id, task_id: &str) {
+    let parent = with(|m| {
+        let task = m.tasks.iter().find(|t| t.id == task_id)?;
+        task.parent_id.clone()
+    });
+    changed(Some(project_id.clone()), Some(task_id.to_owned()));
+    if parent.is_some() {
+        changed(Some(project_id), parent);
+    }
 }
 
 fn get_env(req: GetEnvReq) -> Result<EnvStatus, AppError> {
@@ -380,6 +392,22 @@ fn create_task(req: CreateTaskReq) -> Result<TaskCard, AppError> {
     let status = req.status.unwrap_or(TaskStatus::Todo);
     let task = with(|m| {
         m.project_mut(&req.project_id)?;
+        // One level, same project (the core's messages).
+        if let Some(parent_id) = &req.parent_id {
+            let parent = m
+                .task_mut(parent_id)
+                .map_err(|_| AppError::invalid("Il task padre non esiste"))?;
+            if parent.project_id != req.project_id {
+                return Err(AppError::invalid(
+                    "Il task padre appartiene a un altro progetto",
+                ));
+            }
+            if parent.parent_id.is_some() {
+                return Err(AppError::invalid(
+                    "Un sotto task non può avere a sua volta sotto task",
+                ));
+            }
+        }
         let now = super::now_ms();
         let id = super::new_id();
         m.tasks.push(Task {
@@ -391,11 +419,12 @@ fn create_task(req: CreateTaskReq) -> Result<TaskCard, AppError> {
             position: 0.0,
             created_at: now,
             updated_at: now,
+            parent_id: req.parent_id.clone(),
         });
         move_to(&mut m.tasks, &id, status, None);
         m.task_mut(&id).cloned()
     })?;
-    changed(Some(task.project_id.clone()), Some(task.id.clone()));
+    task_changed(task.project_id.clone(), &task.id);
     Ok(card(task))
 }
 
@@ -408,7 +437,7 @@ fn update_task(req: UpdateTaskReq) -> Result<TaskCard, AppError> {
         t.updated_at = super::now_ms();
         Ok::<_, AppError>(t.clone())
     })?;
-    changed(Some(task.project_id.clone()), Some(task.id.clone()));
+    task_changed(task.project_id.clone(), &task.id);
     Ok(card(task))
 }
 
@@ -427,7 +456,7 @@ fn move_task(req: MoveTaskReq) -> Result<(), AppError> {
         }
         Ok(m.touch(&req.id))
     })?;
-    changed(Some(project), Some(req.id));
+    task_changed(project, &req.id);
     Ok(())
 }
 
@@ -438,9 +467,28 @@ fn delete_task(req: IdReq) -> Result<(), AppError> {
             "Il task è in esecuzione: ferma l'agente prima di eliminarlo",
         ));
     }
-    with(|m| m.tasks.retain(|t| t.id != req.id));
-    super::attempt::forget_task(&req.id);
-    super::attachments::forget_task(&req.id);
+    // Sub-tasks go with their parent (the DB's cascade).
+    let children = subtask_cards(&req.id);
+    if children.iter().any(|c| c.running) {
+        return Err(AppError::busy("Un sotto task è in esecuzione"));
+    }
+    let ids: Vec<Id> = children
+        .into_iter()
+        .map(|c| c.task.id)
+        .chain(std::iter::once(req.id.clone()))
+        .collect();
+    with(|m| m.tasks.retain(|t| !ids.contains(&t.id)));
+    for id in &ids {
+        super::attempt::forget_task(id);
+        super::attachments::forget_task(id);
+    }
+    // Like the core: `changed` for each sub-task removed, then for the task and its parent.
+    for id in &ids[..ids.len() - 1] {
+        changed(Some(task.project_id.clone()), Some(id.clone()));
+    }
+    if let Some(parent) = &task.parent_id {
+        changed(Some(task.project_id.clone()), Some(parent.clone()));
+    }
     changed(Some(task.project_id), Some(req.id));
     Ok(())
 }
@@ -631,8 +679,8 @@ fn project(id: &str, name: &str, repo_path: &str) -> Project {
 }
 
 /// Two projects; the M1 ids (`task-todo`, `task-inprogress`, `task-inreview`, `task-done`)
-/// are kept for `attempt.rs` and `/?task=<id>`. Tasks were created over the last days, the
-/// first listed the oldest, and updated some hours later.
+/// are kept for `attempt.rs` and `/?task=<id>`; `task-pagination` has three sub-tasks. Tasks
+/// were created over the last days, the first listed the oldest, and updated some hours later.
 fn seed_board() -> (Vec<Project>, Vec<Task>) {
     use TaskStatus::*;
     let demo: &[(&str, &str, TaskStatus)] = &[
@@ -656,6 +704,20 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
         ("task-dead-code", "Rimuovi il codice morto", Done),
         ("task-websocket", "Prova con i WebSocket", Cancelled),
     ];
+    // Sub-tasks of "task-pagination", in three columns.
+    let pagination: &[(&str, &str, TaskStatus)] = &[
+        (
+            "task-pagination-api",
+            "Aggiungi limit e offset all'API",
+            Done,
+        ),
+        (
+            "task-pagination-ui",
+            "Pulsanti di pagina nella tabella",
+            InProgress,
+        ),
+        ("task-pagination-tests", "Test della paginazione", Todo),
+    ];
     let web: &[(&str, &str, TaskStatus)] = &[
         ("task-contacts", "Nuova pagina contatti", Todo),
         ("task-images", "Ottimizza le immagini", InReview),
@@ -669,9 +731,13 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
     ];
     const HOUR: Millis = 3_600_000;
     let now = super::now_ms();
-    let total = (demo.len() + web.len()) as Millis;
+    let total = (demo.len() + pagination.len() + web.len()) as Millis;
     let mut tasks = Vec::new();
-    for (project_id, rows) in [(PROJECT_ID, demo), ("project-web", web)] {
+    for (project_id, parent, rows) in [
+        (PROJECT_ID, None, demo),
+        (PROJECT_ID, Some("task-pagination"), pagination),
+        ("project-web", None, web),
+    ] {
         for &(id, title, status) in rows {
             let created_at = now - (total - tasks.len() as Millis) * 9 * HOUR;
             tasks.push(Task {
@@ -683,6 +749,7 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
                 position: 0.0,
                 created_at,
                 updated_at: created_at + (tasks.len() as Millis % 4 + 1) * HOUR,
+                parent_id: parent.map(Into::into),
             });
             move_to(&mut tasks, id, status, None);
         }
@@ -690,7 +757,33 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
     (projects, tasks)
 }
 
+/// For `attempt.rs`: the cards of the task's sub-tasks, in board order.
+pub fn subtask_cards(task_id: &str) -> Vec<TaskCard> {
+    let mut tasks: Vec<Task> = with(|m| {
+        m.tasks
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some(task_id))
+            .cloned()
+            .collect()
+    });
+    tasks.sort_by(|a, b| {
+        column_index(a.status)
+            .cmp(&column_index(b.status))
+            .then(a.position.total_cmp(&b.position))
+    });
+    tasks.into_iter().map(card).collect()
+}
+
 fn card(task: Task) -> TaskCard {
+    let (subtasks_done, subtasks_total) = with(|m| {
+        let children = m
+            .tasks
+            .iter()
+            .filter(|t| t.parent_id.as_deref() == Some(task.id.as_str()));
+        children.fold((0, 0), |(done, total), t| {
+            (done + u32::from(t.status == TaskStatus::Done), total + 1)
+        })
+    });
     let mut card = TaskCard {
         task,
         attempt_id: None,
@@ -701,6 +794,8 @@ fn card(task: Task) -> TaskCard {
         last_status: None,
         last_stop_reason: None,
         worktree_state: None,
+        subtasks_done,
+        subtasks_total,
     };
     super::attempt::decorate(&mut card);
     if card.attempt_id.is_none() && FLAGS.with(|f| f.badges) {
@@ -734,6 +829,22 @@ fn demo_badges(card: &mut TaskCard) {
             Failed,
             Some(StopReason::AppRestart),
             WorktreeState::Present,
+            false,
+            0,
+        ),
+        "task-pagination-ui" => (
+            AttemptState::Active,
+            Running,
+            None,
+            WorktreeState::Present,
+            true,
+            0,
+        ),
+        "task-pagination-api" => (
+            AttemptState::Merged,
+            Completed,
+            None,
+            WorktreeState::Removed,
             false,
             0,
         ),

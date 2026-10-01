@@ -62,6 +62,26 @@
   },
   {
     "body": {
+      "type": "ToolCall",
+      "tool_use_id": "toolu_appr_board",
+      "name": "mcp__atm__move_task",
+      "summary": "move_task",
+      "input": "{\"id\":\"task-parser-tests\",\"status\":\"inreview\"}",
+      "status": {
+        "state": "AwaitingApproval",
+        "approval_id": "",
+        "can_remember": false,
+        "reason": "Gli strumenti della board chiedono conferma prima di spostare un task."
+      },
+      "output": {
+        "text": "Task spostato in inreview.",
+        "truncated_bytes": 0,
+        "is_error": false
+      }
+    }
+  },
+  {
+    "body": {
       "type": "Thinking",
       "text": "Dopo il git mv vanno aggiornati `mod parse;` in lib.rs e gli use nei moduli che lo importano."
     }

@@ -32,6 +32,7 @@ fn task() -> Task {
         position: 1536.5,
         created_at: 1_790_000_000_000,
         updated_at: 1_790_000_000_500,
+        parent_id: Some(id(9)),
     }
 }
 
@@ -75,6 +76,7 @@ fn attempt() -> AttemptView {
         pending_approvals: 1,
         created_at: 3,
         closed_at: None,
+        started_by_attempt: Some(id(12)),
     }
 }
 
@@ -529,6 +531,8 @@ fn model_types_round_trip() {
         last_status: Some(ProcessStatus::Killed),
         last_stop_reason: Some(StopReason::UserStop),
         worktree_state: Some(WorktreeState::Missing),
+        subtasks_done: 1,
+        subtasks_total: 3,
     });
     round_trip(&attempt());
     round_trip(&process());
@@ -543,6 +547,23 @@ fn model_types_round_trip() {
             ..attempt()
         }],
         attachments: vec![attachment()],
+        subtasks: vec![TaskCard {
+            task: Task {
+                id: id(13),
+                parent_id: Some(id(1)),
+                ..task()
+            },
+            attempt_id: None,
+            attempt_state: None,
+            branch: None,
+            running: false,
+            pending_approvals: 0,
+            last_status: None,
+            last_stop_reason: None,
+            worktree_state: None,
+            subtasks_done: 0,
+            subtasks_total: 0,
+        }],
     });
     round_trip(&attachment());
     round_trip(&PickedFile {
@@ -636,6 +657,7 @@ fn api_types_round_trip() {
         title: "t".into(),
         description: String::new(),
         status: Some(TaskStatus::Cancelled),
+        parent_id: Some(id(1)),
     });
     round_trip(&UpdateTaskReq {
         id: id(1),
@@ -782,6 +804,59 @@ fn update_project_description_defaults_to_empty() {
         "default_permission_mode": "acceptEdits", "default_model": null}))
     .unwrap();
     assert_eq!(req.description, "");
+}
+
+/// The sub-task and board-tool fields are optional on the wire (JSON that predates them):
+/// they read back as `None`, 0 or empty.
+#[test]
+fn subtask_fields_default_when_absent() {
+    let mut v = serde_json::to_value(task()).unwrap();
+    v.as_object_mut().unwrap().remove("parent_id");
+    let t: Task = serde_json::from_value(v).unwrap();
+    assert_eq!(t.parent_id, None);
+
+    let req: CreateTaskReq = serde_json::from_value(serde_json::json!({
+        "project_id": "p", "title": "t", "description": "", "status": null}))
+    .unwrap();
+    assert_eq!(req.parent_id, None);
+
+    let card = TaskCard {
+        task: task(),
+        attempt_id: None,
+        attempt_state: None,
+        branch: None,
+        running: false,
+        pending_approvals: 0,
+        last_status: None,
+        last_stop_reason: None,
+        worktree_state: None,
+        subtasks_done: 2,
+        subtasks_total: 5,
+    };
+    let mut v = serde_json::to_value(&card).unwrap();
+    let o = v.as_object_mut().unwrap();
+    o.remove("subtasks_done");
+    o.remove("subtasks_total");
+    let card: TaskCard = serde_json::from_value(v).unwrap();
+    assert_eq!((card.subtasks_done, card.subtasks_total), (0, 0));
+
+    let mut v = serde_json::to_value(attempt()).unwrap();
+    v.as_object_mut().unwrap().remove("started_by_attempt");
+    let a: AttemptView = serde_json::from_value(v).unwrap();
+    assert_eq!(a.started_by_attempt, None);
+
+    let detail = TaskDetail {
+        task: task(),
+        attempt: None,
+        processes: Vec::new(),
+        closed_attempts: Vec::new(),
+        attachments: Vec::new(),
+        subtasks: vec![card],
+    };
+    let mut v = serde_json::to_value(&detail).unwrap();
+    v.as_object_mut().unwrap().remove("subtasks");
+    let d: TaskDetail = serde_json::from_value(v).unwrap();
+    assert!(d.subtasks.is_empty());
 }
 
 #[test]

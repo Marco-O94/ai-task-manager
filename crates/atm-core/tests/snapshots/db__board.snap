@@ -12,7 +12,8 @@ expression: board
       "status": "todo",
       "position": 1024.0,
       "created_at": 1700000000000,
-      "updated_at": 1700000000000
+      "updated_at": 1700000000000,
+      "parent_id": null
     },
     "attempt_id": null,
     "attempt_state": null,
@@ -21,7 +22,9 @@ expression: board
     "pending_approvals": 0,
     "last_status": null,
     "last_stop_reason": null,
-    "worktree_state": null
+    "worktree_state": null,
+    "subtasks_done": 0,
+    "subtasks_total": 0
   },
   {
     "task": {
@@ -32,7 +35,8 @@ expression: board
       "status": "inprogress",
       "position": 1024.0,
       "created_at": 1700000000000,
-      "updated_at": 1700000000002
+      "updated_at": 1700000000002,
+      "parent_id": null
     },
     "attempt_id": "a-run",
     "attempt_state": "active",
@@ -41,7 +45,9 @@ expression: board
     "pending_approvals": 0,
     "last_status": "running",
     "last_stop_reason": null,
-    "worktree_state": "present"
+    "worktree_state": "present",
+    "subtasks_done": 0,
+    "subtasks_total": 0
   },
   {
     "task": {
@@ -52,7 +58,8 @@ expression: board
       "status": "inreview",
       "position": 1024.0,
       "created_at": 1700000000000,
-      "updated_at": 1700000000031
+      "updated_at": 1700000000031,
+      "parent_id": null
     },
     "attempt_id": "a-act",
     "attempt_state": "active",
@@ -61,7 +68,9 @@ expression: board
     "pending_approvals": 0,
     "last_status": "completed",
     "last_stop_reason": null,
-    "worktree_state": "present"
+    "worktree_state": "present",
+    "subtasks_done": 0,
+    "subtasks_total": 0
   },
   {
     "task": {
@@ -72,7 +81,8 @@ expression: board
       "status": "inreview",
       "position": 2048.0,
       "created_at": 1700000000000,
-      "updated_at": 1700000000040
+      "updated_at": 1700000000040,
+      "parent_id": null
     },
     "attempt_id": "a-rst",
     "attempt_state": "active",
@@ -81,7 +91,9 @@ expression: board
     "pending_approvals": 0,
     "last_status": "failed",
     "last_stop_reason": "app_restart",
-    "worktree_state": "present"
+    "worktree_state": "present",
+    "subtasks_done": 0,
+    "subtasks_total": 0
   },
   {
     "task": {
@@ -92,7 +104,8 @@ expression: board
       "status": "done",
       "position": 1024.0,
       "created_at": 1700000000000,
-      "updated_at": 1700000000012
+      "updated_at": 1700000000012,
+      "parent_id": null
     },
     "attempt_id": "a-new",
     "attempt_state": "merged",
@@ -101,6 +114,8 @@ expression: board
     "pending_approvals": 0,
     "last_status": "failed",
     "last_stop_reason": null,
-    "worktree_state": "removed"
+    "worktree_state": "removed",
+    "subtasks_done": 0,
+    "subtasks_total": 0
   }
 ]

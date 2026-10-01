@@ -1,7 +1,8 @@
 //! Task panel (right split, 55 %): header on three rows (column and date with the actions:
-//! Avvia, Merge, Stop, Continua, Scarta, Apri in…, "Sposta in…"; the title; the agent badge,
-//! the branch and the attachments) plus the attempt's label/value line, and the Agente /
-//! Modifiche tabs (spec §9.2). Refetches `get_task_detail` when `AppCtx::detail_version`
+//! Avvia, Merge, Stop, Continua, Scarta, Apri in…, "Sposta in…"; the title, under a sub-task's
+//! "↳ parent" link; the agent badge, the branch and the attachments) plus the attempt's
+//! label/value line, a top-level task's "Sotto task", and the Agente / Modifiche tabs (spec
+//! §9.2). Refetches `get_task_detail` when `AppCtx::detail_version`
 //! changes. Owner: M2-UI-TASK, attachments and model line UI-TASKS.
 
 use atm_types::{
@@ -10,7 +11,7 @@ use atm_types::{
     StopAttempt, Task, TaskCard, TaskDetail, TaskStatus, WorktreeState,
 };
 use icons::{
-    Code, FolderOpen, GitBranch, GitMerge, Paperclip, Play, RotateCw, Square, SquareTerminal,
+    Code, FolderOpen, GitBranch, GitMerge, Paperclip, Play, Plus, RotateCw, Square, SquareTerminal,
     Trash2, X,
 };
 use leptos::ev::KeyboardEvent;
@@ -21,6 +22,7 @@ use wasm_bindgen::JsCast;
 
 use crate::app::{AppCtx, use_app};
 use crate::ipc;
+use crate::state::board::title_of;
 use crate::ui::alert::{Alert, AlertDescription, AlertTitle};
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::empty::{Empty, EmptyContent, EmptyDescription, EmptyHeader, EmptyTitle};
@@ -28,13 +30,15 @@ use crate::ui::select_native::SelectNative;
 use crate::ui::skeleton::Skeleton;
 use crate::ui::tabs::{Tabs, TabsContent, TabsList, TabsTrigger, TabsVariant};
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
-use crate::views::board::{column_title, interrupted_by_app, updated_text, updated_title};
+use crate::views::board::{
+    SubtaskProgress, column_title, interrupted_by_app, updated_text, updated_title,
+};
 use crate::views::composer::Composer;
 use crate::views::diff::{ClosedAttempt, DiffView};
 use crate::views::merge_dialog::DiscardDialog;
 use crate::views::overview::short_commit;
 use crate::views::start_dialog::StartDialog;
-use crate::views::task_dialog::format_size;
+use crate::views::task_dialog::{TaskDialogMode, format_size};
 use crate::views::transcript::{Transcript, mode_label};
 use crate::widgets::status::{AgentBadge, FOCUS_RING, Status, StatusDot, agent_state};
 
@@ -190,6 +194,10 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
             && !running.get()
             && !interrupted.get()
             && tab.get() != TAB_CHANGES
+    });
+    let parent_id = Memo::new(move |_| task.with(|t| t.parent_id.clone()));
+    let subtasks = Memo::new(move |_| {
+        detail.with(|d| d.as_ref().map(|d| d.subtasks.clone()).unwrap_or_default())
     });
     let start_for = RwSignal::new(None::<Id>);
     let discard_open = RwSignal::new(false);
@@ -374,6 +382,7 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                     <X />
                 </Button>
             </div>
+            {move || parent_id.get().map(|parent_id| view! { <ParentLink parent_id /> })}
             <h2 class="mt-1.5 text-[17px] leading-6 font-semibold tracking-tight text-pretty [overflow-wrap:anywhere]">
                 {move || task.with(|t| t.title.clone())}
             </h2>
@@ -414,6 +423,10 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                 </dl>
             </Show>
         </header>
+        // One level only: a sub-task has none of its own.
+        <Show when=move || parent_id.with(Option::is_none)>
+            <Subtasks task subtasks dialog=ctx.task_dialog />
+        </Show>
         <Tabs default_value=TAB_AGENT class="min-h-0 flex-1 gap-0">
             <TabsList
                 variant=TabsVariant::Line
@@ -499,6 +512,132 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
     }
 }
 
+/// "↳ <parent title>" above a sub-task's title: opens the parent's panel.
+#[component]
+fn ParentLink(parent_id: Id) -> impl IntoView {
+    let ctx = use_app();
+    let title = {
+        let parent_id = parent_id.clone();
+        Memo::new(move |_| {
+            ctx.cards
+                .with(|c| title_of(c, &parent_id))
+                .unwrap_or_else(|| "Task padre".into())
+        })
+    };
+    view! {
+        <button
+            type="button"
+            class=format!(
+                "text-muted-foreground hover:text-foreground mt-1.5 block max-w-full truncate rounded-sm text-left font-mono text-[11px] hover:underline {FOCUS_RING}",
+            )
+            title="Apri il task padre"
+            data-parent-link=parent_id.clone()
+            on:click=move |_| ctx.open_task.set(Some(parent_id.clone()))
+        >
+            {move || format!("↳ {}", title.get())}
+        </button>
+    }
+}
+
+/// "Sotto task" of a top-level task: one row per sub-task (its column's dot, its title, which
+/// opens it, its agent badge) and "Aggiungi sotto task", which opens `TaskDialog` with this
+/// task as the parent.
+#[component]
+fn Subtasks(
+    task: Memo<Task>,
+    subtasks: Memo<Vec<TaskCard>>,
+    dialog: RwSignal<Option<TaskDialogMode>>,
+) -> impl IntoView {
+    let progress = Memo::new(move |_| {
+        subtasks.with(|s| {
+            let done = s
+                .iter()
+                .filter(|c| c.task.status == TaskStatus::Done)
+                .count();
+            (done as u32, s.len() as u32)
+        })
+    });
+    let add = move |_| {
+        let (id, title) = task.with_untracked(|t| (t.id.clone(), t.title.clone()));
+        dialog.set(Some(TaskDialogMode::Create {
+            status: TaskStatus::Todo,
+            parent: Some((id, title)),
+        }));
+    };
+    view! {
+        <section class="shrink-0 border-b px-5 py-2" aria-label="Sotto task" data-subtasks="">
+            <div class="flex h-7 items-center gap-2">
+                <h3 class="text-muted-foreground text-xs font-medium">"Sotto task"</h3>
+                <Show when=move || progress.with(|(_, total)| *total > 0)>
+                    {move || {
+                        let (done, total) = progress.get();
+                        view! { <SubtaskProgress done total /> }
+                    }}
+                </Show>
+                <Button
+                    variant=ButtonVariant::Ghost
+                    size=ButtonSize::Sm
+                    class=tw_merge!(SMALL, "text-muted-foreground ml-auto")
+                    attr:data-action="add-subtask"
+                    on:click=add
+                >
+                    <Plus />
+                    "Aggiungi sotto task"
+                </Button>
+            </div>
+            <Show when=move || subtasks.with(|s| !s.is_empty())>
+                <ul class="-mx-2 mt-1 flex max-h-40 flex-col overflow-y-auto">
+                    <For each=move || subtasks.get() key=|c| c.task.id.clone() let:card>
+                        <SubtaskRow subtasks card />
+                    </For>
+                </ul>
+            </Show>
+        </section>
+    }
+}
+
+/// Keyed by id (its handler holds it): reads the latest version of its card.
+#[component]
+fn SubtaskRow(subtasks: Memo<Vec<TaskCard>>, card: TaskCard) -> impl IntoView {
+    let ctx = use_app();
+    let id = card.task.id.clone();
+    let card = {
+        let id = id.clone();
+        Memo::new(move |_| {
+            subtasks
+                .with(|s| s.iter().find(|c| c.task.id == id).cloned())
+                .unwrap_or_else(|| card.clone())
+        })
+    };
+    let status = Memo::new(move |_| card.with(|c| c.task.status));
+    let cancelled = move || status.get() == TaskStatus::Cancelled;
+    let open = {
+        let id = id.clone();
+        move |_| ctx.open_task.set(Some(id.clone()))
+    };
+    view! {
+        <li class="hover:bg-muted/60 flex h-8 items-center gap-2 rounded-md px-2" data-subtask-id=id>
+            {move || view! { <StatusDot status=Status::of_column(status.get()) /> }}
+            <button
+                type="button"
+                class=format!(
+                    "min-w-0 flex-1 truncate rounded-sm text-left text-[13px] hover:underline {FOCUS_RING}",
+                )
+                class=("line-through", cancelled)
+                class=("text-muted-foreground", move || matches!(status.get(), TaskStatus::Done | TaskStatus::Cancelled))
+                title=move || format!("{} · {}", card.with(|c| c.task.title.clone()), column_title(status.get()))
+                on:click=open
+            >
+                {move || card.with(|c| c.task.title.clone())}
+                <span class="sr-only">{move || format!(" · {}", column_title(status.get()))}</span>
+            </button>
+            {move || {
+                card.with(agent_state).map(|(label, status)| view! { <AgentBadge label status /> })
+            }}
+        </li>
+    }
+}
+
 fn branch_chip(attempt: &AttemptView) -> impl IntoView + use<> {
     view! {
         <span
@@ -526,6 +665,8 @@ fn panel_state(d: &TaskDetail) -> Option<(&'static str, Status)> {
         last_status: last.map(|p| p.status),
         last_stop_reason: last.and_then(|p| p.stop_reason),
         worktree_state: Some(attempt.worktree_state),
+        subtasks_done: 0,
+        subtasks_total: 0,
     })
 }
 

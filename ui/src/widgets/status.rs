@@ -154,6 +154,7 @@ mod tests {
                 position: 1.0,
                 created_at: 0,
                 updated_at: 0,
+                parent_id: None,
             },
             attempt_id: Some("a".into()),
             attempt_state: Some(AttemptState::Active),
@@ -163,6 +164,8 @@ mod tests {
             last_status: None,
             last_stop_reason: None,
             worktree_state: Some(WorktreeState::Present),
+            subtasks_done: 0,
+            subtasks_total: 0,
         }
     }
 

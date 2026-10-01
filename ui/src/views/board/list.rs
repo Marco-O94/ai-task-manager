@@ -1,13 +1,17 @@
 //! List view of the board (spec F4): the same cards as the columns, as one semantic table in
-//! column order then position. No search, filter or sort yet. Owner: UI-TASKS.
+//! column order then position, each sub-task right under its parent (a parent's sub-tasks
+//! fold with its "↳ n/m" toggle, not persisted). No search, filter or sort yet. Owner:
+//! UI-TASKS.
 
-use atm_types::{Millis, TaskCard, TaskStatus};
-use icons::Pencil;
+use std::collections::HashSet;
+
+use atm_types::{Id, Millis, TaskCard, TaskStatus};
+use icons::{ChevronDown, Pencil};
 use leptos::prelude::*;
 use wasm_bindgen::JsValue;
 
-use super::{BoardState, branch_line, card_badges, column_title};
-use crate::state::board::by_column;
+use super::{BoardState, SubtaskProgress, branch_line, card_badges, column_title};
+use crate::state::board::nested;
 use crate::ui::empty::{Empty, EmptyDescription, EmptyHeader, EmptyTitle};
 use crate::ui::skeleton::Skeleton;
 use crate::views::task_dialog::TaskDialogMode;
@@ -23,7 +27,21 @@ pub(super) fn TaskList(board: BoardState) -> impl IntoView {
     let ctx = board.ctx;
     // The open task panel takes 55 % of the width: Branch and Aggiornato make room.
     let narrow = Memo::new(move |_| ctx.open_task.with(Option::is_some));
-    let rows = Memo::new(move |_| board.cards.with(|cards| by_column(cards)));
+    // Parents whose sub-tasks are folded.
+    let folded = RwSignal::new(HashSet::<Id>::new());
+    let rows = Memo::new(move |_| {
+        let rows = board.cards.with(|cards| nested(cards));
+        folded.with(|folded| {
+            rows.into_iter()
+                .filter(|c| {
+                    c.task
+                        .parent_id
+                        .as_ref()
+                        .is_none_or(|p| !folded.contains(p))
+                })
+                .collect::<Vec<_>>()
+        })
+    });
 
     view! {
         <section class="flex min-h-0 flex-1 flex-col" data-view="task-list">
@@ -81,7 +99,7 @@ pub(super) fn TaskList(board: BoardState) -> impl IntoView {
                             </thead>
                             <tbody>
                                 <For each=move || rows.get() key=|c| c.task.id.clone() let:card>
-                                    <Row board card narrow />
+                                    <Row board card narrow folded />
                                 </For>
                             </tbody>
                         </table>
@@ -93,7 +111,12 @@ pub(super) fn TaskList(board: BoardState) -> impl IntoView {
 }
 
 #[component]
-fn Row(board: BoardState, card: TaskCard, narrow: Memo<bool>) -> impl IntoView {
+fn Row(
+    board: BoardState,
+    card: TaskCard,
+    narrow: Memo<bool>,
+    folded: RwSignal<HashSet<Id>>,
+) -> impl IntoView {
     let ctx = board.ctx;
     let id = card.task.id.clone();
     let card = {
@@ -121,6 +144,22 @@ fn Row(board: BoardState, card: TaskCard, narrow: Memo<bool>) -> impl IntoView {
     let status = Memo::new(move |_| card.with(|c| c.task.status));
     let cancelled = move || status.get() == TaskStatus::Cancelled;
     let updated = Memo::new(move |_| card.with(|c| c.task.updated_at));
+    let child = Memo::new(move |_| card.with(|c| c.task.parent_id.is_some()));
+    let progress = Memo::new(move |_| card.with(|c| (c.subtasks_done, c.subtasks_total)));
+    let is_folded = {
+        let id = id.clone();
+        Memo::new(move |_| folded.with(|f| f.contains(&id)))
+    };
+    let toggle = {
+        let id = id.clone();
+        move |_| {
+            folded.update(|f| {
+                if !f.remove(&id) {
+                    f.insert(id.clone());
+                }
+            })
+        }
+    };
 
     view! {
         <tr
@@ -128,8 +167,13 @@ fn Row(board: BoardState, card: TaskCard, narrow: Memo<bool>) -> impl IntoView {
             class=("bg-accent/60", move || selected.get())
             data-row-task-id=id
         >
-            <td class="py-2.5 pr-4 pl-5">
+            <td class="py-2.5 pr-4 pl-5" class=("pl-9", move || child.get())>
                 <div class="flex items-center gap-1">
+                    <Show when=move || child.get()>
+                        <span class="text-muted-foreground shrink-0 font-mono text-[11px]" aria-hidden="true">
+                            "↳"
+                        </span>
+                    </Show>
                     <button
                         type="button"
                         class=format!(
@@ -152,6 +196,34 @@ fn Row(board: BoardState, card: TaskCard, narrow: Memo<bool>) -> impl IntoView {
                     >
                         <Pencil class="size-3.5" />
                     </button>
+                    // After the title: the title button stays the row's first one.
+                    <Show when=move || progress.with(|(_, total)| *total > 0)>
+                        <button
+                            type="button"
+                            class=format!(
+                                "hover:bg-muted ml-1 inline-flex shrink-0 items-center gap-1 rounded-sm px-1 {FOCUS_RING}",
+                            )
+                            aria-expanded=move || (!is_folded.get()).to_string()
+                            aria-label=move || {
+                                let (done, total) = progress.get();
+                                let verb = if is_folded.get() { "Mostra" } else { "Nascondi" };
+                                format!("{verb} i sotto task ({done} su {total} fatti)")
+                            }
+                            data-action="toggle-subtasks"
+                            on:click=toggle.clone()
+                        >
+                            {move || {
+                                let (done, total) = progress.get();
+                                view! { <SubtaskProgress done total compact=true /> }
+                            }}
+                            <span
+                                class="text-muted-foreground transition-transform"
+                                class=("-rotate-90", move || is_folded.get())
+                            >
+                                <ChevronDown class="size-3.5" />
+                            </span>
+                        </button>
+                    </Show>
                 </div>
             </td>
             <td class=TD>

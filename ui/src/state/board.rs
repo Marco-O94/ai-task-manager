@@ -51,6 +51,39 @@ pub fn by_column(cards: &[TaskCard]) -> Vec<TaskCard> {
         .collect()
 }
 
+/// [`by_column`] with each sub-task right under its parent, the sub-tasks in the same order
+/// among themselves: the list view's rows. A sub-task whose parent is not among `cards` stays
+/// in its own place.
+pub fn nested(cards: &[TaskCard]) -> Vec<TaskCard> {
+    let ordered = by_column(cards);
+    let has_parent = |c: &TaskCard| {
+        c.task
+            .parent_id
+            .as_ref()
+            .is_some_and(|p| cards.iter().any(|x| &x.task.id == p))
+    };
+    let mut rows = Vec::with_capacity(ordered.len());
+    for card in ordered.iter().filter(|c| !has_parent(c)) {
+        rows.push(card.clone());
+        let id = &card.task.id;
+        rows.extend(
+            ordered
+                .iter()
+                .filter(|c| c.task.parent_id.as_ref() == Some(id))
+                .cloned(),
+        );
+    }
+    rows
+}
+
+/// Title of task `id` among `cards`.
+pub fn title_of(cards: &[TaskCard], id: &str) -> Option<String> {
+    cards
+        .iter()
+        .find(|c| c.task.id == id)
+        .map(|c| c.task.title.clone())
+}
+
 /// Optimistic local reorder mirroring `move_task`: `id` goes into `status` before `before_id`
 /// (at the end when `None`). The `changed` refetch that follows is authoritative.
 #[allow(clippy::ptr_arg)] // frozen M1 signature
@@ -145,6 +178,7 @@ mod tests {
             position,
             created_at: 0,
             updated_at: 0,
+            parent_id: None,
         }
     }
 
@@ -159,6 +193,8 @@ mod tests {
             last_status: None,
             last_stop_reason: None,
             worktree_state: None,
+            subtasks_done: 0,
+            subtasks_total: 0,
         }
     }
 
@@ -196,6 +232,23 @@ mod tests {
         let order: Vec<String> = by_column(&cards).into_iter().map(|c| c.task.id).collect();
         assert_eq!(order, ["a", "b", "c", "q", "p", "r", "x", "k"]);
         assert!(by_column(&[]).is_empty());
+    }
+
+    #[test]
+    fn nested_puts_the_sub_tasks_under_their_parent() {
+        let child = |id: &str, status, position, parent: &str| {
+            let mut c = card(id, status, position);
+            c.task.parent_id = Some(parent.into());
+            c
+        };
+        let mut cards = board(); // Todo a b c, Done x
+        cards.push(child("b2", TaskStatus::Done, 512.0, "b"));
+        cards.push(child("b1", TaskStatus::Todo, 4096.0, "b"));
+        cards.push(child("orphan", TaskStatus::Todo, 10.0, "gone"));
+        let order: Vec<String> = nested(&cards).into_iter().map(|c| c.task.id).collect();
+        assert_eq!(order, ["orphan", "a", "b", "b1", "b2", "c", "x"]);
+        assert_eq!(title_of(&cards, "b1").as_deref(), Some("b1"));
+        assert_eq!(title_of(&cards, "nope"), None);
     }
 
     #[test]

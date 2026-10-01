@@ -187,6 +187,10 @@ pub struct Task {
     pub position: f64,
     pub created_at: Millis,
     pub updated_at: Millis,
+    /// Parent task for a sub-task (same project, one level only: a parent is never itself a
+    /// sub-task); `None` = top-level task. Deleting the parent deletes its sub-tasks.
+    #[serde(default)]
+    pub parent_id: Option<Id>,
 }
 
 /// One board card: the task plus its active (else most recent) attempt, merged with the
@@ -206,6 +210,12 @@ pub struct TaskCard {
     pub last_status: Option<ProcessStatus>,
     pub last_stop_reason: Option<StopReason>,
     pub worktree_state: Option<WorktreeState>,
+    /// Sub-tasks of this task in status `done` (the parent's progress "n/m").
+    #[serde(default)]
+    pub subtasks_done: u32,
+    /// Every sub-task of this task, whatever its status; 0 for a sub-task.
+    #[serde(default)]
+    pub subtasks_total: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -235,6 +245,10 @@ pub struct AttemptView {
     pub pending_approvals: u32,
     pub created_at: Millis,
     pub closed_at: Option<Millis>,
+    /// Attempt whose agent started this one through the board tools (`start_task`); `None` =
+    /// started by the user. Plain id, not a foreign key: it survives the starter's deletion.
+    #[serde(default)]
+    pub started_by_attempt: Option<Id>,
 }
 
 /// One turn (one `claude -p` process).
@@ -267,6 +281,9 @@ pub struct TaskDetail {
     pub closed_attempts: Vec<AttemptView>,
     /// Files attached to the task, oldest first.
     pub attachments: Vec<Attachment>,
+    /// Cards of the task's sub-tasks, in board order (column, then position).
+    #[serde(default)]
+    pub subtasks: Vec<TaskCard>,
 }
 
 /// A file attached to a task: a copy in the app's data dir (never in a worktree, never

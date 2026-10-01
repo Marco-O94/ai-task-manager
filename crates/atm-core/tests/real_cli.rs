@@ -18,8 +18,8 @@
 //! sticky: every later test of the binary refuses to start, and so does every later run until
 //! the marker `real_cli.TRIPPED` in `CARGO_TARGET_TMPDIR` is deleted by hand. The tests
 //! serialize on a lock whatever the libtest flags. Every approval outside the step's allowlist
-//! is denied with `interrupt` and fails the run. Quota: model `sonnet`, effort `low`, tiny
-//! prompts, 8 real turns in a full run, no retries.
+//! is denied with `interrupt` and fails the run. Quota: model `sonnet` (`haiku` for the board
+//! tools), effort `low`, tiny prompts, 11 real turns in a full run, no retries.
 //!
 //! Every project lives in a temp dir removed at the end: a local clone of the toy repo
 //! (`ATM_REAL_CLAUDE_REPO`, default `~/Desktop/Repositories/test-rust`, only read; the clone's
@@ -921,6 +921,7 @@ impl Real {
             title: title.into(),
             description: description.into(),
             status: None,
+            parent_id: None,
         };
         self.core.create_task(req).await.unwrap().task
     }
@@ -1746,10 +1747,14 @@ fn key_trip(v: &Value, init_seen: &mut bool) -> Option<String> {
 }
 
 /// Argv of a turn as the Core builds it (spec §7.3): policy Isolated, `sonnet`, `low`.
+/// A raw probe does not serve the app's SDK server `atm` (the Core does): its declaration is
+/// left out, so that the CLI never waits for it.
 fn probe_argv(guard: &Guard, cwd: &Path, mode: PermissionMode, resume: bool) -> Vec<String> {
     let mut args = turn_args(guard, cwd, mode, &[]);
     args.resume = resume;
-    claude::build_argv(&args)
+    let mut argv = claude::build_argv(&args);
+    argv.retain(|a| !a.starts_with("--mcp-config="));
+    argv
 }
 
 /// [`probe_argv`] of a new session with `allow_rules` in `--settings`: what the preflight of
@@ -2085,7 +2090,8 @@ fn real_cli_checklist() {
             "result_subtype": p1.result_subtype, "exit_code": rows[0].exit_code,
             "cost_usd_estimate": p1.cost_usd_estimate, "num_turns": p1.num_turns}));
         real.check(p1.status == ProcessStatus::Completed, format!("a: turn 1 {p1:?}"));
-        real.check(init["mcp_servers"] == 0, "a: --strict-mcp-config left MCP servers");
+        // Only the app's own SDK server `atm` (the board tools).
+        real.check(init["mcp_servers"] == 1, "a: --strict-mcp-config left MCP servers");
         real.check(init["warnings"] == json!([]), format!("a: SessionInit warnings {init}"));
         real.check(p1.cost_usd_estimate.is_some_and(|c| c > 0.0), "a: no cost");
         real.check(real.seen.typing_previews() > 0, "a: no streaming preview");
@@ -2477,7 +2483,7 @@ fn real_cli_isolated_project_config() {
             marker_after, None,
             "a project hook or MCP server ran in Isolated"
         );
-        assert_eq!(init["mcp_servers"], 0);
+        assert_eq!(init["mcp_servers"], 1, "not only the app's own server atm");
         assert_eq!(p.status, ProcessStatus::Completed);
         real.finish().await;
     });
@@ -2569,7 +2575,9 @@ fn real_cli_subagent_ask_rule_reaches_the_host_in_every_mode() {
                 format!("{mode}: argv {argv:?}"),
             );
             real.check(
-                settings_of(&argv)["permissions"]["ask"] == json!(["Agent", "Task"]),
+                settings_of(&argv)["permissions"]["ask"]
+                    .as_array()
+                    .is_some_and(|ask| ask.ends_with(&[json!("Agent"), json!("Task")])),
                 format!("{mode}: no ask rule in --settings"),
             );
             real.check(
@@ -2834,6 +2842,134 @@ fn real_cli_add_dir_with_spaces_is_readable() {
         real.finish().await;
     });
     drop(picked_dir);
+}
+
+/// Round 2026-09-30 [V]: the board tools of the app's in-process MCP server `atm`, in every
+/// permission mode (Autonomo included: the `ask` rule must reach the host there too). In each,
+/// the agent (haiku, low) creates a subtask of its own task at once (an `allow` rule) and moves
+/// another task to done after the user's approval (an `ask` rule: `can_use_tool` from the SDK
+/// server); both effects are in the DB. 3 real turns. Alone:
+/// `ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored board_tools`.
+#[test]
+#[ignore = "real Claude Code CLI: ATM_REAL_CLAUDE=1, see the module docs"]
+fn real_cli_board_tools_ask_in_every_mode() {
+    let Some((_serial, guard)) = guard() else {
+        return;
+    };
+    runtime().block_on(async {
+        let real = Real::new(guard, "board-tools", Source::Fresh(&[])).await;
+        let security = SetProjectSecurityReq {
+            id: real.project.id.clone(),
+            config_policy: ConfigPolicy::Isolated,
+            allow_bypass: true,
+        };
+        real.core.set_project_security(security).await.unwrap();
+        for (n, mode) in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::BypassPermissions,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let other = real
+                .task(&format!("Board target {}", n + 1), "Leave this task alone.")
+                .await;
+            let task = real
+                .task(
+                    &format!("Board tools check {}", n + 1),
+                    &format!(
+                        "This task is a validation run of the host app. Call the tool \
+                         mcp__atm__create_task exactly once with title `Subtask from the \
+                         agent` and parent_id `self`. Then call the tool mcp__atm__move_task \
+                         exactly once with id `{}` and status `done`. Do not use any other \
+                         tool. Then reply with the word DONE.",
+                        other.id
+                    ),
+                )
+                .await;
+            let args = TurnArgs {
+                model: Some("haiku".into()),
+                allow_bypass: mode == PermissionMode::BypassPermissions,
+                ..turn_args(&real.guard, &real.repo, mode, &[])
+            };
+            let argv = claude::build_argv(&args);
+            let env = real.guard.env().for_attempt(&real.repo, "m5-preflight");
+            real.guard.before_turn(&argv, &real.repo, &env).await;
+            let req = StartAttemptReq {
+                task_id: task.id.clone(),
+                target_branch: "main".into(),
+                permission_mode: mode,
+                model: Some("haiku".into()),
+                effort: Some(Effort::Low),
+                subagent_model: None,
+                max_subagents: None,
+            };
+            let attempt = real.core.start_attempt(req).await.unwrap();
+            real.guard.count_turn();
+            real.label(&format!("{}-board-{mode}", n + 1), &attempt.id, 1);
+            real.subscribe(&attempt.id).await;
+            let (asked, d) = real
+                .drive(&attempt.id, &task.id, 1, |a| {
+                    if a.tool == "mcp__atm__move_task" {
+                        ApprovalDecision::Allow { remember: false }
+                    } else {
+                        nothing_to_approve(&real, "board", a)
+                    }
+                })
+                .await;
+            let p = &d.processes[0];
+            let db = real.db();
+            let children: Vec<Task> = db
+                .task_children(&task.id)
+                .unwrap()
+                .iter()
+                .map(|id| db.task(id).unwrap())
+                .collect();
+            let moved = db.task(&other.id).unwrap();
+            let asks = real.raw_can_use_tool(&attempt.id, &p.id);
+            let init = real.session_init(&p.id).unwrap_or_default();
+            real.note(
+                &format!("board_{mode}"),
+                json!({
+                "children": children.iter().map(|t| &t.title).collect::<Vec<_>>(),
+                "moved": moved.status, "asks": asks, "session_init": init,
+                "tool_calls": real.tool_calls(&p.id),
+                "approvals": asked.iter().map(Asked::json).collect::<Vec<_>>(),
+                "said": real.said(&p.id), "status": p.status}),
+            );
+            real.check(
+                children.len() == 1 && children[0].title == "Subtask from the agent",
+                format!("{mode}: subtasks {children:?}"),
+            );
+            real.check(
+                moved.status == TaskStatus::Done,
+                format!("{mode}: other task {:?}", moved.status),
+            );
+            real.check(
+                asked.len() == 1 && asked[0].tool == "mcp__atm__move_task",
+                format!("{mode}: the move did not wait for the approval"),
+            );
+            real.check(
+                asks.iter()
+                    .all(|r| r["mcp_server"] == json!({"name": "atm", "source": "sdk"})),
+                format!("{mode}: can_use_tool {asks:?}"),
+            );
+            // A count only (a failed server counts too): the subtask above proves the link.
+            real.check(
+                init["mcp_servers"] == 1,
+                format!(
+                    "{mode}: system/init lists {} MCP servers",
+                    init["mcp_servers"]
+                ),
+            );
+            real.check(
+                p.status == ProcessStatus::Completed,
+                format!("{mode}: {p:?}"),
+            );
+        }
+        real.finish().await;
+    });
 }
 
 /// The sanitizer itself (no CLI): runs with the normal test suite.

@@ -44,6 +44,7 @@ fn new_task(project_id: &str, title: &str, status: Option<TaskStatus>) -> Create
         title: title.into(),
         description: String::new(),
         status,
+        parent_id: None,
     }
 }
 
@@ -65,6 +66,7 @@ fn attempt(id: &str, task_id: &str, created_at: i64) -> AttemptRow {
         subagent_model: None,
         max_subagents: None,
         subagents_used: 0,
+        started_by_attempt: None,
         allow_rules: Vec::new(),
         merge_commit: None,
         created_at,
@@ -358,6 +360,74 @@ fn migrates_a_v1_database_with_rows_to_v2() {
         db.update_project(&req, NOW).unwrap().description,
         "Ora descritto"
     );
+}
+
+/// A database of the second schema with rows migrates to the third: the rows are kept, every
+/// task is top-level, every attempt was started by the user, and the new columns are usable.
+#[test]
+fn migrates_a_v2_database_with_rows_to_v3() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atm.sqlite3");
+    {
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch(db::PRAGMAS).unwrap();
+        let tx = c.transaction().unwrap();
+        tx.execute_batch(MIGRATIONS[0]).unwrap();
+        tx.execute_batch(MIGRATIONS[1]).unwrap();
+        tx.pragma_update(None, "user_version", 2).unwrap();
+        tx.commit().unwrap();
+        c.execute_batch(
+            "INSERT INTO projects (id, name, description, repo_path, default_target_branch,
+                created_at, updated_at)
+                VALUES ('p', 'Vecchio', 'Descritto', '/r', 'main', 1, 2);
+             INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at)
+                VALUES ('t', 'p', 'T', 'done', 1024, 0, 0);
+             INSERT INTO task_attachments (id, task_id, name, size, created_at)
+                VALUES ('x', 't', 'log.txt', 3, 0);",
+        )
+        .unwrap();
+        raw_attempt(&c, "a", "active").unwrap();
+        c.execute(
+            "UPDATE attempts SET max_subagents = 2, subagents_used = 1 WHERE id = 'a'",
+            [],
+        )
+        .unwrap();
+        raw_process(&c, "r", "a", 1, "running").unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let version: i64 = Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, MIGRATIONS.len() as i64);
+    assert_eq!(db.project("p").unwrap().description, "Descritto");
+    let t = db.task("t").unwrap();
+    assert_eq!((t.title.as_str(), t.parent_id), ("T", None));
+    let a = db.attempt("a").unwrap();
+    assert_eq!(
+        (a.max_subagents, a.subagents_used, a.started_by_attempt),
+        (Some(2), 1, None)
+    );
+    assert_eq!(db.process("r").unwrap().status, ProcessStatus::Running);
+    assert_eq!(db.attachment_count("t").unwrap(), 1);
+    let card = db.task_card("t").unwrap();
+    assert_eq!((card.subtasks_done, card.subtasks_total), (0, 0));
+
+    let child = CreateTaskReq {
+        parent_id: Some("t".into()),
+        ..new_task("p", "Figlio", Some(TaskStatus::Done))
+    };
+    assert_eq!(
+        db.insert_task("c", &child, NOW)
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("t")
+    );
+    let card = db.task_card("t").unwrap();
+    assert_eq!((card.subtasks_done, card.subtasks_total), (1, 1));
+    assert_eq!(db.task_children("t").unwrap(), ["c"]);
 }
 
 #[test]
@@ -1484,4 +1554,78 @@ fn task_and_attempt_ids_for_cleanup() {
     assert!(db.project_task_ids("nope").unwrap().is_empty());
     assert!(db.project_attempt_ids("nope").unwrap().is_empty());
     assert!(db.task_attempt_ids("nope").unwrap().is_empty());
+}
+
+/// Sub-tasks (migration 0003): the parent is stored, the cards count done and total children,
+/// the children are listed, deleting the parent cascades, the starter is a plain id.
+#[test]
+fn subtasks_are_stored_counted_listed_and_cascade() {
+    let db = seeded();
+    let child = |title: &str, status| CreateTaskReq {
+        parent_id: Some("t".into()),
+        ..new_task("p", title, Some(status))
+    };
+    db.insert_task("c1", &child("Uno", TaskStatus::Done), NOW)
+        .unwrap();
+    db.insert_task("c2", &child("Due", TaskStatus::Todo), NOW + 1)
+        .unwrap();
+    db.insert_task("c3", &child("Tre", TaskStatus::Todo), NOW + 2)
+        .unwrap();
+    db.insert_task("o", &new_task("p", "Altro", None), NOW + 3)
+        .unwrap();
+    assert_eq!(db.task("c1").unwrap().parent_id.as_deref(), Some("t"));
+    assert_eq!(db.task("o").unwrap().parent_id, None);
+
+    let board = db.board("p").unwrap();
+    let counts = |id: &str| {
+        let c = board.iter().find(|c| c.task.id == id).unwrap();
+        (c.subtasks_done, c.subtasks_total)
+    };
+    assert_eq!(counts("t"), (1, 3));
+    assert_eq!(counts("c1"), (0, 0));
+    assert_eq!(counts("o"), (0, 0));
+    let card = db.task_card("t").unwrap();
+    assert_eq!((card.subtasks_done, card.subtasks_total), (1, 3));
+
+    assert_eq!(db.task_children("t").unwrap(), ["c1", "c2", "c3"]);
+    assert!(db.task_children("o").unwrap().is_empty());
+    assert!(db.task_children("nope").unwrap().is_empty());
+    let cards: Vec<_> = db
+        .subtask_cards("t")
+        .unwrap()
+        .into_iter()
+        .map(|c| c.task.id)
+        .collect();
+    assert_eq!(cards, ["c2", "c3", "c1"], "board order: todo before done");
+    assert!(db.subtask_cards("nope").unwrap().is_empty());
+
+    let orphan = CreateTaskReq {
+        parent_id: Some("nope".into()),
+        ..new_task("p", "Orfano", None)
+    };
+    assert!(db.insert_task("x", &orphan, NOW).is_err(), "unknown parent");
+
+    let mut started = attempt("a2", "c2", NOW);
+    started.started_by_attempt = Some("gone".into());
+    db.begin_attempt(&started, &process("r2", "a2", 1, "i"), NOW)
+        .unwrap();
+    assert_eq!(
+        db.attempt("a2").unwrap().started_by_attempt.as_deref(),
+        Some("gone")
+    );
+    assert_eq!(
+        db.attempt("a2")
+            .unwrap()
+            .view(false, 0)
+            .started_by_attempt
+            .as_deref(),
+        Some("gone")
+    );
+
+    db.delete_task("t").unwrap();
+    for id in ["t", "c1", "c2", "c3"] {
+        assert_eq!(err(db.task(id)).code, ErrorCode::NotFound, "{id}");
+    }
+    assert_eq!(err(db.attempt("a2")).code, ErrorCode::NotFound);
+    assert_eq!(db.task("o").unwrap().title, "Altro");
 }

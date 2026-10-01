@@ -145,6 +145,9 @@ struct Inner {
 /// Size of [`Inner::commit_configs`] past which it starts over.
 const MAX_COMMIT_CONFIGS: usize = 64;
 
+/// `Busy` of a task deleted while its agent runs.
+const REMOVE_BUSY: &str = "Il task è in esecuzione: ferma l'agente prima di eliminarlo";
+
 /// Login-shell `PATH` and the git found on it: imported once, re-read by `get_env{force}`.
 struct Tools {
     path: OsString,
@@ -719,6 +722,14 @@ impl Core {
             title: req.title.trim().to_owned(),
             ..req
         };
+        // Serialized with the parent's delete: a sub-task never outlives it unseen.
+        let _parent = match &req.parent_id {
+            Some(parent_id) => Some(s.lock(task_key(parent_id)).await),
+            None => None,
+        };
+        if let Some(parent_id) = &req.parent_id {
+            check_parent(&s.db, &req.project_id, parent_id)?;
+        }
         let task = s.db.insert_task(&new_id(), &req, now_ms())?;
         s.emit_changed(Some(&task.project_id), Some(&task.id));
         s.card(&task.id)
@@ -751,36 +762,34 @@ impl Core {
         Ok(())
     }
 
-    /// Errors: `Busy` if running. Discards the active attempt first; once the rows are gone,
-    /// removes the attachments and the attempts' raw logs.
+    /// Errors: `Busy` if the task or one of its sub-tasks is running, nothing removed. The
+    /// sub-tasks go first, each with the same cleanup as the task ([`Inner::remove_task`]).
     pub async fn delete_task(&self, req: IdReq) -> Result<(), AppError> {
         let s = &self.inner;
         let task = s.db.task(&req.id)?;
-        let busy = || AppError::busy("Il task è in esecuzione: ferma l'agente prima di eliminarlo");
-        // Serialized with `start_attempt`; a follow-up is caught under its attempt's lock, and
-        // none can start on a removed worktree.
-        let _task = s.lock(task_key(&task.id)).await;
-        if s.task_running(&task.id) {
-            return Err(busy());
-        }
         let project = s.db.project(&task.project_id)?;
         let git = s.git().await;
-        for attempt in s.db.task_attempts(&task.id)? {
-            if attempt.worktree_state == WorktreeState::Removed {
-                continue;
-            }
-            let _attempt = s.lock(attempt_key(&attempt.id)).await;
-            if s.turn(&attempt.id).is_some() {
-                return Err(busy());
-            }
-            let _repo = s.lock(repo_key(&project.repo_path)).await;
-            tolerate_missing(s.remove_worktree(&git, &project.repo_path, &attempt).await)?;
+        // Every task's lock across the whole cascade, parent first: none of them starts, and
+        // no sub-task is created (`create_task` takes the parent's) until it is over.
+        let _task = s.lock(task_key(&task.id)).await;
+        let children = s.db.task_children(&task.id)?;
+        let mut child_locks = Vec::with_capacity(children.len());
+        for child in &children {
+            child_locks.push(s.lock(task_key(child)).await);
         }
-        let attempt_ids = s.db.task_attempt_ids(&task.id)?;
-        s.db.delete_task(&task.id)?;
-        let folder = attachments::task_dir(&s.config.data_dir, &task.project_id, &task.id);
-        s.remove_files(folder, &attempt_ids).await;
-        s.emit_changed(Some(&task.project_id), Some(&task.id));
+        if s.task_running(&task.id) {
+            return Err(AppError::busy(REMOVE_BUSY));
+        }
+        if children.iter().any(|id| s.task_running(id)) {
+            return Err(AppError::busy("Un sotto task è in esecuzione"));
+        }
+        for child in &children {
+            s.remove_task(&git, &project, child).await?;
+        }
+        s.remove_task(&git, &project, &task.id).await?;
+        if let Some(parent_id) = &task.parent_id {
+            s.emit_changed(Some(&task.project_id), Some(parent_id));
+        }
         Ok(())
     }
 
@@ -801,12 +810,17 @@ impl Core {
                 .iter()
                 .map(|a| attachments::view(&s.config.data_dir, &task.project_id, a))
                 .collect();
+        let mut subtasks = s.db.subtask_cards(&task.id)?;
+        for card in &mut subtasks {
+            s.merge_live(card);
+        }
         Ok(TaskDetail {
             task,
             attempt: active.map(|a| s.attempt_view(&a)),
             processes: processes.iter().map(|p| p.info()).collect(),
             closed_attempts: closed.iter().map(|a| a.view(false, 0)).collect(),
             attachments,
+            subtasks,
         })
     }
 
@@ -906,6 +920,16 @@ impl Core {
     /// attempt exists), `Invalid` (bypass without the project's `allow_bypass`, sub-agent
     /// options, before any worktree), `Git`.
     pub async fn start_attempt(&self, req: StartAttemptReq) -> Result<AttemptView, AppError> {
+        self.start_attempt_by(req, None).await
+    }
+
+    /// [`Core::start_attempt`] recording the attempt whose agent asked for it (the board tool
+    /// `start_task`, `attempts.started_by_attempt`); `None` = the user.
+    pub(crate) async fn start_attempt_by(
+        &self,
+        req: StartAttemptReq,
+        started_by: Option<Id>,
+    ) -> Result<AttemptView, AppError> {
         let s = &self.inner;
         let task = s.db.task(&req.task_id)?;
         let project = s.db.project(&task.project_id)?;
@@ -975,15 +999,18 @@ impl Core {
             subagent_model,
             max_subagents: req.max_subagents,
             subagents_used: 0,
+            started_by_attempt: started_by,
             allow_rules: Vec::new(),
             merge_commit: None,
             created_at: now,
             updated_at: now,
             closed_at: None,
         };
+        let parent = s.parent_task(&task)?;
         let prompt = first_prompt(
             &task.title,
             &task.description,
+            parent.as_ref(),
             attached_paths(attached.as_ref()),
         );
         let ctx = AttemptCtx {
@@ -1061,9 +1088,11 @@ impl Core {
                 .await
                 .unwrap_or_default();
             let (task, attachments) = (&ctx.task, attached_paths(attached.as_ref()));
+            let parent = s.parent_task(task)?;
             fresh_prompt(
                 &task.title,
                 &task.description,
+                parent.as_ref(),
                 attachments,
                 &log,
                 &req.prompt,
@@ -1309,11 +1338,20 @@ impl Inner {
         (self.notify)(event);
     }
 
+    /// A sub-task's change is its parent's too (its panel lists the sub-tasks): `Changed` for
+    /// the parent follows, when the task is still there.
     fn emit_changed(&self, project_id: Option<&str>, task_id: Option<&str>) {
         self.emit(AppEvent::Changed(Changed {
             project_id: project_id.map(str::to_owned),
             task_id: task_id.map(str::to_owned),
         }));
+        let parent = task_id.and_then(|id| self.db.task(id).ok()?.parent_id);
+        if let Some(parent_id) = parent {
+            self.emit(AppEvent::Changed(Changed {
+                project_id: project_id.map(str::to_owned),
+                task_id: Some(parent_id),
+            }));
+        }
     }
 
     /// Emits and returns the current [`EnvStatus`].
@@ -1345,6 +1383,14 @@ impl Inner {
             .filter(|dir| !dir.as_os_str().is_empty())
     }
 
+    /// A sub-task's parent, for its prompt; `None` for a top-level task.
+    fn parent_task(&self, task: &Task) -> Result<Option<Task>, AppError> {
+        task.parent_id
+            .as_deref()
+            .map(|id| self.db.task(id))
+            .transpose()
+    }
+
     /// What the agent of `task` is given of its attachments (spec F5); `None` without any.
     fn agent_attachments(&self, task: &Task) -> Result<Option<attachments::ForAgent>, AppError> {
         let rows = self.db.task_attachments(&task.id)?;
@@ -1363,6 +1409,44 @@ impl Inner {
             .iter()
             .map(|id| runner::attempt_log_dir(&self.config.data_dir, id));
         remove_dirs(std::iter::once(folder).chain(logs).collect()).await;
+    }
+
+    /// Deletes one task (a sub-task has none of its own), the caller holding its lock
+    /// (serialized with `start_attempt`): `Busy` if running; removes the worktrees of its
+    /// attempts first, then the rows, then the attachments and the attempts' raw logs
+    /// ([`Inner::remove_files`]). Emits `changed`.
+    async fn remove_task(
+        &self,
+        git: &Git,
+        project: &ProjectRow,
+        task_id: &str,
+    ) -> Result<(), AppError> {
+        let busy = || AppError::busy(REMOVE_BUSY);
+        // A follow-up is caught under its attempt's lock, and none can start on a removed
+        // worktree.
+        if self.task_running(task_id) {
+            return Err(busy());
+        }
+        for attempt in self.db.task_attempts(task_id)? {
+            if attempt.worktree_state == WorktreeState::Removed {
+                continue;
+            }
+            let _attempt = self.lock(attempt_key(&attempt.id)).await;
+            if self.turn(&attempt.id).is_some() {
+                return Err(busy());
+            }
+            let _repo = self.lock(repo_key(&project.repo_path)).await;
+            tolerate_missing(
+                self.remove_worktree(git, &project.repo_path, &attempt)
+                    .await,
+            )?;
+        }
+        let attempt_ids = self.db.task_attempt_ids(task_id)?;
+        self.db.delete_task(task_id)?;
+        let folder = attachments::task_dir(&self.config.data_dir, &project.id, task_id);
+        self.remove_files(folder, &attempt_ids).await;
+        self.emit_changed(Some(&project.id), Some(task_id));
+        Ok(())
     }
 
     fn child_env(&self, tools: &Tools, settings: &Settings) -> ChildEnv {
@@ -1904,6 +1988,26 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.map(|v| v.trim().to_owned()).filter(|v| !v.is_empty())
 }
 
+/// A sub-task's parent (spec §5, one level only): an existing task of the same project that
+/// is not itself a sub-task. Errors: `Invalid`.
+fn check_parent(db: &Db, project_id: &str, parent_id: &str) -> Result<(), AppError> {
+    let parent = db.task(parent_id).map_err(|e| match e.code {
+        ErrorCode::NotFound => AppError::invalid("Il task padre non esiste"),
+        _ => e,
+    })?;
+    if parent.project_id != project_id {
+        return Err(AppError::invalid(
+            "Il task padre appartiene a un altro progetto",
+        ));
+    }
+    if parent.parent_id.is_some() {
+        return Err(AppError::invalid(
+            "Un sotto task non può avere a sua volta sotto task",
+        ));
+    }
+    Ok(())
+}
+
 fn check_bypass(mode: PermissionMode, project: &ProjectRow) -> Result<(), AppError> {
     if mode == PermissionMode::BypassPermissions && !project.allow_bypass {
         return Err(AppError::invalid(
@@ -2003,23 +2107,40 @@ fn attached_paths(attached: Option<&attachments::ForAgent>) -> &[PathBuf] {
     attached.map_or(&[], |a| a.paths.as_slice())
 }
 
-/// First turn (spec §7.4 step 2): `# {title}\n\n{description}`, then the attachments
-/// ([`attachments::prompt_section`]).
-fn first_prompt(title: &str, description: &str, attachments: &[PathBuf]) -> String {
+/// First turn (spec §7.4 step 2): `# {title}\n\n{description}`, then a sub-task's parent
+/// ([`parent_section`]) and the attachments ([`attachments::prompt_section`]).
+fn first_prompt(
+    title: &str,
+    description: &str,
+    parent: Option<&Task>,
+    attachments: &[PathBuf],
+) -> String {
     let mut prompt = format!("# {title}\n\n{description}").trim_end().to_owned();
+    prompt.push_str(&parent.map_or_else(String::new, parent_section));
     prompt.push_str(&attachments::prompt_section(attachments));
     prompt
+}
+
+/// `## Parent task` with the parent's title and description, as context.
+fn parent_section(parent: &Task) -> String {
+    let section = format!(
+        "\n\n## Parent task\n\nThis task is a sub-task of the one below, given for context: \
+         work only on this task.\n\n### {}\n\n{}",
+        parent.title, parent.description
+    );
+    section.trim_end().to_owned()
 }
 
 /// `fresh_session` (spec §7.4 step 2): the task, the attempt's commits and the user's text.
 fn fresh_prompt(
     title: &str,
     description: &str,
+    parent: Option<&Task>,
     attachments: &[PathBuf],
     log: &str,
     text: &str,
 ) -> String {
-    let mut prompt = first_prompt(title, description, attachments);
+    let mut prompt = first_prompt(title, description, parent, attachments);
     if !log.trim().is_empty() {
         prompt.push_str("\n\nCommits already made on this branch:\n");
         prompt.push_str(log.trim_end());

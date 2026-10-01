@@ -207,6 +207,7 @@ impl Flow {
             title: title.into(),
             description: description.into(),
             status: None,
+            parent_id: None,
         };
         self.core.create_task(req).await.unwrap().task
     }
@@ -550,8 +551,14 @@ async fn ordered_flow_from_start_to_merge() {
         let settings: Value = serde_json::from_str(flag(argv, "--settings=").unwrap()).unwrap();
         settings["permissions"]["allow"].clone()
     };
-    assert_eq!(allow(&calls[0]), serde_json::json!([]));
-    assert_eq!(allow(&calls[1]), serde_json::json!(["Bash(echo hello)"]));
+    let board = claude::BOARD_ALLOW;
+    assert_eq!(allow(&calls[0]), serde_json::json!(board));
+    let mut remembered = serde_json::json!(board);
+    remembered
+        .as_array_mut()
+        .unwrap()
+        .push("Bash(echo hello)".into());
+    assert_eq!(allow(&calls[1]), remembered);
     for argv in &calls {
         assert!(argv.contains(&"--permission-mode=acceptEdits".to_owned()));
         assert!(argv.contains(&"--strict-mcp-config".to_owned()));
@@ -845,12 +852,12 @@ async fn unsupported_control_request_gets_an_error_reply() {
     let attempt = f.start(&task).await;
     let d = f.turn_end(&task.id, 1, TURN).await;
     assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    // After the answers to the MCP handshake.
     let reply = f
         .record()
         .into_iter()
-        .find(|r| r["kind"] == "control_response")
+        .find(|r| r["kind"] == "control_response" && r["response"]["subtype"] == "error")
         .unwrap();
-    assert_eq!(reply["response"]["subtype"], "error");
     assert_eq!(
         reply["response"]["error"],
         "Unsupported control request subtype: hook_callback"
@@ -1651,6 +1658,7 @@ fn seeded_db() -> (Arc<Db>, String) {
         title: "t".into(),
         description: String::new(),
         status: None,
+        parent_id: None,
     };
     db.insert_task("t", &task, 0).unwrap();
     let attempt = AttemptRow {
@@ -1670,6 +1678,7 @@ fn seeded_db() -> (Arc<Db>, String) {
         subagent_model: None,
         max_subagents: None,
         subagents_used: 0,
+        started_by_attempt: None,
         allow_rules: Vec::new(),
         merge_commit: None,
         created_at: 0,
@@ -3051,10 +3060,11 @@ async fn subagent_limit_allows_up_to_the_max_then_denies() {
         Some("AskUserQuestion,Workflow")
     );
     let settings = settings_of(first);
-    assert_eq!(
-        settings["permissions"]["ask"],
-        serde_json::json!(["Agent", "Task"])
-    );
+    let mut ask = serde_json::json!(claude::BOARD_ASK);
+    ask.as_array_mut()
+        .unwrap()
+        .extend(["Agent".into(), "Task".into()]);
+    assert_eq!(settings["permissions"]["ask"], ask);
     assert_eq!(
         settings["env"],
         serde_json::json!({"CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"})
@@ -3074,7 +3084,10 @@ async fn subagent_limit_allows_up_to_the_max_then_denies() {
         Some("AskUserQuestion,Agent,Task,Workflow")
     );
     let settings = settings_of(second);
-    assert_eq!(settings["permissions"].get("ask"), None);
+    assert_eq!(
+        settings["permissions"]["ask"],
+        serde_json::json!(claude::BOARD_ASK)
+    );
     assert_eq!(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "sonnet");
 }
 
@@ -3102,12 +3115,15 @@ async fn a_zero_limit_disallows_subagents_from_the_first_turn() {
         Some("AskUserQuestion,Agent,Task,Workflow")
     );
     let settings = settings_of(argv);
-    assert_eq!(settings["permissions"].get("ask"), None);
+    assert_eq!(
+        settings["permissions"]["ask"],
+        serde_json::json!(claude::BOARD_ASK)
+    );
     assert_eq!(settings.get("env"), None);
 }
 
-/// Without sub-agent options the argv is the one before the feature (no `ask`, no `env`, no
-/// other disallowed tool), and a spawn that asks (a rule of the user's) is an ordinary
+/// Without sub-agent options the argv is the one before the feature (`ask` holds only the
+/// board tools, no `env`, no other disallowed tool), and a spawn that asks (a rule of the user's) is an ordinary
 /// approval: pending until answered, never counted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_limit_a_subagent_spawn_is_an_ordinary_approval() {
@@ -3149,7 +3165,10 @@ async fn without_a_limit_a_subagent_spawn_is_an_ordinary_approval() {
     assert_eq!(flag(argv, "--disallowedTools="), Some("AskUserQuestion"));
     let settings = settings_of(argv);
     assert_eq!(settings.as_object().unwrap().len(), 1, "{settings}");
-    assert_eq!(settings["permissions"].as_object().unwrap().len(), 2);
+    assert_eq!(
+        settings["permissions"]["ask"],
+        serde_json::json!(claude::BOARD_ASK)
+    );
     assert!(!argv.iter().any(|a| a.starts_with("--add-dir")));
 }
 
@@ -3646,4 +3665,693 @@ fn staged_picks_expire_and_the_oldest_go_first() {
         staging.redeem(&many[last].token, t0),
         Some(pick(last as u64))
     );
+}
+
+// ---- round 2026-09-30: board tools of the in-process MCP server `atm` (spec §7.3, §7.8) -------
+
+/// `(tool, is_error, text)` of every board tool call of the fake, oldest first; a denied one is
+/// `(tool, true, message)`.
+fn board_calls(f: &Flow) -> Vec<(String, bool, String)> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["kind"] == "board")
+        .map(|r| {
+            let tool = r["tool"].as_str().unwrap().to_owned();
+            match r["denied"].as_str() {
+                Some(message) => (tool, true, message.to_owned()),
+                None => (
+                    tool,
+                    r["is_error"] == true,
+                    r["text"].as_str().unwrap().into(),
+                ),
+            }
+        })
+        .collect()
+}
+
+/// `(method, control_response)` of every MCP message of the fake, oldest first.
+fn mcp_answers(f: &Flow) -> Vec<(String, Value)> {
+    f.record()
+        .into_iter()
+        .filter(|r| r["kind"] == "mcp")
+        .map(|r| {
+            let method = r["message"]["method"].as_str().unwrap().to_owned();
+            (method, r["response"].clone())
+        })
+        .collect()
+}
+
+impl Flow {
+    /// Waits until `mcp__atm__<tool>` awaits the user's approval in the subscribed transcript;
+    /// returns its `approval_id`.
+    async fn board_approval(&self, tool: &str) -> Id {
+        let name = format!("mcp__atm__{tool}");
+        let asking = self
+            .entry(&format!("the approval of {name}"), |e| {
+                matches!(&e.body, EntryBody::ToolCall {
+                    name: n,
+                    status: ToolStatus::AwaitingApproval { .. },
+                    ..
+                } if *n == name)
+            })
+            .await;
+        let EntryBody::ToolCall {
+            status: ToolStatus::AwaitingApproval { approval_id, .. },
+            ..
+        } = asking.body
+        else {
+            unreachable!()
+        };
+        approval_id
+    }
+
+    async fn allow(&self, attempt_id: &str, approval_id: Id, remember: bool) {
+        let req = RespondApprovalReq {
+            attempt_id: attempt_id.into(),
+            approval_id,
+            decision: ApprovalDecision::Allow { remember },
+        };
+        self.core.respond_approval(req).await.unwrap();
+    }
+
+    /// Starts `task` (a `[fake:board_tools]` one) and approves its `update_task`, `move_task`
+    /// and `start_task` in turn; returns the attempt once the turn has ended.
+    async fn run_board_tools(&self, task: &Task) -> AttemptView {
+        let attempt = self.start(task).await;
+        self.subscribe(&attempt.id).await;
+        for tool in ["update_task", "move_task", "start_task"] {
+            let approval = self.board_approval(tool).await;
+            self.allow(&attempt.id, approval, false).await;
+        }
+        let d = self.turn_end(&task.id, 1, TURN).await;
+        assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+        attempt
+    }
+}
+
+/// The agent's MCP handshake is answered by the host (`initialize` echoed, the notification,
+/// the six tools); `create_task` with parent `self` runs at once and is announced, and so do
+/// `list_tasks` and `get_task`; `update_task`, `move_task` and `start_task` wait as ordinary
+/// approvals ("Consenti sempre" remembers nothing), then run through the same service as the
+/// UI: the subtask is renamed and moves, and its agent starts in the caller's mode, recorded as
+/// started by the calling attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_tools_create_at_once_and_ask_before_a_move_or_a_start() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Padre", "[fake:board_tools]").await;
+    let attempt = f.start(&task).await;
+    f.subscribe(&attempt.id).await;
+    let approval = f.board_approval("update_task").await;
+
+    let answers = mcp_answers(&f);
+    let methods: Vec<&str> = answers.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/call",
+            "tools/call",
+            "tools/call"
+        ]
+    );
+    let mcp = |i: usize| answers[i].1["response"]["mcp_response"].clone();
+    assert_eq!(mcp(0)["id"], 0);
+    assert_eq!(mcp(0)["result"]["protocolVersion"], "2025-11-25");
+    assert_eq!(
+        mcp(0)["result"]["capabilities"],
+        serde_json::json!({"tools": {}})
+    );
+    assert_eq!(mcp(0)["result"]["serverInfo"]["name"], "atm");
+    assert_eq!(mcp(1), serde_json::json!({"jsonrpc": "2.0", "result": {}}));
+    let tools = mcp(2)["result"]["tools"].as_array().unwrap().clone();
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "list_tasks",
+            "get_task",
+            "create_task",
+            "update_task",
+            "move_task",
+            "start_task"
+        ]
+    );
+    assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
+    assert_eq!(
+        tools[4]["inputSchema"]["properties"]["status"]["enum"],
+        serde_json::json!(["todo", "inprogress", "inreview", "done", "cancelled"])
+    );
+
+    let d = f.detail(&task.id).await;
+    assert_eq!(d.subtasks.len(), 1);
+    let sub = d.subtasks[0].task.clone();
+    assert_eq!(
+        (sub.title.as_str(), sub.parent_id.as_deref(), sub.status),
+        (
+            "Sotto task dal fake",
+            Some(task.id.as_str()),
+            TaskStatus::Todo
+        )
+    );
+    assert_eq!(sub.description, "Creato con create_task.");
+    let calls = board_calls(&f);
+    let outcomes: Vec<(&str, bool)> = calls.iter().map(|c| (c.0.as_str(), c.1)).collect();
+    assert_eq!(
+        outcomes,
+        [
+            ("create_task", false),
+            ("list_tasks", false),
+            ("get_task", false)
+        ]
+    );
+    let answer = |i: usize| serde_json::from_str::<Value>(&calls[i].2).unwrap();
+    assert_eq!(answer(0)["id"], sub.id.as_str());
+    assert_eq!(answer(0)["parent_id"], task.id.as_str());
+    assert_eq!(
+        answer(1),
+        serde_json::json!([{"id": sub.id, "title": "Sotto task dal fake", "status": "todo",
+                            "parent_id": task.id, "agent": null}])
+    );
+    let own = answer(2);
+    assert_eq!(
+        (
+            &own["id"],
+            &own["description"],
+            &own["status"],
+            &own["parent"]
+        ),
+        (
+            &Value::from(task.id.as_str()),
+            &Value::from("[fake:board_tools]"),
+            &Value::from("inprogress"),
+            &Value::Null
+        )
+    );
+    assert_eq!(own["attempt"]["running"], true);
+    assert_eq!(own["subtasks"][0]["id"], sub.id.as_str());
+    assert_eq!(own["subtasks"][0]["status"], "todo");
+    assert!(f.seen.events().iter().any(|e| matches!(e,
+        AppEvent::Changed(c) if c.task_id.as_deref() == Some(sub.id.as_str())
+            && c.project_id.as_deref() == Some(f.project.id.as_str()))));
+
+    // Pending like any tool that asks: nothing changed yet.
+    assert_eq!(f.card(&task.id).await.pending_approvals, 1);
+    assert_eq!(f.detail(&sub.id).await.task.title, "Sotto task dal fake");
+    f.allow(&attempt.id, approval, true).await;
+    let approval = f.board_approval("move_task").await;
+    assert_eq!(
+        f.detail(&sub.id).await.task.title,
+        "Sotto task dal fake (rivisto)"
+    );
+    assert_eq!(f.detail(&sub.id).await.task.status, TaskStatus::Todo);
+    f.allow(&attempt.id, approval, true).await;
+    let approval = f.board_approval("start_task").await;
+    assert_eq!(f.detail(&sub.id).await.task.status, TaskStatus::InReview);
+    assert_eq!(f.detail(&sub.id).await.attempt, None);
+    f.allow(&attempt.id, approval, false).await;
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    assert!(f.db().attempt(&attempt.id).unwrap().allow_rules.is_empty());
+    let calls = board_calls(&f);
+    assert!(calls.iter().all(|c| !c.1), "{calls:?}");
+    assert_eq!(calls.len(), 6);
+
+    let started = f.turn_end(&sub.id, 1, TURN).await;
+    let a = started.attempt.unwrap();
+    assert_eq!(a.started_by_attempt.as_deref(), Some(attempt.id.as_str()));
+    assert_eq!(a.permission_mode, PermissionMode::AcceptEdits);
+    assert_eq!(a.target_branch, "main");
+    assert_eq!(
+        state(&started.processes[0]),
+        (ProcessStatus::Completed, None)
+    );
+    assert_eq!(
+        f.detail(&task.id).await.attempt.unwrap().started_by_attempt,
+        None
+    );
+}
+
+/// `start_task` beyond `max_running` (the caller holds the only slot) is a tool error for the
+/// model, `ConcurrencyLimit`, before any worktree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_start_beyond_max_running_is_a_tool_error() {
+    let f = Flow::new(&[]).await;
+    let settings = f.core.get_settings().await.unwrap();
+    f.core
+        .update_settings(Settings {
+            max_running: 1,
+            ..settings
+        })
+        .await
+        .unwrap();
+    let task = f.task("Padre", "[fake:board_tools]").await;
+    f.run_board_tools(&task).await;
+    let calls = board_calls(&f);
+    let (tool, is_error, text) = &calls[5];
+    assert_eq!((tool.as_str(), *is_error), ("start_task", true));
+    assert!(text.contains("ConcurrencyLimit"), "{text}");
+    let sub = &f.detail(&task.id).await.subtasks[0];
+    assert_eq!(f.detail(&sub.task.id).await.attempt, None);
+    assert_eq!(f.worktrees(), 1);
+}
+
+/// `start_task` of a task that is not a sub-task runs it in the project's default mode, not in
+/// the caller's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_start_of_a_top_level_task_uses_the_project_mode() {
+    let f = Flow::new(&[]).await;
+    let update = UpdateProjectReq {
+        id: f.project.id.clone(),
+        name: f.project.name.clone(),
+        default_target_branch: f.project.default_target_branch.clone(),
+        default_permission_mode: PermissionMode::Default,
+        default_model: None,
+        description: String::new(),
+    };
+    f.core.update_project(update).await.unwrap();
+    let other = f.task("Altro", "[fake:simple]").await;
+    let task = f
+        .task(
+            "Chiamante",
+            &format!("[fake:board_tools] [target:{}]", other.id),
+        )
+        .await;
+    f.run_board_tools(&task).await;
+    let started = f.turn_end(&other.id, 1, TURN).await.attempt.unwrap();
+    assert_eq!(started.permission_mode, PermissionMode::Default);
+    assert_eq!(
+        f.detail(&task.id).await.attempt.unwrap().permission_mode,
+        PermissionMode::AcceptEdits
+    );
+}
+
+/// An agent started by an agent cannot start one in turn (depth 2): `start_task` is refused,
+/// read from the DB at the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_start_by_an_agent_started_by_an_agent_is_refused() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Figlio di un agente", "[fake:board_tools]").await;
+    let attempt = f.start(&task).await;
+    f.subscribe(&attempt.id).await;
+    let approval = f.board_approval("update_task").await;
+    let conn = rusqlite::Connection::open(f.config.data_dir.join("atm.sqlite3")).unwrap();
+    conn.execute(
+        "UPDATE attempts SET started_by_attempt = 'another-attempt' WHERE id = ?1",
+        [&attempt.id],
+    )
+    .unwrap();
+    f.allow(&attempt.id, approval, false).await;
+    for tool in ["move_task", "start_task"] {
+        let approval = f.board_approval(tool).await;
+        f.allow(&attempt.id, approval, false).await;
+    }
+    f.turn_end(&task.id, 1, TURN).await;
+    let calls = board_calls(&f);
+    let (tool, is_error, text) = &calls[5];
+    assert_eq!((tool.as_str(), *is_error), ("start_task", true));
+    assert!(text.contains("started by another agent"), "{text}");
+    let sub = &f.detail(&task.id).await.subtasks[0];
+    assert_eq!(f.detail(&sub.task.id).await.attempt, None);
+    assert_eq!(f.worktrees(), 1);
+}
+
+/// A denied `move_task` never reaches the host as a `tools/call`: the task stays where it was,
+/// and the model gets the user's refusal. `update_task` and `start_task` go on as usual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_denied_board_tool_changes_nothing() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Padre", "[fake:board_tools]").await;
+    let attempt = f.start(&task).await;
+    f.subscribe(&attempt.id).await;
+    let approval = f.board_approval("update_task").await;
+    f.allow(&attempt.id, approval, false).await;
+    let approval = f.board_approval("move_task").await;
+    let req = RespondApprovalReq {
+        attempt_id: attempt.id.clone(),
+        approval_id: approval,
+        decision: ApprovalDecision::Deny {
+            message: "Non spostarlo".into(),
+            interrupt: false,
+        },
+    };
+    f.core.respond_approval(req).await.unwrap();
+    let approval = f.board_approval("start_task").await;
+    let sub = f.detail(&task.id).await.subtasks[0].task.clone();
+    assert_eq!(sub.status, TaskStatus::Todo);
+    f.allow(&attempt.id, approval, false).await;
+    f.turn_end(&task.id, 1, TURN).await;
+
+    let calls = board_calls(&f);
+    assert_eq!(calls[4].0, "move_task");
+    assert!(
+        calls[4].1 && calls[4].2.contains("Non spostarlo"),
+        "{calls:?}"
+    );
+    let called: Vec<String> = mcp_answers(&f)
+        .into_iter()
+        .filter(|(method, _)| method == "tools/call")
+        .map(|(_, r)| r["response"]["mcp_response"]["result"]["content"][0]["text"].to_string())
+        .collect();
+    assert_eq!(called.len(), 5, "{called:?}");
+    f.turn_end(&sub.id, 1, TURN).await;
+}
+
+/// A `tools/call` of a tool that asks, without the user's approval of that very `tool_use_id`
+/// (a CLI that did not ask), is refused by the host: nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unapproved_board_call_is_refused() {
+    let f = Flow::new(&[]).await;
+    let task = f
+        .task("Padre", "[fake:board_tools] [ask:skip] [status:done]")
+        .await;
+    f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let calls = board_calls(&f);
+    assert_eq!(calls.len(), 6);
+    assert!(calls[..3].iter().all(|c| !c.1), "{calls:?}");
+    for (tool, is_error, text) in &calls[3..] {
+        assert!(*is_error, "{tool}: {text}");
+        assert!(text.starts_with("Not approved"), "{tool}: {text}");
+    }
+    let sub = &f.detail(&task.id).await.subtasks[0];
+    assert_eq!(
+        (sub.task.title.as_str(), sub.task.status),
+        ("Sotto task dal fake", TaskStatus::Todo)
+    );
+    assert_eq!(f.detail(&sub.task.id).await.attempt, None);
+}
+
+/// A task of another project is "not found" to the board tools: neither moved nor started.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_tools_never_reach_another_project() {
+    let f = Flow::new(&[]).await;
+    let repo2 = common::init_repo(&f.dir.path().join("repo2"));
+    let other = f
+        .core
+        .add_project(AddProjectReq {
+            path: repo2.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap()
+        .project;
+    let foreign = f
+        .core
+        .create_task(CreateTaskReq {
+            project_id: other.id.clone(),
+            title: "Altrui".into(),
+            description: String::new(),
+            status: None,
+            parent_id: None,
+        })
+        .await
+        .unwrap()
+        .task;
+    let description = format!("[fake:board_tools] [target:{}] [status:done]", foreign.id);
+    let task = f.task("Curioso", &description).await;
+    f.run_board_tools(&task).await;
+    let calls = board_calls(&f);
+    assert_eq!(calls.len(), 6);
+    for (tool, is_error, text) in &calls[3..] {
+        assert!(*is_error, "{tool}: {text}");
+        assert!(
+            text.contains(&format!("No task with id {} in this project", foreign.id)),
+            "{tool}: {text}"
+        );
+    }
+    let d = f.detail(&foreign.id).await;
+    assert_eq!((d.task.status, d.attempt), (TaskStatus::Todo, None));
+    assert_eq!(d.task.title, "Altrui");
+}
+
+/// An `mcp_message` for a server other than `atm` gets an error reply and a warning Notice;
+/// the turn goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_message_for_an_unknown_server_gets_an_error_reply() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Server", "[fake:mcp_other]").await;
+    let attempt = f.start(&task).await;
+    let d = f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(state(&d.processes[0]), (ProcessStatus::Completed, None));
+    // The handshake with `atm` comes first, on every process, like the real CLI's.
+    let answers = mcp_answers(&f);
+    let methods: Vec<&str> = answers.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        methods,
+        [
+            "initialize",
+            "notifications/initialized",
+            "tools/list",
+            "tools/list"
+        ]
+    );
+    assert_eq!(answers[3].1["subtype"], "error");
+    assert_eq!(answers[3].1["error"], "Unknown MCP server: other");
+    let entries = f.entries(&attempt.id).await;
+    assert!(
+        notices(&entries)
+            .iter()
+            .any(|(level, text, _)| *level == Level::Warn && text.contains("other"))
+    );
+}
+
+// ---- sub-tasks ----------------------------------------------------------------------------
+
+async fn try_subtask(f: &Flow, parent_id: &str, title: &str) -> Result<Task, AppError> {
+    let req = CreateTaskReq {
+        project_id: f.project.id.clone(),
+        title: title.into(),
+        description: "[fake:simple]".into(),
+        status: None,
+        parent_id: Some(parent_id.into()),
+    };
+    Ok(f.core.create_task(req).await?.task)
+}
+
+/// `Changed` events that name `task_id`.
+fn changed_for(f: &Flow, task_id: &str) -> usize {
+    f.seen
+        .events()
+        .iter()
+        .filter(|e| matches!(e, AppEvent::Changed(c) if c.task_id.as_deref() == Some(task_id)))
+        .count()
+}
+
+/// One level only: the parent exists, is in the same project and is not itself a sub-task.
+/// Creating, editing and moving a sub-task each emit `Changed` for its parent too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subtasks_need_a_top_level_parent_of_the_project_and_notify_it() {
+    let f = Flow::new(&[]).await;
+    let parent = f.task("Padre", "").await;
+    let other_repo = common::init_repo(&f.dir.path().join("other"));
+    let other = f
+        .core
+        .add_project(AddProjectReq {
+            path: other_repo.to_string_lossy().into_owned(),
+        })
+        .await
+        .unwrap()
+        .project;
+    let foreign = f
+        .core
+        .create_task(CreateTaskReq {
+            project_id: other.id.clone(),
+            title: "Altrove".into(),
+            description: String::new(),
+            status: None,
+            parent_id: None,
+        })
+        .await
+        .unwrap()
+        .task;
+
+    let before = changed_for(&f, &parent.id);
+    let child = try_subtask(&f, &parent.id, "Figlio").await.unwrap();
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(changed_for(&f, &parent.id), before + 1);
+    let subtasks = f.detail(&parent.id).await.subtasks;
+    assert_eq!(subtasks.len(), 1);
+    assert_eq!(subtasks[0].task.id, child.id);
+    let card = f.card(&parent.id).await;
+    assert_eq!((card.subtasks_done, card.subtasks_total), (0, 1));
+
+    for (parent_id, message) in [
+        ("sconosciuto", "Il task padre non esiste"),
+        (
+            foreign.id.as_str(),
+            "Il task padre appartiene a un altro progetto",
+        ),
+        (
+            child.id.as_str(),
+            "Un sotto task non può avere a sua volta sotto task",
+        ),
+    ] {
+        let err = try_subtask(&f, parent_id, "Nipote").await.unwrap_err();
+        assert_eq!(
+            (err.code, err.message.as_str()),
+            (ErrorCode::Invalid, message)
+        );
+    }
+    assert_eq!(f.detail(&parent.id).await.subtasks.len(), 1);
+
+    let before = changed_for(&f, &parent.id);
+    f.core
+        .update_task(UpdateTaskReq {
+            id: child.id.clone(),
+            title: "Figlio rinominato".into(),
+            description: String::new(),
+        })
+        .await
+        .unwrap();
+    f.core
+        .move_task(MoveTaskReq {
+            id: child.id.clone(),
+            status: TaskStatus::Done,
+            before_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed_for(&f, &parent.id), before + 2);
+    let card = f.card(&parent.id).await;
+    assert_eq!((card.subtasks_done, card.subtasks_total), (1, 1));
+}
+
+/// A sub-task's first prompt and a fresh session's carry the parent's title and description
+/// under `## Parent task`; a top-level task's do not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_subtask_prompt_carries_its_parent() {
+    let f = Flow::new(&[]).await;
+    let parent = f.task("Padre", "Il contesto del padre").await;
+    let child = try_subtask(&f, &parent.id, "Figlio").await.unwrap();
+    let attempt = f.start(&child).await;
+    f.turn_end(&child.id, 1, TURN).await;
+    let section = "\n\n## Parent task\n\nThis task is a sub-task of the one below, given for \
+                   context: work only on this task.\n\n### Padre\n\nIl contesto del padre";
+    assert_eq!(
+        prompts(&f)[0],
+        format!("# Figlio\n\n[fake:simple]{section}")
+    );
+    f.follow_up(&attempt.id, "Riprendi", true).await;
+    f.turn_end(&child.id, 2, TURN).await;
+    assert!(
+        prompts(&f)[1].starts_with(&format!("# Figlio\n\n[fake:simple]{section}\n\n")),
+        "{}",
+        prompts(&f)[1]
+    );
+    assert!(!prompts(&f)[0].starts_with("# Padre"));
+}
+
+/// Deleting a parent whose own agent runs is `Busy` before any sub-task is touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_parent_removes_nothing() {
+    let f = Flow::new(&[]).await;
+    let parent = f.task("Padre", "[fake:hang]").await;
+    let child = try_subtask(&f, &parent.id, "Figlio").await.unwrap();
+    let attempt = f.start(&parent).await;
+    f.subscribe(&attempt.id).await;
+    f.entry("system/init", is_session_init).await;
+
+    let err = f
+        .core
+        .delete_task(IdReq {
+            id: parent.id.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (
+            ErrorCode::Busy,
+            "Il task è in esecuzione: ferma l'agente prima di eliminarlo"
+        )
+    );
+    assert_eq!(f.detail(&parent.id).await.subtasks.len(), 1);
+    assert_eq!(
+        f.detail(&child.id).await.task.parent_id,
+        Some(parent.id.clone())
+    );
+    f.stop(&attempt.id).await;
+    f.turn_end(&parent.id, 1, TURN).await;
+}
+
+/// Deleting a parent is `Busy` while a sub-task runs, nothing removed; once it stops, the
+/// sub-tasks go first with their worktrees, attachments and raw logs, then the parent.
+/// Deleting a sub-task alone emits `Changed` for its parent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_parent_deletes_its_subtasks_and_their_files() {
+    let f = Flow::new(&[]).await;
+    let parent = f.task("Padre", "").await;
+    let done = try_subtask(&f, &parent.id, "Finito").await.unwrap();
+    let tokens = stage(&f, &f.dir.path().join("picked"), &["notes.txt"]).await;
+    add(&f, &done, tokens).await.unwrap();
+    let done_attempt = f.start(&done).await;
+    f.turn_end(&done.id, 1, TURN).await;
+    let hanging = f
+        .core
+        .create_task(CreateTaskReq {
+            project_id: f.project.id.clone(),
+            title: "Appeso".into(),
+            description: "[fake:hang]".into(),
+            status: None,
+            parent_id: Some(parent.id.clone()),
+        })
+        .await
+        .unwrap()
+        .task;
+    let hang_attempt = f.start(&hanging).await;
+    f.subscribe(&hang_attempt.id).await;
+    f.entry("system/init", is_session_init).await;
+    assert_eq!(f.worktrees(), 2);
+
+    let delete = || IdReq {
+        id: parent.id.clone(),
+    };
+    let err = f.core.delete_task(delete()).await.unwrap_err();
+    assert_eq!(
+        (err.code, err.message.as_str()),
+        (ErrorCode::Busy, "Un sotto task è in esecuzione")
+    );
+    assert_eq!(f.detail(&parent.id).await.subtasks.len(), 2);
+    assert_eq!(f.worktrees(), 2);
+
+    f.stop(&hang_attempt.id).await;
+    f.turn_end(&hanging.id, 1, TURN).await;
+    let lone = try_subtask(&f, &parent.id, "Da solo").await.unwrap();
+    let before = changed_for(&f, &parent.id);
+    f.core
+        .delete_task(IdReq {
+            id: lone.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(changed_for(&f, &parent.id), before + 1);
+
+    let dirs: Vec<PathBuf> = [(&done, &done_attempt), (&hanging, &hang_attempt)]
+        .iter()
+        .flat_map(|(task, attempt)| {
+            [
+                attachments::task_dir(&f.config.data_dir, &f.project.id, &task.id),
+                runner::attempt_log_dir(&f.config.data_dir, &attempt.id),
+            ]
+        })
+        .collect();
+    assert!(dirs[0].exists() && dirs[1].exists() && dirs[3].exists());
+    f.core.delete_task(delete()).await.unwrap();
+    assert_eq!(f.worktrees(), 0);
+    for dir in &dirs {
+        assert!(!dir.exists(), "{}", dir.display());
+    }
+    for id in [&parent.id, &done.id, &hanging.id] {
+        let err = f.core.get_task_detail(IdReq { id: id.clone() }).await;
+        assert_eq!(err.unwrap_err().code, ErrorCode::NotFound);
+    }
+    let board = f
+        .core
+        .get_board(ProjectIdReq {
+            project_id: f.project.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(board.is_empty());
 }
