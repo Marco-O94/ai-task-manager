@@ -697,6 +697,9 @@ impl Inner {
                 inner.turn_panicked(&attempt_id, &process_id, &handle).await;
             }
             let _ = done_tx.send(true);
+            // On both paths the slot is free and the process row final: the autopilot's
+            // follow-up of this turn may send a turn of its own.
+            inner.turn_ended(attempt_id, process_id);
         });
     }
 

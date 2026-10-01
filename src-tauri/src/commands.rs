@@ -612,6 +612,11 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             trust_error: None,
+            autopilot: false,
+            autopilot_merge: false,
+            verify_command: None,
+            verify_timeout_secs: 600,
+            autopilot_max_fixes: 2,
         }
     }
 

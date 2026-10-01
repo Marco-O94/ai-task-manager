@@ -301,7 +301,8 @@ ai-task-manager/
 │  │              # solo serde + serde_json; compila per wasm32 e host
 │  └─ atm-core/
 │     ├─ Cargo.toml                       # [lib] + [[bin]] fake-claude
-│     ├─ migrations/{0001_init.sql, 0002_overview_attachments_subagents.sql, 0003_subtasks.sql}
+│     ├─ migrations/{0001_init.sql, 0002_overview_attachments_subagents.sql, 0003_subtasks.sql,
+│     │                                   #   0004_autopilot.sql}
 │     ├─ src/lib.rs                       # Core, CoreConfig, startup/recovery/shutdown, 1 metodo per comando
 │     ├─ src/attachments.rs               # allegati dei task: layout su disco, staging, copia (round 2026-09-29)
 │     ├─ src/db.rs                        # rusqlite: open, migrate, 1 fn per query, posizioni
@@ -311,6 +312,8 @@ ai-task-manager/
 │     ├─ src/wire.rs                      # reader di righe con cap, parse Inbound, frame outbound, approval_response()
 │     ├─ src/normalize.rs                 # Normalizer puro (Value → EntryOp)
 │     ├─ src/runner.rs                    # ciclo di vita del turno, approvazioni, stop, finalize
+│     ├─ src/autopilot.rs                 # scheduler dell'autopilota: coda, fine turno, correzioni, merge (§7.12)
+│     ├─ src/autopilot/verify.rs          # verifica: /bin/sh -c <verify_command> nel worktree (§7.12)
 │     ├─ src/live.rs                      # broadcast per attempt, subscription e forwarder
 │     ├─ src/bin/fake-claude.rs           # double del CLI (mai incluso nel bundle)
 │     └─ tests/{common/mod.rs, db.rs, git.rs, claude.rs, normalize.rs, flow.rs, fixtures/**}
@@ -358,7 +361,7 @@ ai-task-manager/
 ### 5.1 Connessione e migrazioni
 
 - A ogni apertura: `PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL;`.
-- Le migrazioni sono `&[include_str!(...)]`: `0001_init.sql`, `0002_overview_attachments_subagents.sql` (round feature del 2026-09-29) e `0003_subtasks.sql` (round del 2026-09-30). Si applicano quelle con indice ≥ `PRAGMA user_version`, ciascuna dentro una transazione; un DB con uno `user_version` più alto di quelle note (app più vecchia) viene rifiutato.
+- Le migrazioni sono `&[include_str!(...)]`: `0001_init.sql`, `0002_overview_attachments_subagents.sql` (round feature del 2026-09-29), `0003_subtasks.sql` (round del 2026-09-30) e `0004_autopilot.sql` (round del 2026-10-01). Si applicano quelle con indice ≥ `PRAGMA user_version`, ciascuna dentro una transazione; un DB con uno `user_version` più alto di quelle note (app più vecchia) viene rifiutato.
 - Gli ID sono UUID v4 minuscoli (`TEXT`); i timestamp sono `INTEGER` in ms Unix.
 - `Mutex<Connection>`: tutte le chiamate sono brevi e sincrone, nessuna query dura più di pochi ms.
 
@@ -507,6 +510,38 @@ ALTER TABLE attempts ADD COLUMN started_by_attempt TEXT;  -- attempt che l'ha av
 - `started_by_attempt` è testo semplice, senza FK: eliminare l'attempt che l'ha avviato non tocca la riga. Si scrive solo all'inserimento (`AttemptRow::started_by_attempt` in `begin_attempt`).
 - Le card contano i figli con due sottoquery correlate (`subtasks_done` = figli in `done`, `subtasks_total` = tutti); `Db::subtask_cards` dà le card dei figli nell'ordine della board, per `TaskDetail::subtasks`.
 
+**Migrazione 0004** (`crates/atm-core/migrations/0004_autopilot.sql`, round del 2026-10-01): l'autopilota per progetto. Le righe esistenti hanno l'autopilota spento, i default qui sotto e nessuna verifica; il test `migrates_a_v3_database_with_rows_to_v4` parte da un DB con 0001–0003 e le righe dentro.
+
+```sql
+ALTER TABLE projects ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0 CHECK (autopilot IN (0, 1));
+ALTER TABLE projects ADD COLUMN autopilot_merge INTEGER NOT NULL DEFAULT 0 CHECK (autopilot_merge IN (0, 1));
+ALTER TABLE projects ADD COLUMN verify_command TEXT
+    CHECK (verify_command IS NULL OR length(verify_command) BETWEEN 1 AND 1000);  -- NULL = nessuna verifica
+ALTER TABLE projects ADD COLUMN verify_timeout_secs INTEGER NOT NULL DEFAULT 600
+    CHECK (verify_timeout_secs BETWEEN 10 AND 3600);
+ALTER TABLE projects ADD COLUMN autopilot_max_fixes INTEGER NOT NULL DEFAULT 2
+    CHECK (autopilot_max_fixes BETWEEN 0 AND 5);
+
+ALTER TABLE tasks ADD COLUMN auto INTEGER NOT NULL DEFAULT 0 CHECK (auto IN (0, 1));  -- affidato all'autopilota
+ALTER TABLE tasks ADD COLUMN after_id TEXT REFERENCES tasks(id) ON DELETE SET NULL;   -- parte dopo che è Fatto
+CREATE INDEX tasks_after ON tasks(after_id);
+ALTER TABLE tasks ADD COLUMN auto_by TEXT;  -- attempt il cui agente l'ha affidato all'autopilota; NULL = l'utente
+
+ALTER TABLE attempts ADD COLUMN verify_state TEXT
+    CHECK (verify_state IN ('running', 'passed', 'failed', 'error'));  -- NULL = mai verificato
+ALTER TABLE attempts ADD COLUMN verify_head TEXT;                       -- commit verificato
+ALTER TABLE attempts ADD COLUMN verify_fixes INTEGER NOT NULL DEFAULT 0 CHECK (verify_fixes >= 0);
+ALTER TABLE attempts ADD COLUMN verify_summary TEXT;                    -- coda dell'output, ≤ 8 KiB
+ALTER TABLE attempts ADD COLUMN verify_pending TEXT;                    -- prompt di una correzione in attesa di uno slot
+```
+
+- **Una sola dipendenza** per task (`after_id`): un altro task dello stesso progetto, mai il task stesso, mai un task annullato (non sarebbe mai Fatto) e mai un ciclo (A dopo B, B dopo A: nessuno dei due partirebbe). Il DB salva solo la FK; le regole sono del Core (`check_after`, `Invalid` in italiano: segue la catena degli `after_id`). Eliminare la dipendenza la toglie (`SET NULL`). Annullare la dipendenza **dopo** averla scelta non è rifiutato (§13.7).
+- **`auto_by`** è testo semplice, senza FK, come `started_by_attempt`: l'attempt il cui agente ha affidato il task all'autopilota (`start_task` in coda, sotto task ereditato, §7.4). Lo scrive `Db::set_task_auto_by`; `Db::set_task_auto` e un `auto` dato da `update_task` (l'utente) lo azzerano. Non è nel contratto IPC.
+- **`verify_pending`**: il prompt di una correzione che non ha trovato uno slot (`ConcurrencyLimit`), o che ha trovato la pausa per limite d'uso, o l'app in chiusura. `Db::set_verify_pending`, `Db::pending_fixes` (attempt attivi, i più vecchi prima); lo azzerano l'invio, `begin_verify` e la fine di ogni turno dell'attempt. Sopravvive al riavvio.
+- **Coda dell'autopilota** (`Db::autopilot_candidates(project_id)`): i task del progetto con `auto = 1`, in `todo`, senza attempt attivo, con `after_id` nullo o in `done`, e con il padre (se sotto task) non annullato, in ordine di posizione. Il flag `projects.autopilot` lo controlla il chiamante. `Db::set_task_auto` toglie (o rimette) `auto` da solo.
+- **Verifica**: `Db::begin_verify` (stato `running`, `verify_head` = HEAD alla partenza, riassunto azzerato), `Db::finish_verify` (`passed`, `failed` o `error`, con il riassunto e il commit), `Db::add_verify_fix` (conta un rimando, restituisce il totale) e `Db::undo_verify_fix` (lo restituisce se il follow-up non è partito). Allo startup `Db::mark_stale_verifies` porta a `error` ogni verifica rimasta `running` (l'app si è chiusa durante la verifica) e restituisce gli attempt toccati.
+- Le card riportano `verify_state` e `verify_fixes` solo dell'attempt **attivo** (`None` e 0 altrimenti); `TaskCard::verifying` viene dal registro live.
+
 **Invarianti imposti dal DB:**
 - al massimo un attempt attivo per task;
 - al massimo un turno `running` per attempt, quindi mai due processi sulla stessa sessione.
@@ -522,6 +557,7 @@ ALTER TABLE attempts ADD COLUMN started_by_attempt TEXT;  -- attempt che l'ha av
 | `worktree_root` | `"~/.ai-task-manager/worktrees"` |
 | `editor_app` | `"Visual Studio Code"` |
 | `remove_worktree_after_merge` | `true` |
+| `notifications` | `true` (notifiche macOS dell'autopilota, round 2026-10-01) |
 
 **Posizioni dei task:**
 - In coda alla colonna: `max + 1024`.
@@ -539,6 +575,7 @@ ALTER TABLE attempts ADD COLUMN started_by_attempt TEXT;  -- attempt che l'ha av
 - `ConfigPolicy`: isolated, trusted.
 - `Effort`: low, medium, high, xhigh, max.
 - `StopReason`: come nel CHECK SQL.
+- `VerifyState`: running, passed, failed, error (round 2026-10-01; `error` = non è stato possibile eseguirla: spawn, timeout, app chiusa durante la verifica).
 
 ### 5.4 Transizioni di stato
 
@@ -589,19 +626,33 @@ pub const MAX_SUBAGENTS: u8 = 10;
 pub const MAX_ATTACHMENTS_PER_TASK: usize = 20;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 << 20;          // 25 MiB
 pub const MAX_PROJECT_DESCRIPTION: usize = 10_000;       // caratteri
+pub const VERIFY_TIMEOUT_SECS: RangeInclusive<u32> = 10..=3600;   // autopilota (round 2026-10-01)
+pub const DEFAULT_VERIFY_TIMEOUT_SECS: u32 = 600;
+pub const MAX_AUTOPILOT_FIXES: u32 = 5;
+pub const DEFAULT_AUTOPILOT_MAX_FIXES: u32 = 2;
+pub const MAX_VERIFY_COMMAND: usize = 1000;             // caratteri
 pub struct Project { pub id: Id, pub name: String, pub description: String /* ≤ 10 000 caratteri, "" di default */,
     pub repo_path: String, pub default_target_branch: String,
     pub default_permission_mode: PermissionMode, pub default_model: Option<String>,
     pub config_policy: ConfigPolicy, pub trusted: bool /* Trusted e fingerprint approvato = quello del tip del branch target */,
-    pub allow_bypass: bool, pub created_at: Millis, pub updated_at: Millis }
+    pub allow_bypass: bool, pub created_at: Millis, pub updated_at: Millis,
+    #[serde(default)] pub autopilot: bool, #[serde(default)] pub autopilot_merge: bool /* merge dopo una verifica verde */,
+    #[serde(default)] pub verify_command: Option<String> /* None = nessuna verifica */,
+    #[serde(default = 600)] pub verify_timeout_secs: u32 /* 10..=3600 */,
+    #[serde(default = 2)] pub autopilot_max_fixes: u32 /* 0..=5 */ }
 pub struct Task { pub id: Id, pub project_id: Id, pub title: String, pub description: String,
     pub status: TaskStatus, pub position: f64, pub created_at: Millis, pub updated_at: Millis,
-    #[serde(default)] pub parent_id: Option<Id> /* padre di un sotto task (un solo livello); None = primo livello */ }
+    #[serde(default)] pub parent_id: Option<Id> /* padre di un sotto task (un solo livello); None = primo livello */,
+    #[serde(default)] pub auto: bool /* affidato all'autopilota */,
+    #[serde(default)] pub after_id: Option<Id> /* parte dopo che questo task è Fatto */ }
 pub struct TaskCard { pub task: Task, pub attempt_id: Option<Id>,
     pub attempt_state: Option<AttemptState> /* Some(Active) = ha un attempt attivo */, pub branch: Option<String>, pub running: bool,
     pub pending_approvals: u32, pub last_status: Option<ProcessStatus>, pub last_stop_reason: Option<StopReason>,
     pub worktree_state: Option<WorktreeState>,
-    #[serde(default)] pub subtasks_done: u32 /* sotto task in done */, #[serde(default)] pub subtasks_total: u32 /* tutti i sotto task */ }
+    #[serde(default)] pub subtasks_done: u32 /* sotto task in done */, #[serde(default)] pub subtasks_total: u32 /* tutti i sotto task */,
+    #[serde(default)] pub verifying: bool /* verifica in corso (registro live) */,
+    #[serde(default)] pub verify_state: Option<VerifyState> /* dell'attempt attivo */,
+    #[serde(default)] pub verify_fixes: u32 /* dell'attempt attivo */ }
 pub struct AttemptView { pub id: Id, pub task_id: Id, pub state: AttemptState, pub branch: String,
     pub target_branch: String, pub base_commit: String, pub worktree_path: String, pub worktree_state: WorktreeState,
     pub permission_mode: PermissionMode, pub model: Option<String>, pub effort: Option<Effort>,
@@ -609,7 +660,11 @@ pub struct AttemptView { pub id: Id, pub task_id: Id, pub state: AttemptState, p
     pub max_subagents: Option<u8> /* 0..=10; None = nessun limite */, pub subagents_used: u32,
     pub session_started: bool, pub merge_commit: Option<String>, pub running: bool, pub pending_approvals: u32,
     pub created_at: Millis, pub closed_at: Option<Millis>,
-    #[serde(default)] pub started_by_attempt: Option<Id> /* attempt che l'ha avviato con start_task; None = l'utente */ }
+    #[serde(default)] pub started_by_attempt: Option<Id> /* attempt che l'ha avviato con start_task; None = l'utente */,
+    #[serde(default)] pub verify_state: Option<VerifyState> /* None = mai verificato */,
+    #[serde(default)] pub verify_head: Option<String> /* commit dell'ultima verifica */,
+    #[serde(default)] pub verify_fixes: u32 /* rimandi dell'autopilota */,
+    #[serde(default)] pub verify_summary: Option<String> /* coda dell'output, ≤ 8 KiB */ }
 pub struct ProcessInfo { pub id: Id, pub seq: u32, pub prompt: String, pub status: ProcessStatus,
     pub stop_reason: Option<StopReason>, pub result_subtype: Option<String>, pub is_error: Option<bool>,
     pub cost_usd_estimate: Option<f64>, pub duration_ms: Option<u64>, pub num_turns: Option<u32>,
@@ -636,7 +691,7 @@ pub struct McpServer { pub name: String, pub transport: String /* type, altrimen
 pub struct BranchList { pub current: Option<String>, pub branches: Vec<String> }
 pub struct Settings { pub claude_path_override: Option<String>, pub default_model: Option<String>,
     pub max_running: u32, pub allow_env_api_key: bool, pub worktree_root: String, pub editor_app: String,
-    pub remove_worktree_after_merge: bool }
+    pub remove_worktree_after_merge: bool, #[serde(default = true)] pub notifications: bool }
 pub struct ClaudeInfo { pub path: Option<String>, pub version: Option<String>, pub supported: bool,
     pub min_version: String /* "2.1.223" */, pub tested_version: String /* "2.1.283" */ }
 #[serde(tag = "state")]
@@ -709,10 +764,17 @@ pub fn merge_message(title: &str, description: &str, attempt_id: &str) -> String
 pub const CONTINUE_PROMPT: &str = "The previous run was interrupted when the app closed. Continue the task.";
 pub struct UpdateProjectReq { pub id: Id, pub name: String, pub default_target_branch: String,
     pub default_permission_mode: PermissionMode, pub default_model: Option<String>,
-    #[serde(default)] pub description: String }
+    #[serde(default)] pub description: String,
+    #[serde(default)] pub autopilot: bool, #[serde(default)] pub autopilot_merge: bool,
+    #[serde(default)] pub verify_command: Option<String>,
+    #[serde(default = 600)] pub verify_timeout_secs: u32, #[serde(default = 2)] pub autopilot_max_fixes: u32 }
 pub struct CreateTaskReq { pub project_id: Id, pub title: String, pub description: String,
     pub status: Option<TaskStatus> /* None = todo */,
-    #[serde(default)] pub parent_id: Option<Id> /* crea un sotto task: stesso progetto, padre di primo livello */ }
+    #[serde(default)] pub parent_id: Option<Id> /* crea un sotto task: stesso progetto, padre di primo livello */,
+    #[serde(default)] pub auto: bool, #[serde(default)] pub after_id: Option<Id> }
+pub struct UpdateTaskReq { pub id: Id, pub title: String, pub description: String,
+    #[serde(default)] pub auto: Option<bool> /* assente = invariato */,
+    #[serde(default)] pub after_id: Option<Option<Id>> /* assente = invariato, null = nessuna dipendenza */ }
 pub struct StartAttemptReq { pub task_id: Id, pub target_branch: String, pub permission_mode: PermissionMode,
     pub model: Option<String>, pub effort: Option<Effort>,
     pub subagent_model: Option<String> /* un alias di MODEL_ALIASES */, pub max_subagents: Option<u8> /* 0..=10 */ }
@@ -736,13 +798,13 @@ pub enum ErrorCode { NotFound, Invalid, Conflict, Busy, ConcurrencyLimit, UsageL
 | `list_projects` | `{}` → `Vec<Project>` | |
 | `pick_repo_folder` | `{}` → `Option<String>` | Chiama `blocking_pick_folder` in `spawn_blocking` [F] |
 | `add_project` | `{path}` → `{project, warnings: Vec<String>}` | §8.3 |
-| `update_project` | `{id, name, default_target_branch, default_permission_mode, default_model, description?}` → `Project` | `description` senza spazi in testa e in coda, al massimo 10 000 caratteri (`Invalid`); assente = vuota |
+| `update_project` | `{id, name, default_target_branch, default_permission_mode, default_model, description?, autopilot?, autopilot_merge?, verify_command?, verify_timeout_secs?, autopilot_max_fixes?}` → `Project` | `description` senza spazi in testa e in coda, al massimo 10 000 caratteri (`Invalid`); assente = vuota. Autopilota (round 2026-10-01): `verify_command` senza spazi in testa e in coda, vuoto = nessuno, al massimo 1000 caratteri; `verify_timeout_secs` da 10 a 3600; `autopilot_max_fixes` da 0 a 5 (`Invalid` in italiano). Assenti: spento, nessun comando, 600 e 2 |
 | `set_project_security` | `{id, config_policy, allow_bypass}` → `Project` | M6. Conferma nativa quando si **eleva** il livello **effettivo**: Trusted se il progetto non è `trusted` ora (anche Trusted con fingerprint scaduto), oppure bypass. Il guscio legge una volta, prima del dialog, progetto, stato salvato e configurazione committata sul tip del branch target predefinito (`Core::security_snapshot`, con branch e commit); il testo della conferma nomina il repository per path (su una riga), il branch e il commit approvati, dice che cosa si concede (configurazione del repo, regole che consentono un tool intero, modalità Autonoma), che una configurazione che fattura fuori dall'abbonamento non si approva e che un turno con una chiave API viene fermato, e che il worktree non è una sandbox. `Core::apply_project_security` salva il fingerprint che il dialog ha descritto, solo se è ancora quello e se lo stato salvato è ancora quello letto (`Conflict` altrimenti, §8.9); `Invalid` se il repo è `$HOME`, se il branch non si legge, se la configurazione non è verificabile o se farebbe fatturare gli agenti fuori dall'abbonamento (nomina la chiave, §8.9). Annullato l'aumento, la parte che abbassa si applica comunque (l'errore lo dice). Togliere `allow_bypass` riporta a Auto-edit una modalità predefinita Autonoma; una revoca ferma i turni che la usano |
 | `remove_project` | `{id}` → `()` | Rifiutato se ci sono turni attivi (`Busy`). Snapshot e rimozione dei worktree; branch tenuti; task, cronologia, allegati e log grezzi cancellati (§4) |
 | `list_branches` | `{project_id}` → `BranchList` | |
 | `get_project_overview` | `{project_id}` → `ProjectOverview` | Letto dal commit in cima a `default_target_branch` (la base dei worktree, quello che il trust approva), mai dal checkout principale; `Invalid` se il repo è `$HOME` o la revisione non è valida, `Git` se il runner fallisce. `Core` risolve tip, record della configurazione (in cache) e `agents_load_config`, poi chiama `git::overview::read`: un solo `git ls-tree -z -l --end-of-options <tip> -- CLAUDE.md .claude/CLAUDE.md AGENTS.md README.md .claude/settings.json .mcp.json` sul runner irrobustito (sola lettura, stdout ≤ 64 KiB), poi un solo `cat-file --batch` che legge per id, con la dimensione esatta, i blob ≤ 64 KiB. Non in cache: ogni chiamata costa un `ls-tree` e al più un `cat-file` (§10.2, §13) |
 | `get_board` | `{project_id}` → `Vec<TaskCard>` | Unisce DB e registro live |
-| `create_task` / `update_task` | `{project_id, title, description, status?, parent_id?}` / `{id, title, description}` → `TaskCard` | Con `parent_id` crea un sotto task (§5.2 migrazione 0003): `Invalid` se il padre non esiste, è di un altro progetto o è a sua volta un sotto task. La creazione prende il lock del padre, così non si incrocia con la sua eliminazione |
+| `create_task` / `update_task` | `{project_id, title, description, status?, parent_id?, auto?, after_id?}` / `{id, title, description, auto?, after_id?}` → `TaskCard` | Con `parent_id` crea un sotto task (§5.2 migrazione 0003): `Invalid` se il padre non esiste, è di un altro progetto o è a sua volta un sotto task. La creazione prende il lock del padre, così non si incrocia con la sua eliminazione. `after_id` (§5.2 migrazione 0004): `Invalid` se il task non esiste, è di un altro progetto, è il task stesso, è annullato o chiude un ciclo di dipendenze. In `update_task` `auto` e `after_id` assenti restano invariati; `after_id: null` toglie la dipendenza |
 | `move_task` | `{id, status, before_id: Option<Id>}` → `()` | `Busy` se il task è in esecuzione e la destinazione è done o cancelled |
 | `delete_task` | `{id}` → `()` | `Busy` se in esecuzione. Fa discard dell'attempt attivo; allegati e log grezzi cancellati (§4). Round 2026-09-30, a cascata: prende il lock del task e poi quello di ogni sotto task per tutta l'operazione; `Busy` ("Il task è in esecuzione: …") se gira l'agente del task, `Busy` ("Un sotto task è in esecuzione") se gira quello di un sotto task, e in entrambi i casi nulla viene toccato. Altrimenti elimina prima i sotto task, ciascuno con la stessa pulizia (worktree, allegati, log grezzi), poi il task. Eliminare un sotto task emette `changed` anche per il padre (§6.4) |
 | `get_task_detail` | `{id}` → `TaskDetail` | Con gli allegati e le card dei sotto task |
@@ -892,7 +954,7 @@ Regole:
   - `--replay-user-messages`: serve solo al rewind, rimandato;
   - `--allowedTools` con un tool intero: oscurerebbe `can_use_tool`.
 - **`ATM_APPEND`.** È fisso per attempt, perché `--system-prompt-snapshot` è attivo di default e il prompt si congela al primo turno [V]:
-  > "You are working on a task from AI Task Manager inside a dedicated git worktree `<path>` on branch `<branch>` (created from `<target>`). Work only inside this directory. Do not push, switch or delete branches, rewrite history, or change git remotes/config. The host app commits your changes automatically after each turn. The user's later messages continue this task, even once it looks done: carry out what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow its conventions. The mcp__atm__* tools manage this project's task board. To split your work into subtasks, use mcp__atm__create_task with parent_id \"self\"."
+  > "You are working on a task from AI Task Manager inside a dedicated git worktree `<path>` on branch `<branch>` (created from `<target>`). Work only inside this directory. Do not push, switch or delete branches, rewrite history, or change git remotes/config. The host app commits your changes automatically after each turn. The user's later messages continue this task, even once it looks done: carry out what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it first and follow its conventions. The mcp__atm__* tools manage this project's task board. To split your work into subtasks, use mcp__atm__create_task with parent_id \"self\". When your task is driven by the autopilot, its subtasks start on their own: give a subtask `after` (another task's id) to start it only once that task is done."
 - La frase finale su CLAUDE.md copre il caso non verificato E11. Il Riepilogo del progetto la dà per scontata (`git/overview.rs`, `usage`: CLAUDE.md e AGENTS.md "letti su istruzione del prompt"): se questa frase cambia, cambiano anche quelle note.
 - La frase sui messaggi successivi (M6) risponde a M5, che ha visto il modello rifiutare un follow-up ritenuto estraneo a un task già finito (§13.4).
 - **Spawn:**
@@ -943,12 +1005,12 @@ Regole:
 
 | Tool (`mcp__atm__*`) | Effetto | Regola (§7.8) |
 |---|---|---|
-| `list_tasks {status?, parent_id?}` | Card del progetto: id, titolo, stato, parent, stato dell'agente | allow |
-| `get_task {id}` | Descrizione, stato, parent, attempt e sotto task con il loro stato | allow |
-| `create_task {title, description?, status?, parent_id?}` | `Core::create_task`; `parent_id:"self"` = il task dell'attempt chiamante | allow |
+| `list_tasks {status?, parent_id?}` | Card del progetto: id, titolo, stato, parent, `auto`, `after_id`, stato dell'agente e `verify` (`{state, fixes}` dell'attempt attivo, `running` durante una verifica; `null` senza verifiche) | allow |
+| `get_task {id}` | Descrizione, stato, parent, `auto`, `after` (`{id, title, status}`), attempt (con `verify`) e sotto task con il loro stato | allow |
+| `create_task {title, description?, status?, parent_id?, after?}` | `Core::create_task`; `parent_id:"self"` = il task dell'attempt chiamante; `after` (id o `"self"`) = `after_id`. Un sotto task con `parent_id:"self"` di un task con `auto` ha `auto` anche lui, con `auto_by` = l'attempt chiamante (round 2026-10-01): l'autopilota lo avvia da solo, dopo il suo `after`, come l'avrebbe avviato il chiamante con `start_task` (§7.12). Non se il chiamante è stato avviato a sua volta da un agente: non può avviare agenti, né direttamente né così | allow |
 | `update_task {id, title?, description?}` | `Core::update_task` (i campi assenti restano) | ask |
 | `move_task {id, status}` | `Core::move_task` in coda alla colonna; `status` è il nome DB di `TaskStatus` (`todo`, `inprogress`, `inreview`, `done`, `cancelled`) | ask |
-| `start_task {id, model?, effort?}` | `Core::start_attempt` con il target predefinito del progetto e le opzioni sub-agent dell'attempt chiamante; la modalità è quella dell'attempt chiamante per un sotto task, quella predefinita del progetto per ogni altro task (così un agente Autonomo non avvia in bypass un task qualsiasi); `started_by_attempt` = l'attempt chiamante. Rifiutato se l'attempt chiamante ha a sua volta `started_by_attempt` (profondità 2, letto dal DB alla chiamata); `ConcurrencyLimit`, `Conflict` e gli altri errori tornano come errore del tool | ask |
+| `start_task {id, model?, effort?}` | `Core::start_attempt` con il target predefinito del progetto e le opzioni sub-agent dell'attempt chiamante; la modalità è quella dell'attempt chiamante per un sotto task, quella predefinita del progetto per ogni altro task (così un agente Autonomo non avvia in bypass un task qualsiasi); `started_by_attempt` = l'attempt chiamante. Rifiutato se l'attempt chiamante ha a sua volta `started_by_attempt` (profondità 2, letto dal DB alla chiamata); `ConcurrencyLimit`, `Conflict` e gli altri errori tornano come errore del tool. Eccezione (round 2026-10-01): un `ConcurrencyLimit` su un task in Da fare di un progetto con l'autopilota acceso imposta `auto` e `auto_by` = l'attempt chiamante, e risponde `{task_id, queued: true, message}`; il task parte quando lo sceglie lo scheduler, con la stessa modalità, gli stessi limiti sub-agent e lo stesso `started_by_attempt` di un avvio immediato (§7.12) | ask |
 
 - **Ambito:** ogni id è cercato nel progetto dell'attempt chiamante; un id di un altro progetto è "non trovato", come uno inesistente. `"self"` vale il task chiamante ovunque si passi un id.
 - Ogni modifica passa dai metodi del Core usati dalla UI: validazioni, lock ed `emit_changed` sono gli stessi.
@@ -1103,7 +1165,8 @@ run_turn(attempt, prompt, mode):
     - in ogni caso: `failed` / `app_restart`, Notice "Esecuzione interrotta dal riavvio dell'app", tool aperti → `Cancelled`, auto-commit;
   - i task in inprogress senza turni attivi passano a inreview;
   - riconciliazione dei worktree (§8.4).
-- **Concorrenza.** Contatore globale con `max_running` (default 2): oltre il limite si restituisce `ConcurrencyLimit`, senza coda. Un `result` di tipo usage limit o billing **mette in pausa** i nuovi avvii finché l'utente non preme "Riprendi".
+- **Concorrenza.** Contatore globale con `max_running` (default 2): oltre il limite si restituisce `ConcurrencyLimit`, senza coda. Fa eccezione l'autopilota (round 2026-10-01, §7.12): i task con `auto` di un progetto con l'autopilota acceso aspettano in coda, e lo scheduler li avvia quando si libera uno slot; il comando `start_attempt` dell'utente risponde sempre `ConcurrencyLimit`. Un `result` di tipo usage limit o billing **mette in pausa** i nuovi avvii finché l'utente non preme "Riprendi".
+- **Notifiche macOS** (round 2026-10-01, `Inner::notify(task, title, body)`): `/usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' -- <titolo> <testo>`. I testi sono argomenti dello script, mai parte del suo codice; `--` impedisce che un testo che inizia con `-` diventi un'opzione. `ChildEnv` ripulito, process group proprio, output scartato, `killpg` più `kill_tree` dopo 10 s; gira in un task a parte e non blocca mai chi la chiama. Al massimo una ogni 30 s per task e titolo (per l'app se il task manca): un'approvazione chiesta non nasconde l'esito dell'autopilota che arriva subito dopo; niente se `Settings.notifications` è spento. Con `CoreConfig::notify_log` (test, E2E) la notifica si aggiunge al file come `[task_id, titolo, testo]` (JSON, una per riga) invece di lanciare `osascript`. Partono: un'approvazione in attesa su un task con `auto` («Autopilota: approvazione richiesta»), la pausa per limite d'uso mentre un progetto ha l'autopilota acceso («Autopilota in pausa», solo al passaggio in pausa), e gli eventi dello scheduler (§7.12).
 
 ### 7.10 Auth e login UX
 
@@ -1152,6 +1215,44 @@ run_turn(attempt, prompt, mode):
 | Broadcast / canale stdin | 1024 / 64 |
 | Batch del forwarder | 50 ms o 200 entry |
 | Anteprima di digitazione | 100 ms |
+| Verifica dell'autopilota (`verify_timeout_secs`) | 600 s di default, da 10 a 3600 s; poi `killpg` più l'albero |
+| Log di una verifica / riassunto (`verify_summary`) | 8 MiB / ultimi 8 KiB |
+| Attesa dell'EOF dell'output dopo la fine della verifica | 2 s |
+| Tick di sicurezza dello scheduler | 60 s |
+| Verifiche di fila se HEAD cambia tra verifica e merge | 3 |
+| Notifica `osascript` | 10 s; al massimo una ogni 30 s per task e titolo |
+
+### 7.12 Autopilota (round 2026-10-01; `autopilot.rs`, `autopilot/verify.rs`)
+
+Un interruttore per progetto (`projects.autopilot`). Quando è acceso il Core guida da solo coda → avvio → verifica → correzione → merge dei task con `auto`. Tutto lo stato sta nel DB (`tasks.auto`, `after_id`, `auto_by`, `attempts.verify_*`): un riavvio ricostruisce la coda. In memoria ci sono solo le verifiche in corso (`Autopilot::verifying`, con il process group del comando).
+
+- **Scheduler.** Un solo task tokio per Core, avviato da `Core::startup` dopo il recupero. Lo svegliano (`tokio::sync::Notify`, un permesso resta se è occupato) la fine di ogni turno (dal supervisore di `runner.rs`, su entrambi i percorsi, a slot già libero), `update_project`, `create_task`, `update_task`, `move_task`, `delete_task`, `merge_attempt`, `discard_attempt`, `update_settings`, `resume_agents` e lo `start_task` in coda; più un tick ogni 60 s. Non fa niente se l'app si chiude (`closing`: termina) o è in pausa per limite d'uso.
+- **Un passaggio.**
+  1. Prima le **correzioni in attesa** (`Db::pending_fixes`): un attempt già avviato ha la precedenza sulla coda. Una che non trova ancora lo slot ferma il passaggio.
+  2. Poi, per ogni progetto con l'autopilota, i candidati di `Db::autopilot_candidates` (§5.2) in ordine di posizione, con `start_attempt_by`: branch target e modalità predefiniti del progetto, modello dei default. Un task affidato da un agente (`auto_by`) parte come l'avrebbe avviato quell'agente con `start_task`: `started_by_attempt` = quell'attempt (così la catena resta a profondità 2, §10.2), la sua modalità per un sotto task, i suoi limiti sub-agent. Se l'attempt non c'è più, i default del progetto ma sempre con `started_by_attempt`.
+  3. `ConcurrencyLimit`, `UsageLimited` e `Busy` fermano il passaggio, il task resta in coda; `Conflict` (avviato nel frattempo) lo salta; ogni altro errore toglie `auto` con la notifica «Impossibile avviare «X»: …».
+- **Fine di un turno** di un attempt attivo il cui task ha `auto` e il cui progetto ha l'autopilota (`after_turn`, in un task a parte; la fine del turno azzera prima `verify_pending`):
+  - `Completed` → verifica;
+  - ogni altro esito (`Failed`, `Killed`, Stop dell'utente, `AuthFailure`, `UsageLimit`) → l'autopilota lascia il task (`auto = 0`) con una notifica che dice perché. Non riprova mai da solo e non scavalca mai uno Stop.
+- **Verifica** (`Inner::verify`). Prende il lock dell'attempt (merge, follow-up e discard aspettano); niente se il tentativo è chiuso, se gira un turno o se l'app si chiude. Senza `verify_command` conta come passata. Altrimenti:
+  - `/bin/sh -c <verify_command>` con cwd nel worktree: il comando è dell'utente e si legge **solo dal DB**, mai da file del repository;
+  - `ChildEnv` ripulito (§7.2) come l'agente, stdin null, stdout e stderr sulla stessa pipe;
+  - `process_group(0)`, `kill_on_drop`; il pgid si registra in `Autopilot::verifying`;
+  - allo scadere di `verify_timeout_secs`, e anche dopo un'uscita normale, `verify::kill_group`: `killpg` del gruppo più i discendenti dei suoi membri trovati con `ps` (un server avviato dai test con `setsid`), così la pipe arriva all'EOF;
+  - output in `logs/<attempt>/verify/<ms>.log` (cartella 0700, file 0600, al massimo 8 MiB), coda di 8 KiB in `verify_summary`;
+  - `begin_verify` registra `running` e `verify_head` (HEAD prima di partire), `finish_verify` l'esito: `passed` (exit 0), `failed` (exit ≠ 0, segnale, timeout) o `error` (non è partita);
+  - `TaskCard::verifying` è vero intanto, e `get_branch_status` mette `merge_blocked` «La verifica dell'autopilota è in corso».
+- **Verifica passata.**
+  - Senza «Merge automatico»: notifica «pronto per il merge»; il task resta In revisione con `auto`.
+  - Con «Merge automatico»: `get_branch_status`. Se ci sono conflitti, il follow-up `conflict_prompt` (lo stesso testo di «Risolvi con l'agente», §8.7), contato come correzione. Altrimenti `Core::merge_attempt_at` con `merge_message`: sotto il lock dell'attempt controlla che HEAD sia ancora `verify_head` (se no, una nuova verifica, al massimo 3 di fila, poi l'autopilota lascia il task) e che il worktree sia pulito (`status --porcelain` vuoto: niente file scritti dalla verifica o dopo, altrimenti `Invalid` e l'autopilota lascia il task). Poi lo squash merge di §8.7 e la notifica «mergiato». Un merge sveglia lo scheduler, che avvia i task con `after_id` sul task mergiato.
+- **Verifica fallita.** Se `verify_fixes < autopilot_max_fixes`, il follow-up di correzione (in inglese: il comando, come è finito, la coda dell'output; fake-claude lo gioca come `fix_on_resume`), sempre **dopo** che il supervisore ha liberato lo slot, mai dentro `finalize`. Esaurite le correzioni: notifica «Verifica fallita dopo N tentativi», il task resta In revisione e l'autopilota lo lascia. Un errore della verifica (`error`) lo lascia subito.
+- **Invio di una correzione** (`deliver_fix`). Si conta in `verify_fixes` prima del follow-up e si restituisce se non parte.
+  - Se gira un turno (un follow-up dell'utente durante la verifica), niente: la sua fine torna in `after_turn`.
+  - `ConcurrencyLimit`, `UsageLimited` o l'app in chiusura: il prompt va in `verify_pending` e lo manda lo scheduler, prima della coda, quando c'è uno slot.
+  - `Busy`: niente.
+  - Ogni altro errore lascia il task, a meno che l'utente non l'abbia ripreso nel frattempo (discard, eliminazione, `auto` tolto).
+- **L'utente riprende il task.** Un discard toglie `auto` (altrimenti lo scheduler lo riavvierebbe subito); discard ed eliminazione uccidono prima la verifica in corso dell'attempt, che altrimenti terrebbe il lock fino al timeout. Togliere `auto` o spegnere l'autopilota del progetto ferma la catena alla prossima decisione (una verifica in corso finisce).
+- **Chiusura e riavvio.** `Core::shutdown` imposta `closing`, sveglia lo scheduler (che termina) e uccide il gruppo di ogni verifica registrata; una verifica che parte dopo vede `closing` e si uccide da sola. Una verifica interrotta così resta `running`: allo startup `mark_stale_verifies` la porta a `error` con la notifica «… interrotta dalla chiusura dell'app», e il task resta In revisione con `auto` finché l'utente non lo riprende. Un turno interrotto dall'app non riparte da solo (lo «Continua» resta all'utente); una correzione in `verify_pending` sì.
 
 ---
 
@@ -1339,7 +1440,8 @@ precondizioni: attempt active · nessun turno running · worktree present · hea
 | Board (5 colonne; Annullati compressa) | scroll_area, empty, skeleton, button, input | card e badge scritti a mano (`widgets/status.rs`): un badge colorato con pallino per lo stato dell'agente, "Attende approvazione" (sostituisce "In esecuzione", senza conteggio), "In esecuzione" (pallino pulsante, nascosto con reduced motion), "Interrotto" (neutro, fermo) più il link "Continua", "Fallito", "Fermato", "Pronto al merge", "Mergiato"/"Scartato"; "Worktree mancante" a parte. **DnD** (§9.3), creazione rapida in fondo alla colonna; **sotto task** (round 2026-09-30): la card del padre mostra il chip "↳ n/m" (sotto task fatti su totali) con una barra sottile, la card del figlio una riga mono e muted "↳ titolo del padre"; i sotto task stanno nelle colonne come gli altri task e i contatori per colonna li includono; **toolbar Kanban \| Lista** (toggle con `aria-pressed`, non persistito, Kanban a ogni montaggio; le due viste dietro `Show` su un memo, una sola nel DOM) con "Nuovo task" a destra in entrambe le viste |
 | **Lista** (`views/board/list.rs`) | skeleton, empty | `<table>` semantica sulle stesse card e sullo stesso `get_board` della kanban, colonne a larghezza fissa: **Titolo** (un `<button>` troncato che apre il task, `title` = titolo intero; `aria-current` sul task aperto) più una matita "Modifica il task", **Stato** (pallino e titolo della colonna), **Agente** (gli stessi badge della card, o "—"), **Branch**, **Aggiornato** ("oggi, 14:05", "ieri, 09:12", "12 set", "12 set 2025"; data completa nel `title`). Ordine fisso: colonna, poi posizione; i sotto task (round 2026-09-30) stanno subito sotto il padre, rientrati e con "↳", in ordine di colonna e posizione. Il padre ha dopo la matita un toggle "↳ n/m" con chevron che comprime o espande i suoi figli (`aria-expanded`, `aria-label` "Nascondi i sotto task (n su m fatti)"/"Mostra …"; non persistito, tutto espanso a ogni montaggio). Con il pannello aperto Branch e Aggiornato si nascondono. "Nuovo task" della toolbar apre il dialog in Da fare. Niente ricerca, filtro o ordinamento (filtrare la kanban romperebbe l'indice del DnD, `widgets/dnd.rs`); nessun cambio di stato in riga (si usa "Sposta in" del pannello) |
 | Dialog task (crea/modifica) | dialog*, input, textarea, label, button | form; sezione **Allegati**: "Aggiungi file…" (`type=button`, picker nativo multiplo, token) e righe con "×". In **creazione** i file scelti restano in attesa (solo nome e dimensione): "Crea task" fa `create_task`, poi `add_task_attachments` con i token, e chiude solo dopo entrambi; se l'aggiunta fallisce il task resta e compare il toast "Task creato, allegati non aggiunti: …". In **modifica** aggiunta e rimozione sono immediate, con `get_task_detail` all'apertura e una guardia contro le risposte vecchie. Un pick oltre i 20 allegati tiene i primi file (nell'ordine del picker) che ci stanno e dice quanti ne ha lasciati fuori in un avviso (`p[role=alert]`: "Al massimo 20 allegati per task: N file non aggiunti."); la dimensione la controlla il Core. Mentre "Crea task" o "Salva" sono in corso la sezione Allegati non cambia ("Aggiungi file…" e "×" disabilitati); una risposta arrivata dopo che il dialog è stato chiuso o riaperto non lo chiude e non ne cambia lo stato (solo il toast). Con un tentativo attivo: "La cartella allegati è visibile all'agente a ogni turno: cita i nuovi file nel messaggio." Round 2026-09-30: la creazione accetta un padre (`TaskDialogMode::Create { status, parent }`); allora il titolo è "Nuovo sotto task" e sotto l'intestazione c'è "↳ Sotto task di «titolo»". In modifica, il primo click su "Elimina" di un padre avvisa "Elimina anche N sotto task." (`role=alert`); a eliminazione riuscita il pannello si chiude se mostrava il task o uno dei suoi sotto task |
-| Dialog "Impostazioni app" | dialog*, input, label, button, select_native | form delle impostazioni generali (§5.2), senza tab |
+| Dialog "Impostazioni app" | dialog*, input, label, button, select_native | form delle impostazioni generali (§5.2), senza tab; round 2026-10-01: la casella «Notifiche macOS (autopilota: approvazioni, verifiche, merge)» (`Settings.notifications`) |
+| **Autopilota** (round 2026-10-01, §7.12) | button, input, label, checkbox nativo, callout | **topbar**: chip-interruttore «Autopilota» del progetto selezionato (`aria-pressed`; acceso, un puntino indaco pulsante al posto dell'icona robot), salva subito con `update_project`. **Impostazioni progetto**, sezione «Autopilota» («Avvia da soli i task affidati, li verifica, rimanda gli errori all'agente e, se vuoi, fa il merge.»): «Autopilota attivo», «Comando di verifica» (input mono, con l'avviso «Gira con /bin/sh nel worktree del task dopo ogni turno completato. Esegue codice del repository sul tuo Mac con i tuoi permessi. …»), «Timeout della verifica (secondi)», «Tentativi di correzione» (0–5), «Merge automatico se verificato», e «Salva l'autopilota» (toast «Autopilota aggiornato»). **Dialog task e pannello**: «Affida all'autopilota» e il select «Parte dopo…» («Nessun task», poi i task del progetto tranne il task stesso e gli annullati); nel pannello si salvano subito. **Card e Lista**: icona robot sui task con `auto` («Affidato all'autopilota»), badge «In coda» (`auto`, Da fare, nessun attempt; tooltip «Parte dopo «X»», «Autopilota del progetto spento» o «Attende un agente libero»), badge di verifica «Verifica…» (spinner), «Verificato», «Verifica fallita (n/max)», «Verifica non eseguita». **Pannello**: riga «Verifica: `cmd` · passata · correzioni n/max» dell'attempt attivo, con «Output della verifica» (la coda, `<details>`). Scostamenti dal piano: niente durata della verifica (non si registra), e `cmd` è il comando **attuale** del progetto (tooltip «Comando attuale del progetto: …»), non necessariamente quello verificato. Le card leggono autopilota e tentativi del progetto senza tracciarli (§13.7) |
 | Pannello task: header | button (Avvia, Merge, Continua, Stop, Scarta, Apri in Finder/Terminale/Editor), tooltip, select_native ("Sposta in…") | tre righe: contesto (pallino e titolo della colonna, "creato <data>" nel formato della Lista) con le azioni e la chiusura; il titolo; badge dell'agente, chip del branch e chip degli allegati (nome e dimensione, tooltip con il path assoluto). Un'azione primaria per stato: Avvia senza attempt, Continua se interrotto, altrimenti **Merge** in revisione con l'agente fermo, che apre il tab Modifiche (dove si fa il merge) e ne porta il focus sul tab. Sotto, un `<dl>` dell'attempt attivo con le coppie **Modello**, **Sub-agent** ("sonnet, max 3 (usati 1)", "nessuno" con max 0; le due omesse se l'attempt non le imposta), **Modalità** e **Da** ("main @ 3f2a9c1"), con un ": " sr-only dopo ogni etichetta; presente per ogni attempt attivo. Un pallino giallo sul tab Agente (con `aria-describedby` "In attesa di approvazione") segnala un'approvazione in attesa. Round 2026-09-30: nel pannello di un sotto task, sopra il titolo, il link "↳ titolo del padre" apre il padre; nel pannello di un task di primo livello, sotto l'header, la sezione **Sotto task** (`section[aria-label="Sotto task"]`): intestazione con "↳ n/m" e il bottone "Aggiungi sotto task" (apre il `TaskDialog` della board in creazione con questo task come padre), poi una riga per figlio con il pallino della colonna, il titolo (un bottone che apre il figlio; il nome della colonna è nel testo sr-only e nel `title`), barrato se annullato, e il badge dell'agente |
 | Dialog Avvia | dialog*, select_native (branch target; modello: "Predefinito (x)" con x il default del progetto, poi quello delle Impostazioni app, altrimenti "CLI", e `MODEL_ALIASES` (opus/sonnet/haiku/fable); effort; **Sub-agent (max)**: "Predefinito del CLI" (nessun limite), "Nessun sub-agent" (0), 1–10; **Modello dei sub-agent**: "Predefinito del CLI" o un alias, nascosto con max 0 (e allora non inviato); modalità: Supervisionato/Auto-edit/Autonomo, quest'ultimo abilitato solo con `allow_bypass`, con sotto la descrizione della modalità scelta: Auto-edit approva da solo modifiche e comandi shell sui file del worktree e chiede per il resto, Supervisionato chiede per tutto tranne le letture, M5), callout (avviso bypass: il worktree non è una sandbox), button | nota sui sub-agent: "Il massimo vale per tutto il tentativo. Il modello vale per i sub-agent che non ne chiedono uno proprio: Explore o una chiamata con un modello esplicito possono usarne un altro."; con "Predefinito" il modello inviato è `None` e il Core risolve lo stesso default (§6.3) |
 | Tab **Agente** | marker (notice e righe tool), collapsible (output tool, thinking), badge (esito TurnEnd, "Attende approvazione", "Negato", costo "≈ stima API", durata), alert (errori, limiti, auth, resume fallito), button (approvazioni, Continua, Nuova sessione), input (messaggio dell'approvazione), textarea e button (composer, disabilitato durante il turno), kbd (⌘↩), empty, skeleton, spinner | **lista del transcript** (§9.4, messaggi e righe scritti a mano), **card di approvazione** (tool, input completo, motivo; "Approva", "Approva sempre" (per il tentativo) solo se `can_remember`, "Rifiuta", "Rifiuta e ferma", campo messaggio). Per i tool `mcp__atm__*` (round 2026-09-30, `approval::board_tool_label`) la card mostra un'etichetta leggibile, per esempio «Sposta «X» in Fatto», «Modifica «X»», «Avvia l'agente su «X»» (il titolo dalle card della board, altrimenti l'id), con l'input JSON in un `<details>` "Input"; niente "Approva sempre", perché le richieste dei tool board non hanno suggestion (§7.8), annidamento dei subagent tramite `parent_tool_use_id`, riga di anteprima digitazione |
@@ -1386,6 +1488,17 @@ Hook aggiunti dai pacchetti UI oltre al contratto (stessa regola: l'E2E li usa, 
 | Dialog task | `[data-name=TaskDialogContent] [data-testid=attachments]`, righe `li[data-attachment=<nome>]` con `button[data-action=remove-attachment]`, avviso del limite `p[role=alert]`, `[data-testid=attachments-hint]` |
 | Pannello task | chip `[data-view=task-panel] header li[data-attachment=<nome>]` (`title` = path), `[data-testid=attempt-meta]` (un `<dl>`), `[data-action=open-merge]` (apre il tab Modifiche) |
 | StartDialog | `#start-model` (prima opzione `""` = "Predefinito (x)"), `#start-max-subagents` (valori `""`, `0`…`10`), `#start-subagent-model` (`""` e gli alias; assente dal DOM con max `0`), `[data-testid=subagent-help]` |
+
+Round 2026-10-01 (Autopilota), stessa regola:
+
+| Elemento | Selettore |
+|---|---|
+| Topbar | `button[data-action=toggle-autopilot][aria-pressed=true\|false]` (solo con un progetto selezionato) |
+| Impostazioni progetto | `#project-autopilot`, `#project-verify-command`, `#project-verify-timeout`, `#project-max-fixes`, `#project-autopilot-merge` (caselle e input), `[data-action=save-autopilot]` |
+| Dialog task | `#task-auto[data-auto-toggle]` (casella), `[data-after] select#task-after` (valore `""` = nessuna dipendenza, altrimenti l'id) |
+| Pannello task | `[data-testid=task-autopilot]` con `#panel-auto[data-auto-toggle]` e `#panel-after`; riga della verifica `[data-view=task-panel] [data-verify=running\|passed\|failed\|error]` |
+| Card e righe della Lista | dentro `[data-testid=badges]`: `[data-auto]` (icona robot), `[data-queued]` («In coda», `title` = il motivo), `[data-verify=running\|passed\|failed\|error]` (il badge di verifica) |
+| Impostazioni app | `#settings-notifications` |
 
 **Aggiornamento del tab Modifiche:**
 - all'apertura del tab;
@@ -1449,12 +1562,14 @@ Hook aggiunti dai pacchetti UI oltre al contratto (stessa regola: l'E2E li usa, 
 | App lanciata da dentro una sessione Claude Code (o da un terminale cmux o IDE) | Le variabili della sessione padre (id, messaggi, effort, PID, …) e del suo host (`CMUX_*`, IDE, e il `NODE_OPTIONS` con cui cmux fa caricare il suo modulo a ogni programma node, riportato a quello dell'utente) non arrivano agli agenti né a git e lasciano anche il processo dell'app, che all'avvio si ri-esegue senza (§7.2); verificato da `tests/claude.rs`, `tests/flow.rs` e dall'E2E (anche con `ps -E` dell'app). Resta vero che i processi antenati ancora vivi (la shell o la sessione che ha lanciato l'app) hanno quelle variabili, leggibili con `ps -E` da ogni processo dello stesso utente: per non esporle agli agenti si lancia l'app da un terminale pulito o dal Finder |
 | Allegati dei task: una webview compromessa che fa copiare all'host un file segreto (Portachiavi, `~/.ssh`, `~/.aws`, il DB e i log dell'app) in una cartella che l'agente legge senza chiedere (round feature del 2026-09-29) | **Il picker è l'autorità**: la webview non passa mai un path. `pick_attachment_files` apre il picker nativo nel guscio e consegna i path solo a `Core::stage_picks`; la webview riceve `PickedFile{token, name, size}` e `add_task_attachments` accetta solo token, **monouso**, validi **10 minuti**, al più **100** in memoria (i più vecchi scartati), al più 20 file per pick; un pick è tutto o niente. Difesa in profondità sul path, **canonicalizzato** (link risolti): rifiutato se sta sotto `~/.claude*` (ogni voce della home che inizia per `.claude`, in qualunque maiuscola, e il target di una tale voce se è un link), `$CLAUDE_CONFIG_DIR`, `~/.ssh`, `~/.aws`, `~/Library/Keychains`, la cartella dati o quella della cache dell'app (confronto ASCII senza maiuscole, come APFS; anche le forme canoniche delle cartelle); poi `symlink_metadata().is_file()`; poi apertura con `O_NOFOLLOW\|O_NONBLOCK` (un file sostituito da un link dopo lo staging dà `ELOOP`, una FIFO non blocca), `fstat` regolare e ≤ 25 MiB (`MAX_ATTACHMENT_BYTES`), copia con `take(MAX+1)`. Alla copia il file riaperto deve essere **lo stesso** dello staging (device e inode dell'`fstat`, salvati con il token): una cartella del percorso sostituita da un link, un hard link o un rename sopra il file danno "«nome» è cambiato dopo la scelta (sostituito o spostato): sceglilo di nuovo"; una modifica sul posto dello stesso file no. Il nome viene da `file_name()` senza caratteri nascosti o bidi; vuoto, `.`, `..` o con un apice inverso è rifiutato, oltre 120 caratteri è accorciato (estensione fino a 16 caratteri tenuta). Gli errori nominano solo il file, mai il path intero. Le copie stanno in `data_dir/attachments/…` (dir 0700, file 0600 `create_new`), fuori da ogni worktree e da git (`git add -A` non le vede); aggiunta e rimozione girano sotto il lock del task e una transazione riconta e inserisce, e a ogni errore (anche la FK di un task appena cancellato) le cartelle appena create si rimuovono. All'agente: `--add-dir` sulla cartella del task e i path nel prompt (§7.3, §7.4), nessuna regola deny: Bash può modificare le copie, mai gli originali (§13). Test: `tests/flow.rs::attachments_reach_the_agent_and_go_with_the_task`, `removing_the_project_removes_its_attachments_and_logs`, `picks_outside_the_rules_are_refused`, `tokens_are_single_use_and_the_copy_checks_again`, `the_attachment_limit_removes_the_copies_it_refuses`, `staged_picks_expire_and_the_oldest_go_first` |
 | Riepilogo del progetto: il testo del repository mostrato all'utente (segreti, caratteri che ingannano, file fuori dal repo) | Letto dal **commit in cima al branch target predefinito** (`ls-tree` e `cat-file --batch` sul runner irrobustito del §8.1, sola lettura), mai dal checkout principale, mai da `$HOME` (repo che è la home: `Invalid`), mai da `~/.claude.json` (i server aggiunti con `claude mcp add` non compaiono). Nessun link seguito: un symlink mostra solo "→ target". Segreti mascherati (`•••`) a ogni profondità in `.claude/settings.json` e `.mcp.json`: i valori di `env` e `headers`, ogni chiave che finisce in `Helper` più `awsAuthRefresh`/`awsCredentialExport`, e dal valore di ogni chiave `url` (e dall'URL di un server MCP) userinfo, query e fragment, anche nelle forme che il parser WHATWG del CLI accetta senza `scheme://` (`https:/`, `https:///`, `https:\\`, spazi in testa e in coda, tab e a capo interni); un JSON non valido non si mostra mai grezzo ("JSON non valido"). I server MCP si riducono a nome, trasporto, target e **nomi** delle chiavi di env e header; la UI non rende mai il testo di `.mcp.json`. Caratteri nascosti e bidi resi visibili lato server come `⟨U+XXXX⟩` (con un badge), `\r\n` → `\n`; solo testo semplice, mai HTML né markdown. Limite: il mascheramento è euristico, un segreto dentro `command`/`args`, nel comando di un hook, nel path di un URL o in un URL sotto una chiave diversa da `url` (o dentro un altro testo) si vede. Test: `tests/git.rs::overview_masks_every_secret` (nessuna sottostringa "secret" nell'overview serializzato), `overview_strips_lax_urls_too`, `overview_shows_the_committed_context_in_order`, `overview_notes_what_it_does_not_show`, `core_overview_reads_the_target_tip_and_never_home` |
-| Un agente che modifica, sposta o avvia task, anche di altri (tool board, round 2026-09-30) | Solo il progetto dell'attempt: un id di un altro progetto è "non trovato". Creare e leggere sono liberi; modificare, spostare e avviare passano da `ask` → `can_use_tool` → approvazione dell'utente, in ogni modalità, e "Consenti sempre" non salva regole (§7.8); l'host poi esegue solo il `tools/call` con il `tool_use_id` approvato, così un CLI che salta la domanda (un hook dell'utente, un cambio di precedenza) non cambia nulla (§7.4). Le modifiche usano i servizi della UI (validazioni, `Busy` su un task in esecuzione, lock). Gli avvii rispettano `max_running` (`ConcurrencyLimit` come errore del tool), usano la modalità dell'agente chiamante solo per un sotto task (per gli altri task quella predefinita del progetto) e si fermano a profondità 2 (`started_by_attempt`): un agente avviato da un agente non avvia agenti. Il server è in-process sulla stdio del CLI: nessun socket (D1). Accettazione: `tests/flow.rs::board_tools_*`, `board_start_*`, `a_denied_board_tool_changes_nothing`, `an_unapproved_board_call_is_refused` |
+| Un agente che modifica, sposta o avvia task, anche di altri (tool board, round 2026-09-30) | Solo il progetto dell'attempt: un id di un altro progetto è "non trovato". Creare e leggere sono liberi; modificare, spostare e avviare passano da `ask` → `can_use_tool` → approvazione dell'utente, in ogni modalità, e "Consenti sempre" non salva regole (§7.8); l'host poi esegue solo il `tools/call` con il `tool_use_id` approvato, così un CLI che salta la domanda (un hook dell'utente, un cambio di precedenza) non cambia nulla (§7.4). Le modifiche usano i servizi della UI (validazioni, `Busy` su un task in esecuzione, lock). Gli avvii rispettano `max_running` (`ConcurrencyLimit` come errore del tool), usano la modalità dell'agente chiamante solo per un sotto task (per gli altri task quella predefinita del progetto) e si fermano a profondità 2 (`started_by_attempt`): un agente avviato da un agente non avvia agenti. Il server è in-process sulla stdio del CLI: nessun socket (D1). **Autopilota** (round 2026-10-01): due avvii non passano subito da `start_attempt`. (1) Uno `start_task` approvato che trova gli slot pieni in un progetto con l'autopilota mette il task in coda (`auto`, `auto_by` = l'attempt chiamante). (2) Un sotto task creato con `parent_id:"self"` (tool `allow`, senza domanda) da un task con `auto` eredita `auto` e parte da solo, senza approvazione: è la scelta dell'utente di affidare il padre all'autopilota. In entrambi i casi lo scheduler avvia come avrebbe avviato il chiamante: `started_by_attempt` = il chiamante, la sua modalità solo per un sotto task, i suoi limiti sub-agent (§7.12); e un chiamante avviato a sua volta da un agente non fa ereditare `auto`. La profondità resta 2. Accettazione: `tests/flow.rs::board_tools_*`, `board_start_*` (anche `board_start_without_a_slot_is_queued_in_an_autopilot_project`: lo avvia lo scheduler con `started_by_attempt`), `board_subtasks_inherit_auto_and_take_after`, `a_denied_board_tool_changes_nothing`, `an_unapproved_board_call_is_refused` |
+| Comando di verifica dell'autopilota: codice del repository eseguito senza approvazione (round 2026-10-01) | Lo scrive l'utente nelle Impostazioni del progetto e si legge **solo dal DB** (`projects.verify_command`), mai da file del repository; la UI avvisa che «esegue codice del repository sul tuo Mac con i tuoi permessi». **Limite da sapere**: in Supervisionato e Auto-edit ogni comando Bash dell'agente che non tocca solo file chiede l'approvazione, mentre la verifica gira `/bin/sh -c <verify_command>` dopo ogni turno completato **senza chiedere**, e l'agente può aver modificato proprio i file che il comando esegue (test, `build.rs`, script di `package.json`, `Makefile`). È esecuzione di codice scritto dall'agente, come quella dei test che l'utente lancerebbe a mano: il worktree non è una sandbox. Controlli: `ChildEnv` ripulito come per gli agenti (niente chiavi API né variabili di una sessione padre), stdin null, process group proprio, timeout (`verify_timeout_secs`, 10–3600 s) con `killpg` più i discendenti, il gruppo ucciso anche dopo un'uscita normale, da discard ed eliminazione del task e da `shutdown`; log 0600 in dir 0700, al massimo 8 MiB. Un merge automatico squasha solo il commit verificato con il worktree pulito (§7.12). Test: `tests/flow.rs::autopilot_verification_timeout_kills_the_group`, `autopilot_shutdown_kills_the_verification` |
+| Notifiche macOS (`osascript`, round 2026-10-01) | Un solo punto (`Inner::notify`), un solo script fisso: titolo e testo (che contengono titoli di task, scritti anche dagli agenti) passano come `argv` dopo `--` e lo script li legge con `on run argv`, mai interpolati nell'AppleScript; argv senza shell, `ChildEnv` ripulito con PATH `/usr/bin:/bin`, cwd `/`, process group proprio, `killpg` più l'albero dopo 10 s, output scartato; al massimo una ogni 30 s per task e titolo, spegnibili. Due grep del §10.3 lo tengono così |
 | Attacchi di rete | Nessun socket TCP/UDP in ascolto. L'unico socket in ascolto è quello Unix del plugin single-instance (`/tmp/dev_aitaskmanager_desktop_si.sock`, release e debug senza selftest/E2E): riceve cwd e argv di un secondo avvio e porta avanti la finestra. `/tmp` è condiviso tra gli account: se a quel path c'è un socket di un altro utente, che altrimenti riceverebbe il lancio e lo farebbe uscire con 0, l'app spegne il controllo di istanza singola e lo dice sullo stderr (M6-REVIEW) |
 | Fuga di segreti | Log 0600 in dir 0700; valori dell'env mai registrati; transcript solo locali; righe, log grezzi (`logs/<attempt>`) e allegati cancellati con il task o il progetto (§4) |
 | Iniezione di comandi | Sempre argv; `--flag=value`; prompt solo via stdin come JSON; branch validati; target presi dalla lista dei ref; `-z` e `--` ovunque. Nel `.command` c'è solo il path di claude, con escape |
 | Perdita di dati | Commit di snapshot prima di ogni rimozione; mai rimozione automatica di lavoro non mergiato; `update-ref` CAS; `ff-only`; branch tenuti |
-| Processi orfani | Process group, stop sequence, `killpg` del gruppo residuo più i discendenti del leader registrati mentre viveva (i comandi Bash del CLI hanno gruppi propri, §7.4 passo 4), shutdown ordinato, recovery con kill verificato. Non coperti: i discendenti di un leader morto da solo senza `result` o insieme all'app (§7.9) |
+| Processi orfani | Process group, stop sequence, `killpg` del gruppo residuo più i discendenti del leader registrati mentre viveva (i comandi Bash del CLI hanno gruppi propri, §7.4 passo 4), shutdown ordinato (anche le verifiche dell'autopilota, §7.12), recovery con kill verificato. Non coperti: i discendenti di un leader morto da solo senza `result` o insieme all'app (§7.9), e quelli di una verifica il cui genitore è già uscito (riassegnati a launchd, fuori dal gruppo) |
 
 ### 10.3 Grep di sicurezza (in `scripts/check.sh`; qualunque match fa fallire)
 
@@ -1467,6 +1582,9 @@ Hook aggiunti dai pacchetti UI oltre al contratto (stessa regola: l'E2E li usa, 
   - `TcpListener`, `UdpSocket`, `UnixListener`, `0.0.0.0` (il codice del progetto non apre socket in ascolto; quello del plugin single-instance è nelle sue dipendenze, §10.2);
   - `credentials.json` fuori dalla costante `DENY_RULES`;
   - `CLAUDE_CODE_OAUTH_TOKEN` fuori dal commento sul passthrough in `claude.rs`.
+- **`crates/*/src`, `src-tauri/src`** (round 2026-10-01, notifiche):
+  - `osascript` fuori da `crates/atm-core/src/lib.rs` (`Inner::notify`);
+  - `display notification` in una riga diversa dallo script fisso `"display notification (item 2 of argv) with title (item 1 of argv)"` (nessun testo interpolato nell'AppleScript).
 - **`tauri.conf.json`:** `"csp": null`, `"devtools": true`.
 
 ---
@@ -1648,6 +1766,19 @@ Stesse regole del §11.1 (Opus, al massimo 15 agent per workflow, un worktree pe
 
 Item `pub` congelati durante B: `sidebar::{add_repository, projects_loaded}`, `start_dialog::mode_help`, `board::{column_title, NoProject}`, `git::overview::{Source, read}`.
 
+#### Round 2026-10-01: Autopilota
+
+Stesse regole, worktree `wp/a-<pkg>`, integrazione su `wp/a-int`.
+
+| Fase | Pacchetto | Ownership |
+|---|---|---|
+| A | CONTRATTI | migrazione 0004, tipi, `db.rs` (mapping, candidati, setter della verifica), mock minimi, spec §5–§6 |
+| B1 | SCHEDULER | `autopilot.rs`, `autopilot/verify.rs`, hook nel supervisore di `runner.rs`, wake in `lib.rs`, `merge_blocked`, `tests/flow.rs` |
+| B2 | NOTIFICHE E TOOL | `Inner::notify`, `Settings.notifications`, `runner/board_tools.rs` (`after`, `auto` ereditato, coda), `ATM_APPEND`, scenari `fix_on_resume` e `board_chain` |
+| B3 | UI | topbar, impostazioni progetto e app, dialog e pannello del task, badge di card e Lista, mock |
+| C | E2E | merge su `wp/a-int`, `autopilot_fix_and_merge`, `autopilot_after`; `check.sh` ed `e2e.sh` verdi |
+| D | REVIEW | core e concorrenza, sicurezza e processi, UI/spec/test; poi un agent di fix (correzioni in attesa di uno slot, profondità 2 via `auto_by`, kill delle verifiche, merge del solo commit verificato, cicli di dipendenze, §7.12, §9.2, §10, §13.7, README) |
+
 ---
 
 ## 12. Verifica end-to-end
@@ -1685,6 +1816,8 @@ Item `pub` congelati durante B: `sidebar::{add_repository, projects_loaded}`, `s
 | `auth_fail` | `result` con testo "Not logged in · Please run /login" |
 | `resolve_merge` | `git merge <FAKE_CLAUDE_TARGET>`, risolve concatenando le versioni, `git commit --no-edit` |
 | `board_tools` | Solo se `--mcp-config` dichiara il server sdk `atm` (round 2026-09-30): `create_task` con parent `self`, `list_tasks`, `get_task` (subito), e `update_task`, `move_task` (a `[status:S]` del messaggio, default `inreview`) e `start_task` (di `[target:ID]`, default il sotto task creato), ciascuno dopo il suo `can_use_tool` (con `[ask:skip]` senza chiedere, come un CLI che salta la regola `ask`: l'host deve rifiutarli); ogni `tools/call` porta `_meta."claudecode/toolUseId"`; registra gli esiti (`kind: "board"`, `denied` per un rifiuto) |
+| `fix_on_resume` | Come `simple`; in una sessione ripresa (`--resume`) scrive anche `fixed.txt`. Lo gioca anche il prompt di correzione dell'autopilota dopo una verifica fallita (round 2026-10-01) |
+| `board_chain` | Come `board_tools` per il server `atm` (round 2026-10-01): due `create_task` con parent `self`, il secondo con `after` = il primo; poi `result` success |
 | `mcp_other` | Un `tools/list` al server `other` (non dichiarato); registra la risposta di errore |
 | `subagents` | `FAKE_CLAUDE_SUBAGENTS` spawn (default 3) uno dopo l'altro, ciascuno un `tool_use` `Agent` più un `can_use_tool`; registra ogni risposta (`kind: "subagent"`) e chiude con `result` success (round feature del 2026-09-29) |
 
@@ -1720,6 +1853,8 @@ Item `pub` congelati durante B: `sidebar::{add_repository, projects_loaded}`, `s
       - `subtasks_from_the_panel` (giro 2026-09-30), su `da-rimuovere`: "Aggiungi sotto task" (`[data-action=add-subtask]`) nel pannello di un task apre `TaskDialog` come "Nuovo sotto task" con `[data-parent-title]` "↳ Sotto task di «…»"; il figlio ha `parent_id` nel DB, il pannello del padre lo elenca in `[data-subtasks] [data-subtask-id]`, la card del padre ha `[data-subtask-progress]` "0/1" e quella del figlio la riga "↳ <padre>"; nella Lista le righe seguono `state::board::nested` (il figlio subito sotto il padre, con "↳") e `[data-action=toggle-subtasks]` del padre lo nasconde e lo rimostra;
       - `board_tools_agent`: con Agenti in parallelo = 1 (poi di nuovo 2), un task `[fake:board_tools]` avviato dal dialog Avvia crea subito il suo sotto task (sulla board, sotto il padre, mentre l'agente aspetta la prima approvazione); `update_task`, `move_task` e `start_task` chiedono con la card di approvazione, che ha la frase (`[data-board-tool]`, es. «Sposta «Sotto task dal fake (rivisto)» in In revisione») e nessun "Approva sempre"; approvati, il sotto task è rinominato, passa a In revisione, e il suo avvio torna all'agente come errore del tool `ConcurrencyLimit`; il record di fake-claude ha le risposte ai suoi `mcp_message` (handshake, `tools/list` con 6 tool, 6 `tools/call`);
       - `subtask_cascade`: "Modifica" sulla card del padre di `subtasks_from_the_panel` → "Elimina" avvisa "Elimina anche 1 sotto task." (`[data-delete-warning]`) → "Conferma eliminazione": padre e figlio spariscono dalla board e da `get_board`;
+      - `autopilot_fix_and_merge` (round 2026-10-01), su `da-rimuovere`: l'interruttore «Autopilota» della topbar (`[data-action=toggle-autopilot]`) passa ad `aria-pressed=true` e la casella `#project-autopilot` delle Impostazioni del progetto lo segue; lì si salvano (`[data-action=save-autopilot]`, toast «Autopilota aggiornato») il comando di verifica `test -f fixed.txt` e «Merge automatico se verificato», con 2 tentativi di correzione. Un task creato dal dialog con «Affida all'autopilota» (`#task-auto[data-auto-toggle]`) e `[fake:fix_on_resume]` parte da solo, senza il dialog Avvia; la prima verifica fallisce (badge `[data-verify=failed]` «Verifica fallita (1/2)» sulla card), il follow-up dell'autopilota (`--resume`, prompt «The project's verification command `test -f fixed.txt` exited with code 1…») scrive `fixed.txt`, la seconda passa e il task è mergiato da solo: Fatto, attempt `merged` con `verify_state` passed e 1 correzione, commit squash in cima al target con il titolo del task. Le notifiche finiscono in `notify.jsonl` della cartella del giro (`CoreConfig::notify_log`), mai in `osascript`;
+      - `autopilot_after`: con Agenti in parallelo = 1 (poi di nuovo 2), due task `[fake:append]` affidati dal dialog, il secondo con «Parte dopo…» (`[data-after] select`) sul primo; il secondo resta in Da fare con il badge `[data-queued]` «In coda» (tooltip «Parte dopo «…»») e parte solo quando il primo è Fatto; poi è mergiato anche lui, sopra il primo (`fixed.txt` è già sul target: le verifiche passano subito);
       - `project_removal`: con `main` selezionato, il menu di `da-rimuovere` si apre con un `contextmenu` sintetico che la pagina deve annullare (voci Impostazioni progetto e Rimuovi dalla lista…, trigger "⋯" `aria-expanded`) e si chiude con un `pointerdown` fuori; riaperto, "Rimuovi dalla lista…" → `RemoveProjectDialog` ("Rimuovere «da-rimuovere» dalla lista?") → "Rimuovi": il progetto sparisce dalla sidebar e da `list_projects`, `main` resta selezionato sulla sua board, il task del progetto dà `get_task_detail: NotFound`, gli allegati e i log dei tre attempt spariscono dalla cartella dati e i worktree dal disco e da git; branch e checkout restano.
     - **Errori IPC attesi**: il giro confronta, nell'ordine, i comandi falliti con quelli che provoca: nella fase 1 i tre `add_project: Invalid` del passo 3 (`EXPECTED_FAILURES`); nella fase 2, tutti dopo il passo 10, `["set_project_security: Invalid", "get_task_detail: NotFound"]` (`EXPECTED_FAILURES_PHASE2`: Attendibile + Annulla, poi il task del progetto rimosso); nella fase 3 nessuno.
 
@@ -1855,6 +1990,17 @@ Osservati con l'harness `tests/real_cli.rs` (18 turni reali in tutto, stima del 
 - **Eliminazione a cascata:** `delete_task` tiene i lock del task e dei sotto task, quindi nessun sotto task parte o nasce durante l'eliminazione; un follow-up su un tentativo già esistente di un sotto task prende però solo il lock del suo attempt, e se parte nella finestra tra il controllo e la rimozione di quel sotto task l'eliminazione si ferma con `Busy` a metà, dopo i sotto task già tolti.
 - **Tool board:** "Consenti sempre" non ricorda mai un tool board (nessuna suggestion, §7.8): ogni modifica, spostamento e avvio chiede di nuovo; un agente avviato da un agente non può usare `start_task` (profondità 2); `start_task` su un sotto task usa la modalità dell'agente chiamante, e la card di approvazione mostra solo l'etichetta e l'input, non la modalità che avrà il nuovo agente; il dialog Avvia non c'è, quindi branch target e opzioni sono quelli predefiniti del progetto e del chiamante.
 - **CLI reale:** R16; la verifica completa con l'app (fase E) è passata il 2026-10-01 con il CLI 2.1.286 (§13.3).
+
+### 13.7 Limiti noti del round del 2026-10-01 (Autopilota)
+
+- **Nessun nuovo tentativo da solo:** dopo un turno `Failed`, `Killed`, uno Stop dell'utente, un `AuthFailure` o un `UsageLimit`, o una verifica in `error`, l'autopilota lascia il task (`auto` spento, notifica). Un turno interrotto dalla chiusura dell'app non riparte da solo («Continua» resta all'utente), e una verifica interrotta dalla chiusura diventa `error` allo startup, con il task che resta In revisione con `auto` finché l'utente non lo riprende.
+- **Verifica:** gira codice del repository senza approvazione, in ogni modalità (§10.2); non è una sandbox. Un processo che la verifica stacca dal suo albero (un genitore già uscito) può sopravviverle; allora l'output oltre i 2 s di attesa dell'EOF si perde dal riassunto. La durata non si registra. Spegnere l'autopilota o togliere `auto` non ferma una verifica in corso (la catena si ferma dopo); discard ed eliminazione sì.
+- **Merge automatico:** se la verifica lascia file non ignorati nel worktree (snapshot, report di coverage, lockfile riscritti), il merge non parte e l'autopilota lascia il task: vanno ignorati in `.gitignore` o committati dall'agente. Se HEAD cambia tra verifica e merge per 3 volte di fila, l'autopilota lascia il task.
+- **Dipendenze:** una sola per task; cicli e task annullati sono rifiutati quando si sceglie la dipendenza, ma un task annullato **dopo** blocca chi dipende da lui («In coda» per sempre, finché l'utente non cambia «Parte dopo…»).
+- **Correzioni in attesa:** una correzione che non trova lo slot aspetta in `verify_pending` e passa prima della coda; se nel frattempo l'utente manda un follow-up e il suo turno finisce, la correzione decade e si rifà la verifica. In una finestra stretta (fine del turno dell'utente mentre lo scheduler sta già mandando la correzione) può partire una correzione superflua, contata.
+- **Notifiche:** al massimo una ogni 30 s per task e titolo: due esiti dell'autopilota sullo stesso task a meno di 30 s (raro) mostrano solo il primo. Solo macOS (`osascript`), nessuna azione cliccabile.
+- **UI:** le card leggono l'autopilota del progetto, i «Tentativi di correzione» e il titolo della dipendenza senza tracciarli: un tooltip «In coda» o un «(n/max)» si aggiorna al prossimo cambiamento della card. La riga «Verifica:» del pannello mostra il comando attuale del progetto, non per forza quello verificato.
+- **Coda:** lo scheduler sceglie per posizione nella board, progetto per progetto, senza equità tra progetti.
 
 ---
 

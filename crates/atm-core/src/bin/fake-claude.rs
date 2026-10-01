@@ -17,7 +17,8 @@
 //!   Answers `initialize` (except `noinit`); each user message plays the scenario named by
 //!   `[fake:NAME]` in its text (never in the `## Parent task` section of a sub-task's prompt:
 //!   the same holds for the `[target:…]`/`[status:…]` tags), else `resolve_merge` for the app's "Risolvi con l'agente"
-//!   prompt, else `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
+//!   prompt, else `fix_on_resume` for the autopilot's fix prompt of a failed verification, else
+//!   `$FAKE_CLAUDE_SCENARIO`, else `simple`; exits 0 at EOF.
 //!   An interrupt is answered with success (`{"still_queued":[]}`), the user line `[Request
 //!   interrupted by user]` and a `result` `error_during_execution` (except `hang_ignore`).
 //!
@@ -41,7 +42,8 @@
 //! `--mcp-config` declares the SDK server `atm`, else an unknown scenario:
 //! [`Session::board_tools`]; each tool's outcome is recorded as
 //! `{"kind":"board","tool":…,"is_error":…,"text":…}` or `{…,"denied":…}`; with `[ask:skip]`
-//! the tools that ask call at once, without `can_use_tool`), mcp_other (one `tools/list` to a
+//! the tools that ask call at once, without `can_use_tool`), board_chain (like board_tools:
+//! [`Session::board_chain`]), mcp_other (one `tools/list` to a
 //! server named `other`; then succeeds). Whenever `--mcp-config` declares `atm`, every
 //! scenario that initializes first runs the MCP handshake as `mcp_message` requests before
 //! `system/init`, like the real CLI; each MCP message and its answer is recorded as
@@ -125,6 +127,8 @@ fn main() {
 const AUTH_FILE_ENV: &str = "FAKE_CLAUDE_AUTH_FILE";
 /// First words of the app's "Risolvi con l'agente" follow-up (spec §8.7).
 const CONFLICT_PROMPT: &str = "This branch conflicts with `";
+/// First words of the autopilot's follow-up after a failed verification (`autopilot.rs`).
+const FIX_PROMPT: &str = "The project's verification command `";
 
 fn auth_status(text: bool) {
     let from_file = std::env::var_os(AUTH_FILE_ENV)
@@ -460,6 +464,7 @@ impl Session {
         match scenario {
             "simple" => self.simple(),
             "append" => self.append(),
+            "fix_on_resume" => self.fix_on_resume(),
             "approval" => self.approval()?,
             "slow" => {
                 let n = count_env("FAKE_CLAUDE_SLOW_EVENTS", 20);
@@ -532,6 +537,7 @@ impl Session {
             "resolve_merge" => self.resolve_merge(),
             "subagents" => self.subagents()?,
             "board_tools" if self.atm_server => self.board_tools()?,
+            "board_chain" if self.atm_server => self.board_chain()?,
             "mcp_other" => {
                 self.mcp_server = "other";
                 let answer = self.mcp(json!({"jsonrpc": "2.0", "id": 0, "method": "tools/list"}));
@@ -563,6 +569,15 @@ impl Session {
         }
         self.text("Fatto: hello.txt creato.");
         self.result("success", false, Some("Fatto: hello.txt creato."));
+    }
+
+    /// `simple`, plus `fixed.txt` on a resumed session only: an autopilot's verification
+    /// `test -f fixed.txt` fails after the first turn and passes after its fix follow-up.
+    fn fix_on_resume(&mut self) {
+        if std::env::args().any(|a| a.starts_with("--resume")) {
+            let _ = std::fs::write(self.cwd.join("fixed.txt"), "fixed\n");
+        }
+        self.simple();
     }
 
     /// Appends the first line of the message (without the `[fake:…]` tag and the leading `#`
@@ -721,6 +736,24 @@ impl Session {
         self.board_call("move_task", json!({"id": target, "status": status}), true)?;
         self.board_call("start_task", json!({"id": target}), true)?;
         self.result("success", false, Some("Board aggiornata."));
+        Ok(())
+    }
+
+    /// Two subtasks of the caller's task, the second `after` the first (`create_task`, which
+    /// never asks), as an agent splits its work for the autopilot; then succeeds.
+    fn board_chain(&mut self) -> Step {
+        let first = self.board_call(
+            "create_task",
+            json!({"title": "Primo passo", "parent_id": "self"}),
+            false,
+        )?;
+        let first = serde_json::from_str::<Value>(&first).unwrap_or_default();
+        self.board_call(
+            "create_task",
+            json!({"title": "Secondo passo", "parent_id": "self", "after": first["id"]}),
+            false,
+        )?;
+        self.result("success", false, Some("Lavoro diviso in due passi."));
         Ok(())
     }
 
@@ -1114,6 +1147,10 @@ fn pick_scenario(text: &str) -> String {
             text.starts_with(CONFLICT_PROMPT)
                 .then(|| "resolve_merge".to_owned())
         })
+        .or_else(|| {
+            text.starts_with(FIX_PROMPT)
+                .then(|| "fix_on_resume".to_owned())
+        })
         .or_else(|| std::env::var("FAKE_CLAUDE_SCENARIO").ok())
         .unwrap_or_else(|| "simple".into())
 }
@@ -1176,6 +1213,8 @@ mod tests {
         assert_eq!(pick_scenario(prompt), "resolve_merge");
         assert_eq!(conflict_target(prompt).as_deref(), Some("release/1.2"));
         assert_eq!(pick_scenario("Crea hello [fake:approval]"), "approval");
+        let fix = "The project's verification command `test -f fixed.txt` exited with code 1";
+        assert_eq!(pick_scenario(fix), "fix_on_resume");
         assert_eq!(conflict_target("Merge `main` please"), None);
         assert_eq!(conflict_target("This branch conflicts with `` in: x"), None);
         assert_eq!(

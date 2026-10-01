@@ -11,11 +11,12 @@ pub(crate) use list::{updated_text, updated_title};
 use std::time::Duration;
 
 use atm_types::{
-    AttemptState, CONTINUE_PROMPT, CreateTask, CreateTaskReq, GetBoard, Id, MoveTask, MoveTaskReq,
-    ProjectIdReq, SendFollowUp, SendFollowUpReq, StopReason, TaskCard, TaskStatus, WorktreeState,
+    AttemptState, CONTINUE_PROMPT, CreateTask, CreateTaskReq, DEFAULT_AUTOPILOT_MAX_FIXES,
+    GetBoard, Id, MoveTask, MoveTaskReq, ProjectIdReq, SendFollowUp, SendFollowUpReq, StopReason,
+    TaskCard, TaskStatus, WorktreeState,
 };
 use icons::{
-    ChevronLeft, ChevronRight, FolderPlus, GitBranch, List, Pencil, Plus, SquareKanban,
+    Bot, ChevronLeft, ChevronRight, FolderPlus, GitBranch, List, Pencil, Plus, SquareKanban,
     TriangleAlert,
 };
 use leptos::html;
@@ -36,7 +37,8 @@ use crate::views::start_dialog::StartDialog;
 use crate::views::task_dialog::{TaskDialog, TaskDialogMode};
 use crate::widgets::dnd::{DragCtx, DropPlaceholder};
 use crate::widgets::status::{
-    AgentBadge, FOCUS_RING, PILL_TABLIST, Status, StatusDot, agent_state, pill_tab,
+    AgentBadge, FOCUS_RING, PILL_TABLIST, Status, StatusDot, agent_state, pill_tab, queued,
+    verify_state,
 };
 use list::TaskList;
 
@@ -159,6 +161,8 @@ impl BoardState {
                 description: String::new(),
                 status: Some(status),
                 parent_id: None,
+                auto: false,
+                after_id: None,
             };
             match ipc::call::<CreateTask>(&req).await {
                 Ok(card) => self.edit(|cards| {
@@ -604,13 +608,26 @@ fn ParentLine(cards: RwSignal<Vec<TaskCard>>, parent_id: Id) -> impl IntoView {
     }
 }
 
-/// Badges of a card (spec §9.2): the agent's state (see [`agent_state`]), "Interrotto" with
-/// "Continua" (spec §7.9), and a missing worktree. `None` without any: the list view shows a
-/// dash instead. `display: contents`, so they flow in the caller's row.
+/// Badges of a card (spec §9.2): the autopilot's icon, «In coda» (with why as its tooltip),
+/// the agent's state (see [`agent_state`]), "Interrotto" with "Continua" (spec §7.9), the
+/// verification, and a missing worktree. `None` without any: the list view shows a dash
+/// instead. `display: contents`, so they flow in the caller's row. The project's autopilot
+/// and «Tentativi di correzione», and the dependency's title, are read untracked: a card shows
+/// a change of them at its own next change (a known limit, spec §13.7).
 fn card_badges(ctx: AppCtx, card: &TaskCard) -> Option<impl IntoView + use<>> {
     let state = agent_state(card);
     let missing = card.worktree_state == Some(WorktreeState::Missing);
-    if state.is_none() && !missing {
+    // Read untracked: the card's own changes re-render its badges.
+    let project = ctx.projects.with_untracked(|ps| {
+        ps.iter()
+            .find(|p| p.id == card.task.project_id)
+            .map(|p| (p.autopilot, p.autopilot_max_fixes))
+    });
+    let (autopilot, max_fixes) = project.unwrap_or((false, DEFAULT_AUTOPILOT_MAX_FIXES));
+    let verify = verify_state(card, max_fixes);
+    let queued = queued(card).then(|| queue_reason(ctx, card, autopilot));
+    let auto = card.task.auto;
+    if state.is_none() && !missing && verify.is_none() && queued.is_none() && !auto {
         return None;
     }
     let agent = state.map(|(label, status)| {
@@ -646,7 +663,36 @@ fn card_badges(ctx: AppCtx, card: &TaskCard) -> Option<impl IntoView + use<>> {
     });
     Some(view! {
         <div class="contents" data-testid="badges">
+            {auto
+                .then(|| {
+                    view! {
+                        <span
+                            class="text-primary inline-flex items-center"
+                            title="Affidato all'autopilota"
+                            data-auto=""
+                        >
+                            <Bot class="size-3.5" />
+                            <span class="sr-only">"Affidato all'autopilota"</span>
+                        </span>
+                    }
+                })}
+            {queued
+                .map(|reason| {
+                    view! {
+                        <span class="inline-flex" title=reason data-queued="">
+                            <AgentBadge label="In coda" status=Status::Todo />
+                        </span>
+                    }
+                })}
             {agent}
+            {verify
+                .map(|(label, status, name)| {
+                    view! {
+                        <span class="inline-flex" data-verify=name>
+                            <AgentBadge label status spin=name == "running" />
+                        </span>
+                    }
+                })}
             {missing
                 .then(|| {
                     view! {
@@ -664,6 +710,23 @@ fn card_badges(ctx: AppCtx, card: &TaskCard) -> Option<impl IntoView + use<>> {
                 })}
         </div>
     })
+}
+
+/// Tooltip of "In coda": why the queued task has not started yet.
+fn queue_reason(ctx: AppCtx, card: &TaskCard, autopilot: bool) -> String {
+    let after = card.task.after_id.as_ref().and_then(|id| {
+        ctx.cards.with_untracked(|cards| {
+            cards
+                .iter()
+                .find(|c| c.task.id == *id && c.task.status != TaskStatus::Done)
+                .map(|c| c.task.title.clone())
+        })
+    });
+    match after {
+        Some(title) => format!("Parte dopo «{title}»"),
+        None if !autopilot => "Autopilota del progetto spento".into(),
+        None => "Attende un agente libero".into(),
+    }
 }
 
 /// `data-badge` of the agent's badge, which the E2E drives: `running` only while the
@@ -828,6 +891,8 @@ mod tests {
                     created_at: 0,
                     updated_at: 0,
                     parent_id: None,
+                    auto: false,
+                    after_id: None,
                 },
                 attempt_id: Some("a".into()),
                 attempt_state: Some(AttemptState::Active),
@@ -839,6 +904,9 @@ mod tests {
                 worktree_state: None,
                 subtasks_done: 0,
                 subtasks_total: 0,
+                verifying: false,
+                verify_state: None,
+                verify_fixes: 0,
             };
             f(&mut card);
             let (_, status) = agent_state(&card)?;

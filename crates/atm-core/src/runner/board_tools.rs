@@ -8,14 +8,14 @@ use std::sync::Arc;
 
 use atm_types::{
     AppError, AttemptView, CreateTaskReq, Effort, ErrorCode, Id, IdReq, MoveTaskReq, ProjectIdReq,
-    StartAttemptReq, Task, TaskCard, TaskStatus, UpdateTaskReq,
+    StartAttemptReq, Task, TaskCard, TaskStatus, UpdateTaskReq, VerifyState,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
 use crate::db::AttemptCtx;
-use crate::{Core, Inner};
+use crate::{Core, Inner, now_ms};
 
 /// The id that names the calling attempt's own task.
 const SELF_ID: &str = "self";
@@ -31,19 +31,25 @@ pub(super) fn list() -> Value {
     json!([
         {"name": "list_tasks",
          "description": "List the tasks of this project's board (id, title, status, parent, \
-                         agent state), optionally filtered by status or parent.",
+                         autopilot, after, agent and verification state), optionally filtered \
+                         by status or parent.",
          "inputSchema": {"type": "object", "properties": {"status": status, "parent_id": id}}},
         {"name": "get_task",
-         "description": "Get one task: title, description, status, parent, agent state and its \
-                         subtasks with their status.",
+         "description": "Get one task: title, description, status, parent, autopilot, after, \
+                         agent and verification state and its subtasks with their status.",
          "inputSchema": {"type": "object", "properties": {"id": id}, "required": ["id"]}},
         {"name": "create_task",
          "description": "Create a task on this project's board (in todo unless a status is \
                          given). With parent_id \"self\" it is a subtask of your task; a \
-                         subtask cannot have subtasks of its own.",
+                         subtask cannot have subtasks of its own. If your task is driven by \
+                         the autopilot, so are your subtasks: they start on their own, each \
+                         one after its `after` task is done.",
          "inputSchema": {"type": "object", "properties": {
              "title": {"type": "string"}, "description": {"type": "string"},
-             "status": status, "parent_id": id}, "required": ["title"]}},
+             "status": status, "parent_id": id,
+             "after": {"type": "string", "description": "Task id, or \"self\": the new task \
+                                                         starts only after that task is done."}},
+             "required": ["title"]}},
         {"name": "update_task",
          "description": "Change the title and/or the description of a task. Needs the user's \
                          approval.",
@@ -59,8 +65,9 @@ pub(super) fn list() -> Value {
         {"name": "start_task",
          "description": "Start an agent on a task, in its own worktree, with the project's \
                          defaults; a subtask's agent runs in your permission mode. Needs the \
-                         user's approval and fails when too many agents are running. An agent \
-                         started by another agent cannot start agents.",
+                         user's approval. When too many agents are running it fails, or, in a \
+                         project with the autopilot on, it is queued and starts on its own \
+                         later. An agent started by another agent cannot start agents.",
          "inputSchema": {"type": "object", "properties": {"id": id,
              "model": {"type": "string", "description": "Model alias, e.g. sonnet or opus; \
                                                          default: the project's."},
@@ -98,6 +105,7 @@ struct CreateArgs {
     description: String,
     status: Option<TaskStatus>,
     parent_id: Option<String>,
+    after: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -155,30 +163,65 @@ async fn run(
                 }
                 None => Value::Null,
             };
+            let after = match &d.task.after_id {
+                Some(id) => {
+                    let a = inner.db.task(id)?;
+                    json!({"id": a.id, "title": a.title, "status": a.status})
+                }
+                None => Value::Null,
+            };
             let attempt = d.attempt.as_ref().map(|a| {
                 json!({"state": a.state, "running": a.running, "branch": a.branch,
-                       "pending_approvals": a.pending_approvals})
+                       "pending_approvals": a.pending_approvals,
+                       "verify": verify_json(a.verify_state, a.verify_fixes)})
             });
             Ok(json!({
                 "id": d.task.id, "title": d.task.title, "description": d.task.description,
-                "status": d.task.status, "parent": parent, "attempt": attempt,
+                "status": d.task.status, "parent": parent, "auto": d.task.auto,
+                "after": after, "attempt": attempt,
                 "subtasks": d.subtasks.iter().map(card_json).collect::<Vec<_>>(),
             }))
         }
         "create_task" => {
             let a: CreateArgs = parse(args)?;
-            let parent_id = match a.parent_id.map(|id| resolve(ctx, id)) {
+            let parent = match a.parent_id.map(|id| resolve(ctx, id)) {
+                Some(id) => Some(own_task(inner, ctx, &id)?),
+                None => None,
+            };
+            let after_id = match a.after.map(|id| resolve(ctx, id)) {
                 Some(id) => Some(own_task(inner, ctx, &id)?.id),
                 None => None,
             };
+            // A subtask of the caller's own task is the autopilot's when that task is, started
+            // as if the caller had (`auto_by`): not when the caller was itself started by an
+            // agent, which may not start agents (depth 2, spec §10).
+            let auto = parent
+                .as_ref()
+                .is_some_and(|p| p.id == ctx.task.id && p.auto)
+                && inner
+                    .db
+                    .attempt(&ctx.attempt.id)?
+                    .started_by_attempt
+                    .is_none();
             let req = CreateTaskReq {
-                project_id,
+                project_id: project_id.clone(),
                 title: a.title,
                 description: a.description,
                 status: a.status,
-                parent_id,
+                parent_id: parent.map(|p| p.id),
+                auto: false,
+                after_id,
             };
-            Ok(task_json(&core.create_task(req).await?.task))
+            let task = core.create_task(req).await?.task;
+            if !auto {
+                return Ok(task_json(&task));
+            }
+            inner
+                .db
+                .set_task_auto_by(&task.id, &ctx.attempt.id, now_ms())?;
+            inner.emit_changed(Some(&project_id), Some(&task.id));
+            inner.autopilot.wake();
+            Ok(task_json(&inner.db.task(&task.id)?))
         }
         "update_task" => {
             let a: UpdateArgs = parse(args)?;
@@ -187,6 +230,8 @@ async fn run(
                 id: task.id,
                 title: a.title.unwrap_or(task.title),
                 description: a.description.unwrap_or(task.description),
+                auto: None,
+                after_id: None,
             };
             Ok(task_json(&core.update_task(req).await?.task))
         }
@@ -227,7 +272,22 @@ async fn run(
                 subagent_model: caller.subagent_model,
                 max_subagents: caller.max_subagents,
             };
-            let view = start(core, req, caller.id).await?;
+            let view = match start(core, req, caller.id.clone()).await {
+                // The autopilot starts it once a slot is free (it only starts tasks in todo).
+                Err(e)
+                    if e.code == ErrorCode::ConcurrencyLimit
+                        && project.autopilot
+                        && task.status == TaskStatus::Todo =>
+                {
+                    inner.db.set_task_auto_by(&task.id, &caller.id, now_ms())?;
+                    inner.emit_changed(Some(&project_id), Some(&task.id));
+                    inner.autopilot.wake();
+                    return Ok(json!({"task_id": task.id, "queued": true,
+                        "message": "Too many agents are running: the task is queued and the \
+                                    autopilot starts it once one of them has finished."}));
+                }
+                result => result?,
+            };
             Ok(
                 json!({"task_id": task.id, "attempt_id": view.id, "branch": view.branch,
                       "permission_mode": view.permission_mode, "model": view.model}),
@@ -284,7 +344,13 @@ fn own_task(inner: &Inner, ctx: &AttemptCtx, id: &str) -> Result<Task, AppError>
 
 fn task_json(task: &Task) -> Value {
     json!({"id": task.id, "title": task.title, "status": task.status,
-           "parent_id": task.parent_id})
+           "parent_id": task.parent_id, "auto": task.auto, "after_id": task.after_id})
+}
+
+/// The active attempt's verification: `null` before the first, else its state and how many
+/// fixes the autopilot asked for.
+fn verify_json(state: Option<VerifyState>, fixes: u32) -> Value {
+    state.map_or(Value::Null, |s| json!({"state": s, "fixes": fixes}))
 }
 
 fn card_json(card: &TaskCard) -> Value {
@@ -294,6 +360,12 @@ fn card_json(card: &TaskCard) -> Value {
         (false, Some(state)) => state.as_str().into(),
         (false, None) => Value::Null,
     };
+    let verify_state = if card.verifying {
+        Some(VerifyState::Running)
+    } else {
+        card.verify_state
+    };
+    v["verify"] = verify_json(verify_state, card.verify_fixes);
     if card.subtasks_total > 0 {
         v["subtasks_done"] = card.subtasks_done.into();
         v["subtasks_total"] = card.subtasks_total.into();

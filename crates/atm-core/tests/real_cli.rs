@@ -846,6 +846,7 @@ impl Real {
             path_env: Some(guard.path.clone()),
             extra_env: guard.extra_env.clone(),
             open_log: None,
+            notify_log: None,
         };
         let seen = Seen::new();
         let core = Core::new(config.clone(), seen.notify()).unwrap();
@@ -922,6 +923,8 @@ impl Real {
             description: description.into(),
             status: None,
             parent_id: None,
+            auto: false,
+            after_id: None,
         };
         self.core.create_task(req).await.unwrap().task
     }

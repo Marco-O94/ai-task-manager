@@ -22,6 +22,14 @@ pub const MAX_ATTACHMENTS_PER_TASK: usize = 20;
 pub const MAX_ATTACHMENT_BYTES: u64 = 25 << 20;
 /// Longest `Project::description`, in characters (`projects.description` CHECK).
 pub const MAX_PROJECT_DESCRIPTION: usize = 10_000;
+/// Bounds and default of `Project::verify_timeout_secs` (`projects` CHECK).
+pub const VERIFY_TIMEOUT_SECS: std::ops::RangeInclusive<u32> = 10..=3600;
+pub const DEFAULT_VERIFY_TIMEOUT_SECS: u32 = 600;
+/// Upper bound and default of `Project::autopilot_max_fixes` (`projects` CHECK).
+pub const MAX_AUTOPILOT_FIXES: u32 = 5;
+pub const DEFAULT_AUTOPILOT_MAX_FIXES: u32 = 2;
+/// Longest `Project::verify_command`, in characters.
+pub const MAX_VERIFY_COMMAND: usize = 1000;
 
 /// Enums whose strings are shared with the DB `CHECK`s and the CLI (spec §5.3). Each gets
 /// `ALL` (declaration order), `as_str()`, `Display` and `FromStr` (`Invalid` on unknown input),
@@ -147,6 +155,18 @@ db_enum! {
     }
 }
 
+db_enum! {
+    /// `attempts.verify_state`: the autopilot's run of the project's `verify_command` on the
+    /// attempt's worktree (`None` = never verified).
+    VerifyState {
+        Running = "running",
+        Passed = "passed",
+        Failed = "failed",
+        /// Could not run (spawn error, timeout, the app closed while it ran).
+        Error = "error",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub id: Id,
@@ -174,6 +194,31 @@ pub struct Project {
     /// settings (M6). `None` otherwise, and absent from the JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trust_error: Option<String>,
+    /// Autopilot on: the app starts, verifies, fixes and (with `autopilot_merge`) merges the
+    /// project's tasks with `Task::auto` on its own.
+    #[serde(default)]
+    pub autopilot: bool,
+    /// Merge an attempt once its verification passed; off = notify "pronto per il merge".
+    #[serde(default)]
+    pub autopilot_merge: bool,
+    /// Run by `/bin/sh -c` in the attempt's worktree after a completed turn; `None` = no
+    /// verification (counts as passed). Trimmed, at most [`MAX_VERIFY_COMMAND`] characters.
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// In [`VERIFY_TIMEOUT_SECS`].
+    #[serde(default = "default_verify_timeout_secs")]
+    pub verify_timeout_secs: u32,
+    /// Follow-ups sent after a failed verification, per attempt, 0..=[`MAX_AUTOPILOT_FIXES`].
+    #[serde(default = "default_autopilot_max_fixes")]
+    pub autopilot_max_fixes: u32,
+}
+
+pub(crate) fn default_verify_timeout_secs() -> u32 {
+    DEFAULT_VERIFY_TIMEOUT_SECS
+}
+
+pub(crate) fn default_autopilot_max_fixes() -> u32 {
+    DEFAULT_AUTOPILOT_MAX_FIXES
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -191,6 +236,13 @@ pub struct Task {
     /// sub-task); `None` = top-level task. Deleting the parent deletes its sub-tasks.
     #[serde(default)]
     pub parent_id: Option<Id>,
+    /// Entrusted to the project's autopilot.
+    #[serde(default)]
+    pub auto: bool,
+    /// Starts only once this task (same project, not itself) is done; `None` = no dependency.
+    /// Deleting that task clears it.
+    #[serde(default)]
+    pub after_id: Option<Id>,
 }
 
 /// One board card: the task plus its active (else most recent) attempt, merged with the
@@ -216,6 +268,15 @@ pub struct TaskCard {
     /// Every sub-task of this task, whatever its status; 0 for a sub-task.
     #[serde(default)]
     pub subtasks_total: u32,
+    /// The autopilot is running the verification of the active attempt now (live registry).
+    #[serde(default)]
+    pub verifying: bool,
+    /// `AttemptView::verify_state` of the active attempt; `None` without one.
+    #[serde(default)]
+    pub verify_state: Option<VerifyState>,
+    /// `AttemptView::verify_fixes` of the active attempt; 0 without one.
+    #[serde(default)]
+    pub verify_fixes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -249,6 +310,19 @@ pub struct AttemptView {
     /// started by the user. Plain id, not a foreign key: it survives the starter's deletion.
     #[serde(default)]
     pub started_by_attempt: Option<Id>,
+    /// Latest verification; `None` = never verified.
+    #[serde(default)]
+    pub verify_state: Option<VerifyState>,
+    /// Commit the latest verification ran on (HEAD before it started).
+    #[serde(default)]
+    pub verify_head: Option<String>,
+    /// Follow-ups the autopilot sent after a failed verification (or a merge conflict).
+    #[serde(default)]
+    pub verify_fixes: u32,
+    /// Tail of the latest verification's output (at most 8 KiB); the full output is in the
+    /// attempt's logs.
+    #[serde(default)]
+    pub verify_summary: Option<String>,
 }
 
 /// One turn (one `claude -p` process).
@@ -410,6 +484,13 @@ pub struct Settings {
     pub worktree_root: String,
     pub editor_app: String,
     pub remove_worktree_after_merge: bool,
+    /// macOS notifications from the autopilot.
+    #[serde(default = "yes")]
+    pub notifications: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -422,6 +503,7 @@ impl Default for Settings {
             worktree_root: "~/.ai-task-manager/worktrees".into(),
             editor_app: "Visual Studio Code".into(),
             remove_worktree_after_merge: true,
+            notifications: true,
         }
     }
 }

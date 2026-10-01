@@ -285,6 +285,7 @@ pub fn core_config() -> CoreConfig {
             ("FAKE_CLAUDE_FLOOD_PAUSE_MS".into(), FLOOD_PAUSE_MS.into()),
         ],
         open_log: Some(p.open_log.clone()),
+        notify_log: Some(p.dir.join("notify.jsonl")),
     }
 }
 

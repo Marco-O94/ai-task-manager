@@ -807,6 +807,12 @@ impl Git {
         Ok(self.run_ok(dir, &args, &RunOpts::read()).await?.stdout)
     }
 
+    /// Nothing to commit in `dir` (`status --porcelain`, untracked files included, ignored
+    /// ones not).
+    pub async fn is_clean(&self, dir: &Path) -> Result<bool, AppError> {
+        Ok(self.status(dir).await?.is_empty())
+    }
+
     /// Some ref reaches the HEAD of `worktree`.
     async fn head_in_a_ref(&self, worktree: &Path) -> Result<bool, AppError> {
         let args = [

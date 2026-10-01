@@ -14,7 +14,8 @@
 # - phase 2: relaunch; step 4's order after the restart, the rest of step 8, steps 9-12, the
 #   security confirmations, then the feature round's checks: `task_list_view` (Lista on main),
 #   `attachment_to_the_agent`, `subagent_limit`, `subtasks_from_the_panel`,
-#   `board_tools_agent` and `subtask_cascade` (on the scratch project `da-rimuovere`),
+#   `board_tools_agent`, `subtask_cascade`, `autopilot_fix_and_merge` and `autopilot_after`
+#   (on the scratch project `da-rimuovere`),
 #   `project_removal` (that project removed from the sidebar menu, main stays selected); then
 #   `app.exit` -> RunEvent::ExitRequested during another [fake:hang_ignore] turn;
 # - phase 3 (perf): [fake:flood] on three concurrent attempts, one of them open; the page stays

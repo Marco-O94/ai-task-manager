@@ -8,7 +8,9 @@
 //! `respond_approval`. Seeded attempts, on the board baseline tasks:
 //! - `task-inprogress`: a running turn, replayed from its first subscription;
 //! - `task-inreview`: one finished turn, ready for review and merge;
-//! - `task-done`: a merged attempt.
+//! - `task-done`: a merged attempt;
+//! - `task-header`, `task-images`, `task-forms` (Autopilota of `sito-web`): a finished turn
+//!   whose verification is running, passed, and failed once (1/2) with its output.
 //!
 //! Query parameters, next to `?task=`: `fixture=simple|approval|flood` (the running turn
 //! defaults to `approval`, the finished history and new turns to `simple`) and
@@ -48,6 +50,8 @@ const POLL_MS: i32 = 100;
 /// Lines of the generated file that exercises "mostra tutto" (over 2000 lines).
 const LONG_FILE_LINES: u32 = 2_400;
 const CONFLICT_FILES: [&str; 2] = ["tests/parser.rs", "README.md"];
+/// Tail of the failed verification of `task-forms`.
+const VERIFY_FAILED: &str = "FAIL src/forms.test.js\n  ✕ rifiuta un'email senza dominio (4 ms)\n\n    expect(received).toBe(expected)\n    Expected: false\n    Received: true\n\nTests: 1 failed, 17 passed, 18 total\n";
 /// Start of the "Risolvi con l'agente" prompt: after that turn the preview is clean (§8.7).
 const CONFLICT_PROMPT: &str = "This branch conflicts with";
 
@@ -187,6 +191,10 @@ impl Attempt {
                 created_at: now_ms(),
                 closed_at: None,
                 started_by_attempt: None,
+                verify_state: None,
+                verify_head: None,
+                verify_fixes: 0,
+                verify_summary: None,
             },
             processes: Vec::new(),
             entries: Vec::new(),
@@ -400,6 +408,30 @@ fn seed() -> State {
         }
         attempts.push(a);
     }
+    let verifications = [
+        ("task-header", VerifyState::Running, 0, None),
+        (
+            "task-images",
+            VerifyState::Passed,
+            0,
+            Some("Tests: 42 passed, 42 total\n"),
+        ),
+        ("task-forms", VerifyState::Failed, 1, Some(VERIFY_FAILED)),
+    ];
+    for (id, state, fixes, summary) in verifications {
+        let Some(task) = board::task(id) else {
+            continue;
+        };
+        let mut a = Attempt::new(&task, "main".into(), Fixture::Simple, merge);
+        a.open_turn(prompt_of(&task));
+        a.materialize(Fixture::Simple.steps());
+        a.close_turn(End::Completed);
+        a.view.verify_state = Some(state);
+        a.view.verify_head = Some(fake_sha());
+        a.view.verify_fixes = fixes;
+        a.view.verify_summary = summary.map(Into::into);
+        attempts.push(a);
+    }
     State {
         attempts,
         subs: HashMap::new(),
@@ -499,6 +531,12 @@ pub fn decorate(card: &mut TaskCard) {
         card.last_status = last.map(|p| p.status);
         card.last_stop_reason = last.and_then(|p| p.stop_reason);
         card.worktree_state = Some(a.view.worktree_state);
+        if a.view.state == AttemptState::Active {
+            // No verifier here: a `running` one stands for the live one.
+            card.verifying = a.view.verify_state == Some(VerifyState::Running);
+            card.verify_state = a.view.verify_state;
+            card.verify_fixes = a.view.verify_fixes;
+        }
     });
 }
 

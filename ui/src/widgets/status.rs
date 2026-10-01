@@ -3,7 +3,8 @@
 //! topbar and of the board toolbar. Class strings are whole literals so that Tailwind's
 //! scanner sees them.
 
-use atm_types::{AttemptState, ProcessStatus, TaskCard, TaskStatus};
+use atm_types::{AttemptState, ProcessStatus, TaskCard, TaskStatus, VerifyState};
+use icons::LoaderCircle;
 use leptos::prelude::*;
 
 use crate::views::board::interrupted_by_app;
@@ -90,6 +91,32 @@ pub fn agent_state(card: &TaskCard) -> Option<(&'static str, Status)> {
     }
 }
 
+/// The autopilot's verification of the active attempt (spec A3) as its badge label, colour
+/// and `data-verify`; `max_fixes` is the project's `autopilot_max_fixes`.
+pub fn verify_state(card: &TaskCard, max_fixes: u32) -> Option<(String, Status, &'static str)> {
+    if card.verifying {
+        return Some(("Verifica…".into(), Status::Running, "running"));
+    }
+    Some(match card.verify_state? {
+        VerifyState::Running => ("Verifica…".into(), Status::Running, "running"),
+        VerifyState::Passed => ("Verificato".into(), Status::Done, "passed"),
+        VerifyState::Failed => (
+            format!("Verifica fallita ({}/{max_fixes})", card.verify_fixes),
+            Status::Failed,
+            "failed",
+        ),
+        VerifyState::Error => ("Verifica non eseguita".into(), Status::Failed, "error"),
+    })
+}
+
+/// "In coda": a task given to the autopilot that waits in Da fare for a free slot or for
+/// its dependency (`after_id`).
+pub fn queued(card: &TaskCard) -> bool {
+    card.task.auto
+        && card.task.status == TaskStatus::Todo
+        && card.attempt_state != Some(AttemptState::Active)
+}
+
 /// Small round dot of `status`; `ping` adds the halo of the live states (hidden with
 /// reduced motion).
 #[component]
@@ -109,15 +136,25 @@ pub fn StatusDot(status: Status, #[prop(optional)] ping: bool) -> impl IntoView 
     }
 }
 
-/// Tinted badge of an agent state (see [`agent_state`]), with its dot.
+/// Tinted badge of an agent state (see [`agent_state`]), with its dot; `spin` shows a
+/// spinner instead (a verification in progress).
 #[component]
-pub fn AgentBadge(label: &'static str, status: Status) -> impl IntoView {
+pub fn AgentBadge(
+    #[prop(into)] label: String,
+    status: Status,
+    #[prop(optional)] spin: bool,
+) -> impl IntoView {
     view! {
         <span class=format!(
             "inline-flex h-5 items-center gap-1.5 rounded-md px-1.5 text-[11px] font-medium whitespace-nowrap {}",
             status.tint(),
         )>
-            <StatusDot status ping=status.pings() />
+            {if spin {
+                view! { <LoaderCircle class="size-3 animate-spin motion-reduce:animate-none" attr:aria-hidden="true" /> }
+                    .into_any()
+            } else {
+                view! { <StatusDot status ping=status.pings() /> }.into_any()
+            }}
             {label}
         </span>
     }
@@ -155,6 +192,8 @@ mod tests {
                 created_at: 0,
                 updated_at: 0,
                 parent_id: None,
+                auto: false,
+                after_id: None,
             },
             attempt_id: Some("a".into()),
             attempt_state: Some(AttemptState::Active),
@@ -166,6 +205,9 @@ mod tests {
             worktree_state: Some(WorktreeState::Present),
             subtasks_done: 0,
             subtasks_total: 0,
+            verifying: false,
+            verify_state: None,
+            verify_fixes: 0,
         }
     }
 
@@ -208,5 +250,32 @@ mod tests {
         assert_eq!(merged, Some(("Mergiato", Status::Done)));
         let discarded = state(|c| c.attempt_state = Some(AttemptState::Discarded));
         assert_eq!(discarded, Some(("Scartato", Status::Cancelled)));
+    }
+
+    #[test]
+    fn verification_and_queue_follow_the_card() {
+        let verify = |f: fn(&mut TaskCard)| {
+            let mut c = card();
+            f(&mut c);
+            verify_state(&c, 2).map(|(label, _, name)| (label, name))
+        };
+        assert_eq!(verify(|_| {}), None);
+        let live = verify(|c| c.verifying = true);
+        assert_eq!(live, Some(("Verifica…".into(), "running")));
+        let passed = verify(|c| c.verify_state = Some(VerifyState::Passed));
+        assert_eq!(passed, Some(("Verificato".into(), "passed")));
+        let failed = verify(|c| {
+            c.verify_state = Some(VerifyState::Failed);
+            c.verify_fixes = 1;
+        });
+        assert_eq!(failed, Some(("Verifica fallita (1/2)".into(), "failed")));
+
+        let mut c = card();
+        assert!(!queued(&c));
+        c.task.auto = true;
+        c.task.status = TaskStatus::Todo;
+        assert!(!queued(&c), "an active attempt is not queued");
+        c.attempt_state = None;
+        assert!(queued(&c));
     }
 }

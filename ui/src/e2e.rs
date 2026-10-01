@@ -14,8 +14,8 @@
 //!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
 //!   the security confirmations, then the feature round's checks (the task list view on main,
-//!   attachments, sub-agent limits, sub-tasks and the agents' board tools on a scratch
-//!   project, whose removal from the sidebar menu comes last) and the report on stdout; the
+//!   attachments, sub-agent limits, sub-tasks, the agents' board tools and the Autopilota on a
+//!   scratch project, whose removal from the sidebar menu comes last) and the report on stdout; the
 //!   app then exits through `app.exit` (`ExitRequested`) during one more `[fake:hang_ignore]`
 //!   turn, which the script checks afterwards;
 //! - phase 3 (M6, also alone with `scripts/e2e.sh --perf`): `[fake:flood]` on three concurrent
@@ -42,7 +42,8 @@ use atm_types::{
     AttemptIdReq, AttemptState, CONTINUE_PROMPT, ConfigPolicy, Empty, Entry, EntryBody, ErrorCode,
     FileStatus, GetBoard, GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq,
     GetProjectOverview, GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, Project,
-    ProjectIdReq, StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, WorktreeState,
+    ProjectIdReq, StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, VerifyState,
+    WorktreeState,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use leptos::prelude::*;
@@ -129,6 +130,13 @@ const CHILD_TITLE: &str = "Figlio dal pannello";
 /// fake-claude's `board_tools`).
 const BOARD_TITLE: &str = "Riorganizza [fake:board_tools]";
 const BOARD_CHILD: &str = "Sotto task dal fake";
+/// The scratch project's verification command (round 2026-10-01): it fails until a fix
+/// follow-up of `[fake:fix_on_resume]` writes `fixed.txt`.
+const VERIFY_COMMAND: &str = "test -f fixed.txt";
+/// The autopilot's task fixed after its first verification, then merged on its own.
+const AUTO_TITLE: &str = "Verifica e correggi [fake:fix_on_resume]";
+/// Two autopilot tasks, the second «Parte dopo…» the first, with Agenti in parallelo = 1.
+const AFTER_TITLES: [&str; 2] = ["Primo in coda [fake:append]", "Dopo il primo [fake:append]"];
 /// The `--disallowedTools` of a turn that may start no sub-agent (none allowed, or none left).
 const NO_SUBAGENTS: &str = "--disallowedTools=AskUserQuestion,Agent,Task,Workflow";
 /// Default wait of a UI reaction.
@@ -382,6 +390,11 @@ async fn phase2(run: &mut Run) -> R<Next> {
     run.check("board_tools_agent", r)?;
     let r = subtask_cascade(&scratch).await;
     run.check("subtask_cascade", r)?;
+    // Round 2026-10-01, on the scratch project too: the Autopilota.
+    let r = autopilot_fix_and_merge(run, &scratch).await;
+    run.check("autopilot_fix_and_merge", r)?;
+    let r = autopilot_after(&scratch).await;
+    run.check("autopilot_after", r)?;
     let r = project_removal(&scratch).await;
     run.check("project_removal", r)?;
     let r = only_expected_failures(&EXPECTED_FAILURES_PHASE2).await;
@@ -2743,6 +2756,191 @@ async fn subtask_cascade(scratch: &Scratch) -> R<String> {
     ))
 }
 
+/// Round 2026-10-01 on the scratch project: the topbar's «Autopilota» turns it on
+/// (`aria-pressed`), and its Impostazioni, whose checkbox follows the toggle, set the
+/// verification command [`VERIFY_COMMAND`] and «Merge automatico se verificato» (2 fixes, the
+/// default). A task created with «Affida all'autopilota» ([`AUTO_TITLE`]) starts with no Avvia;
+/// its first verification fails («Verifica fallita (1/2)» on the card), the autopilot's
+/// follow-up (`--resume`, its prompt names the command and how it ended) writes `fixed.txt`,
+/// the second verification passes and the task is merged on its own: Fatto, the squash commit
+/// on the target, the closed attempt verified after 1 fix. The notifications go to the run's
+/// `notify.jsonl` (`CoreConfig::notify_log`), never to `osascript`.
+async fn autopilot_fix_and_merge(run: &Run, scratch: &Scratch) -> R<String> {
+    let notify_log = format!("{}/notify.jsonl", run.setup.dir);
+    if exists(&notify_log).await? {
+        return Err("a notification before the autopilot was on".into());
+    }
+    select_tasks(SCRATCH).await?;
+    let toggle = wait_q("[data-action=toggle-autopilot][aria-pressed=false]").await?;
+    click(&toggle);
+    wait_q("[data-action=toggle-autopilot][aria-pressed=true]").await?;
+    click(&wait_q("[data-project-view=settings]").await?);
+    let page = until("Autopilota attivo in the project settings", UI, || {
+        q("[data-testid=project-settings]")
+            .filter(|p| find_in(p, "#project-autopilot").is_some_and(|c| checked(&c)))
+    })
+    .await?;
+    let field = |sel: &str| find_in(&page, sel).ok_or(format!("no {sel}"));
+    set_value(&field("#project-verify-command")?, VERIFY_COMMAND)?;
+    let merge = field("#project-autopilot-merge")?;
+    if !checked(&merge) {
+        click(&merge);
+    }
+    let fixes = field("#project-max-fixes")?;
+    let fixes = Reflect::get(&fixes, &"value".into())
+        .ok()
+        .and_then(|v| v.as_string());
+    if fixes.as_deref() != Some("2") {
+        return Err(format!("Tentativi di correzione {fixes:?}"));
+    }
+    let since = last_toast();
+    click(&field("[data-action=save-autopilot]")?);
+    toast_after(since, "autopilot saved", |t| {
+        t.contains("Autopilota aggiornato")
+    })
+    .await?;
+    let p = project_named(SCRATCH).await?;
+    if !p.autopilot
+        || !p.autopilot_merge
+        || p.verify_command.as_deref() != Some(VERIFY_COMMAND)
+        || p.autopilot_max_fixes != 2
+    {
+        return Err(format!("project after the save {p:?}"));
+    }
+
+    select_tasks(SCRATCH).await?;
+    let task = create_auto_task(AUTO_TITLE, None).await?;
+    let attempt = until_async("the autopilot's start", TURN, || {
+        let task = task.clone();
+        async move {
+            let d = detail(&task).await.ok()?;
+            d.attempt.or_else(|| d.closed_attempts.first().cloned())
+        }
+    })
+    .await?;
+    if open_dialog("StartDialog").is_some() || !detail(&task).await?.task.auto {
+        return Err("not started by the autopilot".into());
+    }
+    until("«Verifica fallita (1/2)» on the card", TURN, || {
+        find_in(&card(&task)?, "[data-verify=failed]")
+            .filter(|b| text(b).contains("Verifica fallita (1/2)"))
+    })
+    .await?;
+    until("merged on its own", 2 * TURN, || {
+        (column_of(&task)? == "done").then_some(())
+    })
+    .await?;
+    let merged = closed_in_db(&task, &attempt.id, AttemptState::Merged, TaskStatus::Done).await?;
+    if merged.verify_state != Some(VerifyState::Passed) || merged.verify_fixes != 1 {
+        return Err(format!(
+            "verification {:?} after {} fixes",
+            merged.verify_state, merged.verify_fixes
+        ));
+    }
+    let log = git(
+        &scratch.repo,
+        &["log", "-1", "--format=%H%n%s", &merged.target_branch],
+    )
+    .await?;
+    let mut lines = log.stdout.lines();
+    let (head, subject) = (lines.next().unwrap_or(""), lines.next().unwrap_or(""));
+    if merged.merge_commit.as_deref() != Some(head) || subject != AUTO_TITLE {
+        return Err(format!(
+            "{} log {:?}, merge_commit {:?}",
+            merged.target_branch, log.stdout, merged.merge_commit
+        ));
+    }
+    let turns = records("turn").await?;
+    let played: Vec<(bool, String)> = call_records_in(&attempt.worktree_path)
+        .await?
+        .iter()
+        .map(|c| {
+            let argv: Vec<String> = serde_json::from_value(c["argv"].clone()).unwrap_or_default();
+            let prompt = turns
+                .iter()
+                .find(|t| t["pid"] == c["pid"])
+                .and_then(|t| t["prompt"].as_str())
+                .unwrap_or_default();
+            (flag(&argv, "--resume").is_some(), prompt.to_owned())
+        })
+        .collect();
+    let fix = format!("The project's verification command `{VERIFY_COMMAND}` exited with code 1");
+    match played.as_slice() {
+        [(false, first), (true, second)]
+            if first.contains(AUTO_TITLE) && second.starts_with(&fix) => {}
+        _ => return Err(format!("turns (resumed, prompt) {played:?}")),
+    }
+    if !exists(&notify_log).await? {
+        return Err(format!("no notification in {notify_log}"));
+    }
+    Ok(format!(
+        "topbar Autopilota → aria-pressed=true, the settings' checkbox follows; «{VERIFY_COMMAND}» \
+         + Merge automatico saved; «{AUTO_TITLE}» started with no Avvia, «Verifica fallita \
+         (1/2)» on its card, follow-up --resume with the fix prompt, verified (1 fix) and merged \
+         on its own: Fatto, {head} «{subject}» on {}; notifications in notify.jsonl",
+        merged.target_branch
+    ))
+}
+
+/// With Agenti in parallelo = 1 (2 again afterwards), two tasks given to the autopilot from
+/// the dialog, the second «Parte dopo…» the first ([`AFTER_TITLES`]; `fixed.txt` is on the
+/// target now, so each verification passes at once): the second waits in Da fare with «In
+/// coda» («Parte dopo «…»») and starts only once the first is merged (Fatto), then is merged
+/// too, on top of it.
+async fn autopilot_after(scratch: &Scratch) -> R<String> {
+    set_max_running(1).await?;
+    select_tasks(SCRATCH).await?;
+    let first = create_auto_task(AFTER_TITLES[0], None).await?;
+    let second = create_auto_task(AFTER_TITLES[1], Some(&first)).await?;
+    let task = detail(&second).await?.task;
+    if !task.auto || task.after_id.as_deref() != Some(first.as_str()) {
+        return Err(format!("second task {task:?}"));
+    }
+    let reason = until("«In coda» on the second card", UI, || {
+        find_in(&card(&second)?, "[data-queued]")?.get_attribute("title")
+    })
+    .await?;
+    if reason != format!("Parte dopo «{}»", AFTER_TITLES[0]) {
+        return Err(format!("«In coda» says {reason:?}"));
+    }
+    let (status, started) = until_async("the second task's start", 3 * TURN, || {
+        let (first, second) = (first.clone(), second.clone());
+        async move {
+            let d = detail(&second).await.ok()?;
+            let attempt = d.attempt.or_else(|| d.closed_attempts.first().cloned())?;
+            Some((detail(&first).await.ok()?.task.status, attempt))
+        }
+    })
+    .await?;
+    if status != TaskStatus::Done {
+        return Err(format!("the second started with the first {status:?}"));
+    }
+    until("the second merged", 2 * TURN, || {
+        (column_of(&second)? == "done").then_some(())
+    })
+    .await?;
+    closed_in_db(&second, &started.id, AttemptState::Merged, TaskStatus::Done).await?;
+    // The target's last two commits (the debug helper takes `-1` only).
+    let mut subjects = Vec::new();
+    for rev in [
+        started.target_branch.clone(),
+        format!("{}~1", started.target_branch),
+    ] {
+        let log = git(&scratch.repo, &["log", "-1", "--format=%s", &rev]).await?;
+        subjects.push(log.stdout.trim().to_owned());
+    }
+    if subjects != [AFTER_TITLES[1], AFTER_TITLES[0]] {
+        return Err(format!("{} log {subjects:?}", started.target_branch));
+    }
+    set_max_running(2).await?;
+    select_tasks(SCRATCH).await?;
+    Ok(format!(
+        "Agenti in parallelo 1: «{}» «In coda» ({reason}) while the first ran, started once it \
+         was Fatto; both merged in order on {}",
+        AFTER_TITLES[1], started.target_branch
+    ))
+}
+
 /// F1: the scratch project is removed from its sidebar menu while main stays selected. A
 /// right click (a synthetic `contextmenu`: the page prevents the native menu) opens the menu
 /// on it, a pointerdown outside closes it; opened again, "Rimuovi dalla lista…" asks with
@@ -2911,6 +3109,32 @@ async fn create_task_with(
             find_in(&dialog, &format!("[data-attachment=\"{name}\"]"))
         })
         .await?;
+    }
+    let create = until("Crea task enabled", UI, || {
+        button_in(&dialog, "Crea task").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&create);
+    until("task dialog closed", UI, || {
+        open_dialog("TaskDialog").is_none().then_some(())
+    })
+    .await?;
+    new_card(&before, title).await
+}
+
+/// TaskDialog from Da fare's "+" with «Affida all'autopilota» checked and «Parte dopo…» `after`
+/// when given; returns the new card's id.
+async fn create_auto_task(title: &str, after: Option<&str>) -> R<String> {
+    let before = card_ids();
+    click(&wait_q("button[aria-label=\"Nuovo task in Da fare\"]").await?);
+    let dialog = until("task dialog", UI, || open_dialog("TaskDialog")).await?;
+    set_value(&find_in(&dialog, "#task-title").ok_or("no title")?, title)?;
+    click(&find_in(&dialog, "#task-auto[data-auto-toggle]").ok_or("no Affida all'autopilota")?);
+    if let Some(after) = after {
+        set_select(
+            &find_in(&dialog, "[data-after] select").ok_or("no Parte dopo…")?,
+            after,
+        )?;
     }
     let create = until("Crea task enabled", UI, || {
         button_in(&dialog, "Crea task").filter(|b| !b.has_attribute("disabled"))
@@ -3422,6 +3646,13 @@ fn elements(list: Option<web_sys::NodeList>) -> Vec<Element> {
 
 fn text(el: &Element) -> String {
     el.text_content().unwrap_or_default()
+}
+
+fn checked(el: &Element) -> bool {
+    Reflect::get(el, &"checked".into())
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn button_in(root: &Element, label: &str) -> Option<Element> {

@@ -12,6 +12,9 @@
 //! - `projects=0`: no projects ("Aggiungi repository" cycles through a fixed list of folders);
 //! - `badges=0`: no demo attempt fields on the cards `attempt.rs` knows nothing about (by
 //!   default they show every agent state: waiting, failed, interrupted, ready, closed).
+//!
+//! `sito-web` has the Autopilota on (`npm test`): its tasks are all given to it, two queued
+//! (one after a task still in review), the others verifying, verified and failed (1/2).
 
 use std::cell::RefCell;
 
@@ -305,6 +308,30 @@ fn update_project(req: UpdateProjectReq) -> Result<Project, AppError> {
             req.default_target_branch
         )));
     }
+    let verify_command = req
+        .verify_command
+        .map(|c| c.trim().to_owned())
+        .filter(|c| !c.is_empty());
+    if verify_command
+        .as_ref()
+        .is_some_and(|c| c.chars().count() > MAX_VERIFY_COMMAND)
+    {
+        return Err(AppError::invalid(format!(
+            "Il comando di verifica può avere al massimo {MAX_VERIFY_COMMAND} caratteri"
+        )));
+    }
+    if !VERIFY_TIMEOUT_SECS.contains(&req.verify_timeout_secs) {
+        return Err(AppError::invalid(format!(
+            "Il timeout della verifica va da {} a {} secondi",
+            VERIFY_TIMEOUT_SECS.start(),
+            VERIFY_TIMEOUT_SECS.end()
+        )));
+    }
+    if req.autopilot_max_fixes > MAX_AUTOPILOT_FIXES {
+        return Err(AppError::invalid(format!(
+            "I tentativi di correzione vanno da 0 a {MAX_AUTOPILOT_FIXES}"
+        )));
+    }
     let project = with(|m| {
         let p = m.project_mut(&req.id)?;
         if req.default_permission_mode == PermissionMode::BypassPermissions && !p.allow_bypass {
@@ -317,6 +344,11 @@ fn update_project(req: UpdateProjectReq) -> Result<Project, AppError> {
         p.default_target_branch = req.default_target_branch;
         p.default_permission_mode = req.default_permission_mode;
         p.default_model = req.default_model;
+        p.autopilot = req.autopilot;
+        p.autopilot_merge = req.autopilot_merge;
+        p.verify_command = verify_command;
+        p.verify_timeout_secs = req.verify_timeout_secs;
+        p.autopilot_max_fixes = req.autopilot_max_fixes;
         p.updated_at = super::now_ms();
         Ok(p.clone())
     })?;
@@ -420,6 +452,8 @@ fn create_task(req: CreateTaskReq) -> Result<TaskCard, AppError> {
             created_at: now,
             updated_at: now,
             parent_id: req.parent_id.clone(),
+            auto: req.auto,
+            after_id: req.after_id.clone(),
         });
         move_to(&mut m.tasks, &id, status, None);
         m.task_mut(&id).cloned()
@@ -434,6 +468,12 @@ fn update_task(req: UpdateTaskReq) -> Result<TaskCard, AppError> {
         let t = m.task_mut(&req.id)?;
         t.title = title;
         t.description = description;
+        if let Some(auto) = req.auto {
+            t.auto = auto;
+        }
+        if let Some(after_id) = req.after_id {
+            t.after_id = after_id;
+        }
         t.updated_at = super::now_ms();
         Ok::<_, AppError>(t.clone())
     })?;
@@ -675,10 +715,15 @@ fn project(id: &str, name: &str, repo_path: &str) -> Project {
         created_at: now,
         updated_at: now,
         trust_error: None,
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     }
 }
 
-/// Two projects; the M1 ids (`task-todo`, `task-inprogress`, `task-inreview`, `task-done`)
+/// Two projects, the second with the Autopilota; the M1 ids (`task-todo`, `task-inprogress`, `task-inreview`, `task-done`)
 /// are kept for `attempt.rs` and `/?task=<id>`; `task-pagination` has three sub-tasks. Tasks
 /// were created over the last days, the first listed the oldest, and updated some hours later.
 fn seed_board() -> (Vec<Project>, Vec<Task>) {
@@ -718,8 +763,12 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
         ),
         ("task-pagination-tests", "Test della paginazione", Todo),
     ];
+    // All given to the autopilot (`attempt.rs` seeds their verifications).
     let web: &[(&str, &str, TaskStatus)] = &[
         ("task-contacts", "Nuova pagina contatti", Todo),
+        ("task-sitemap", "Genera la sitemap", Todo),
+        ("task-header", "Header responsive", InReview),
+        ("task-forms", "Valida i form di contatto", InReview),
         ("task-images", "Ottimizza le immagini", InReview),
     ];
     let projects = vec![
@@ -727,7 +776,11 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
             description: "Servizio di esempio del mock: API REST con parser e lista utenti.".into(),
             ..project(PROJECT_ID, "demo", "/Users/demo/demo")
         },
-        project("project-web", "sito-web", "/Users/demo/Progetti/sito-web"),
+        Project {
+            autopilot: true,
+            verify_command: Some("npm test".into()),
+            ..project("project-web", "sito-web", "/Users/demo/Progetti/sito-web")
+        },
     ];
     const HOUR: Millis = 3_600_000;
     let now = super::now_ms();
@@ -750,6 +803,9 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
                 created_at,
                 updated_at: created_at + (tasks.len() as Millis % 4 + 1) * HOUR,
                 parent_id: parent.map(Into::into),
+                auto: project_id == "project-web",
+                // Queued behind the header, still in review.
+                after_id: (id == "task-contacts").then(|| "task-header".into()),
             });
             move_to(&mut tasks, id, status, None);
         }
@@ -796,6 +852,9 @@ fn card(task: Task) -> TaskCard {
         worktree_state: None,
         subtasks_done,
         subtasks_total,
+        verifying: false,
+        verify_state: None,
+        verify_fixes: 0,
     };
     super::attempt::decorate(&mut card);
     if card.attempt_id.is_none() && FLAGS.with(|f| f.badges) {
@@ -853,14 +912,6 @@ fn demo_badges(card: &mut TaskCard) {
             Completed,
             None,
             WorktreeState::Removed,
-            false,
-            0,
-        ),
-        "task-images" => (
-            AttemptState::Active,
-            Completed,
-            None,
-            WorktreeState::Present,
             false,
             0,
         ),

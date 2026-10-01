@@ -13,7 +13,9 @@ expression: board
       "position": 1024.0,
       "created_at": 1700000000000,
       "updated_at": 1700000000000,
-      "parent_id": null
+      "parent_id": null,
+      "auto": false,
+      "after_id": null
     },
     "attempt_id": null,
     "attempt_state": null,
@@ -24,7 +26,10 @@ expression: board
     "last_stop_reason": null,
     "worktree_state": null,
     "subtasks_done": 0,
-    "subtasks_total": 0
+    "subtasks_total": 0,
+    "verifying": false,
+    "verify_state": null,
+    "verify_fixes": 0
   },
   {
     "task": {
@@ -36,7 +41,9 @@ expression: board
       "position": 1024.0,
       "created_at": 1700000000000,
       "updated_at": 1700000000002,
-      "parent_id": null
+      "parent_id": null,
+      "auto": false,
+      "after_id": null
     },
     "attempt_id": "a-run",
     "attempt_state": "active",
@@ -47,7 +54,10 @@ expression: board
     "last_stop_reason": null,
     "worktree_state": "present",
     "subtasks_done": 0,
-    "subtasks_total": 0
+    "subtasks_total": 0,
+    "verifying": false,
+    "verify_state": null,
+    "verify_fixes": 0
   },
   {
     "task": {
@@ -59,7 +69,9 @@ expression: board
       "position": 1024.0,
       "created_at": 1700000000000,
       "updated_at": 1700000000031,
-      "parent_id": null
+      "parent_id": null,
+      "auto": false,
+      "after_id": null
     },
     "attempt_id": "a-act",
     "attempt_state": "active",
@@ -70,7 +82,10 @@ expression: board
     "last_stop_reason": null,
     "worktree_state": "present",
     "subtasks_done": 0,
-    "subtasks_total": 0
+    "subtasks_total": 0,
+    "verifying": false,
+    "verify_state": null,
+    "verify_fixes": 0
   },
   {
     "task": {
@@ -82,7 +97,9 @@ expression: board
       "position": 2048.0,
       "created_at": 1700000000000,
       "updated_at": 1700000000040,
-      "parent_id": null
+      "parent_id": null,
+      "auto": false,
+      "after_id": null
     },
     "attempt_id": "a-rst",
     "attempt_state": "active",
@@ -93,7 +110,10 @@ expression: board
     "last_stop_reason": "app_restart",
     "worktree_state": "present",
     "subtasks_done": 0,
-    "subtasks_total": 0
+    "subtasks_total": 0,
+    "verifying": false,
+    "verify_state": null,
+    "verify_fixes": 0
   },
   {
     "task": {
@@ -105,7 +125,9 @@ expression: board
       "position": 1024.0,
       "created_at": 1700000000000,
       "updated_at": 1700000000012,
-      "parent_id": null
+      "parent_id": null,
+      "auto": false,
+      "after_id": null
     },
     "attempt_id": "a-new",
     "attempt_state": "merged",
@@ -116,6 +138,9 @@ expression: board
     "last_stop_reason": null,
     "worktree_state": "removed",
     "subtasks_done": 0,
-    "subtasks_total": 0
+    "subtasks_total": 0,
+    "verifying": false,
+    "verify_state": null,
+    "verify_fixes": 0
   }
 ]

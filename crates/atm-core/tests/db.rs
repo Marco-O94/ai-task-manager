@@ -13,7 +13,8 @@ use atm_core::db::{
 use atm_types::{
     AppError, AttemptState, ConfigPolicy, CreateTaskReq, Effort, Entry, EntryBody, EntryPage,
     ErrorCode, MAX_ATTACHMENTS_PER_TASK, MAX_PROJECT_DESCRIPTION, PermissionMode, ProcessStatus,
-    Settings, StopReason, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq, WorktreeState,
+    Settings, StopReason, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq, VerifyState,
+    WorktreeState,
 };
 use rusqlite::{Connection, ffi};
 
@@ -35,6 +36,11 @@ fn project(id: &str, name: &str) -> ProjectRow {
         allow_bypass: false,
         created_at: NOW,
         updated_at: NOW,
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     }
 }
 
@@ -45,6 +51,8 @@ fn new_task(project_id: &str, title: &str, status: Option<TaskStatus>) -> Create
         description: String::new(),
         status,
         parent_id: None,
+        auto: false,
+        after_id: None,
     }
 }
 
@@ -72,6 +80,10 @@ fn attempt(id: &str, task_id: &str, created_at: i64) -> AttemptRow {
         created_at,
         updated_at: created_at,
         closed_at: None,
+        verify_state: None,
+        verify_head: None,
+        verify_fixes: 0,
+        verify_summary: None,
     }
 }
 
@@ -355,6 +367,11 @@ fn migrates_a_v1_database_with_rows_to_v2() {
         default_permission_mode: PermissionMode::AcceptEdits,
         default_model: None,
         description: "Ora descritto".into(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     assert_eq!(
         db.update_project(&req, NOW).unwrap().description,
@@ -428,6 +445,240 @@ fn migrates_a_v2_database_with_rows_to_v3() {
     let card = db.task_card("t").unwrap();
     assert_eq!((card.subtasks_done, card.subtasks_total), (1, 1));
     assert_eq!(db.task_children("t").unwrap(), ["c"]);
+}
+
+/// A database of the third schema with rows migrates to the fourth: the rows are kept with the
+/// autopilot off and the documented defaults, no attempt was verified, and the new columns'
+/// CHECKs and `after_id`'s `ON DELETE SET NULL` hold.
+#[test]
+fn migrates_a_v3_database_with_rows_to_v4() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atm.sqlite3");
+    {
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch(db::PRAGMAS).unwrap();
+        let tx = c.transaction().unwrap();
+        for sql in &MIGRATIONS[..3] {
+            tx.execute_batch(sql).unwrap();
+        }
+        tx.pragma_update(None, "user_version", 3).unwrap();
+        tx.commit().unwrap();
+        c.execute_batch(
+            "INSERT INTO projects (id, name, repo_path, default_target_branch, created_at,
+                updated_at)
+                VALUES ('p', 'Vecchio', '/r', 'main', 1, 2);
+             INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at)
+                VALUES ('t', 'p', 'T', 'inreview', 1024, 0, 0);
+             INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at,
+                parent_id)
+                VALUES ('s', 'p', 'S', 'todo', 1024, 0, 0, 't');",
+        )
+        .unwrap();
+        raw_attempt(&c, "a", "active").unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let version: i64 = Connection::open(&path)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, MIGRATIONS.len() as i64);
+    let p = db.project("p").unwrap();
+    assert_eq!(
+        (
+            p.autopilot,
+            p.autopilot_merge,
+            p.verify_command,
+            p.verify_timeout_secs,
+            p.autopilot_max_fixes
+        ),
+        (false, false, None, 600, 2)
+    );
+    let s = db.task("s").unwrap();
+    assert_eq!(
+        (s.auto, s.after_id, s.parent_id.as_deref()),
+        (false, None, Some("t"))
+    );
+    let a = db.attempt("a").unwrap();
+    assert_eq!(
+        (
+            a.verify_state,
+            a.verify_head,
+            a.verify_fixes,
+            a.verify_summary
+        ),
+        (None, None, 0, None)
+    );
+    let card = db.task_card("t").unwrap();
+    assert_eq!(
+        (card.verify_state, card.verify_fixes, card.verifying),
+        (None, 0, false)
+    );
+
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch(db::PRAGMAS).unwrap();
+    for bad in [
+        "UPDATE projects SET verify_timeout_secs = 9",
+        "UPDATE projects SET verify_timeout_secs = 3601",
+        "UPDATE projects SET autopilot_max_fixes = 6",
+        "UPDATE projects SET verify_command = ''",
+        "UPDATE projects SET autopilot = 2",
+        "UPDATE tasks SET auto = 2",
+        "UPDATE attempts SET verify_state = 'done'",
+        "UPDATE attempts SET verify_fixes = -1",
+    ] {
+        let e = c.execute(bad, []).unwrap_err();
+        assert_eq!(
+            e.sqlite_error().unwrap().extended_code,
+            ffi::SQLITE_CONSTRAINT_CHECK,
+            "{bad}"
+        );
+    }
+    c.execute("UPDATE tasks SET after_id = 't' WHERE id = 's'", [])
+        .unwrap();
+    assert_eq!(db.task("s").unwrap().after_id.as_deref(), Some("t"));
+    c.execute("UPDATE tasks SET parent_id = NULL WHERE id = 's'", [])
+        .unwrap();
+    db.delete_task("t").unwrap();
+    assert_eq!(db.task("s").unwrap().after_id, None);
+}
+
+/// The scheduler's queue: auto, todo, no active attempt, dependency done (or none), parent not
+/// cancelled, this project only, in position order.
+#[test]
+fn autopilot_candidates_follow_the_rules() {
+    use TaskStatus::{Cancelled, Done, InReview, Todo};
+    let db = Db::open_in_memory().unwrap();
+    db.insert_project(&project("p", "Progetto")).unwrap();
+    db.insert_project(&project("q", "Altro")).unwrap();
+    let add = |id: &str, project: &str, status, auto, after: Option<&str>, parent: Option<&str>| {
+        let req = CreateTaskReq {
+            auto,
+            after_id: after.map(Into::into),
+            parent_id: parent.map(Into::into),
+            ..new_task(project, id, Some(status))
+        };
+        db.insert_task(id, &req, NOW).unwrap();
+    };
+    add("open", "p", Todo, true, None, None);
+    add("manual", "p", Todo, false, None, None);
+    add("waits", "p", Todo, true, Some("open"), None);
+    add("dep", "p", Done, false, None, None);
+    add("ready", "p", Todo, true, Some("dep"), None);
+    add("review", "p", InReview, true, None, None);
+    add("dead", "p", Cancelled, false, None, None);
+    add("orphaned", "p", Todo, true, None, Some("dead"));
+    add("child", "p", Todo, true, None, Some("dep"));
+    add("busy", "p", Todo, true, None, None);
+    add("elsewhere", "q", Todo, true, None, None);
+    db.begin_attempt(&attempt("a", "busy", NOW), &process("r", "a", 1, "i"), NOW)
+        .unwrap();
+    db.set_task_status("busy", Todo, NOW).unwrap();
+
+    let ids = |project| -> Vec<String> {
+        db.autopilot_candidates(project)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
+    };
+    assert_eq!(ids("p"), ["open", "ready", "child"]);
+    assert_eq!(ids("q"), ["elsewhere"]);
+
+    db.set_task_status("open", Done, NOW).unwrap();
+    db.set_task_auto("ready", false, NOW).unwrap();
+    assert_eq!(ids("p"), ["waits", "child"]);
+    assert_eq!(
+        err(db.set_task_auto("nope", true, NOW)).code,
+        ErrorCode::NotFound
+    );
+}
+
+/// `update_task` changes `auto` and `after_id` only when asked; `Some(None)` clears the
+/// dependency, an unknown one is a missing reference.
+#[test]
+fn update_task_sets_auto_and_after_only_when_given() {
+    let db = seeded();
+    db.insert_task("d", &new_task("p", "Dipendenza", None), NOW)
+        .unwrap();
+    let update = |auto, after_id| UpdateTaskReq {
+        id: "t".into(),
+        title: "Task".into(),
+        description: String::new(),
+        auto,
+        after_id,
+    };
+    let t = db
+        .update_task(&update(Some(true), Some(Some("d".into()))), NOW)
+        .unwrap();
+    assert_eq!((t.auto, t.after_id.as_deref()), (true, Some("d")));
+    let t = db.update_task(&update(None, None), NOW).unwrap();
+    assert_eq!((t.auto, t.after_id.as_deref()), (true, Some("d")));
+    let t = db
+        .update_task(&update(Some(false), Some(None)), NOW)
+        .unwrap();
+    assert_eq!((t.auto, t.after_id), (false, None));
+    let e = err(db.update_task(&update(None, Some(Some("nope".into()))), NOW));
+    assert_eq!(e.code, ErrorCode::NotFound);
+}
+
+/// The verification columns: begin, finish with the summary and the commit, the fix counter,
+/// the active attempt's state on its card, and the startup recovery of a cut verification.
+#[test]
+fn verify_state_lifecycle() {
+    let db = with_attempt();
+    db.begin_verify("a1", "h1", NOW).unwrap();
+    let a = db.attempt("a1").unwrap();
+    assert_eq!(
+        (a.verify_state, a.verify_head.as_deref()),
+        (Some(VerifyState::Running), Some("h1"))
+    );
+    db.finish_verify("a1", VerifyState::Failed, Some("1 failed"), "h2", NOW)
+        .unwrap();
+    assert_eq!(db.add_verify_fix("a1", NOW).unwrap(), 1);
+    assert_eq!(db.add_verify_fix("a1", NOW).unwrap(), 2);
+    let a = db.attempt("a1").unwrap();
+    assert_eq!(
+        (
+            a.verify_state,
+            a.verify_head.as_deref(),
+            a.verify_summary.as_deref(),
+            a.verify_fixes
+        ),
+        (Some(VerifyState::Failed), Some("h2"), Some("1 failed"), 2)
+    );
+    let view = a.view(false, 0);
+    assert_eq!(
+        (view.verify_state, view.verify_fixes),
+        (Some(VerifyState::Failed), 2)
+    );
+    let card = db.task_card("t").unwrap();
+    assert_eq!(
+        (card.verify_state, card.verify_fixes),
+        (Some(VerifyState::Failed), 2)
+    );
+
+    db.begin_verify("a1", "h3", NOW).unwrap();
+    assert_eq!(db.attempt("a1").unwrap().verify_summary, None);
+    assert_eq!(db.mark_stale_verifies(NOW).unwrap(), ["a1"]);
+    assert_eq!(
+        db.attempt("a1").unwrap().verify_state,
+        Some(VerifyState::Error)
+    );
+    assert!(db.mark_stale_verifies(NOW).unwrap().is_empty());
+
+    // A closed attempt's verification is not the card's.
+    db.finish_discard("a1", NOW).unwrap();
+    let card = db.task_card("t").unwrap();
+    assert_eq!((card.verify_state, card.verify_fixes), (None, 0));
+
+    for missing in [
+        err(db.begin_verify("nope", "h", NOW)),
+        err(db.finish_verify("nope", VerifyState::Passed, None, "h", NOW)),
+        err(db.add_verify_fix("nope", NOW)),
+    ] {
+        assert_eq!(missing.code, ErrorCode::NotFound);
+    }
 }
 
 #[test]
@@ -516,6 +767,8 @@ fn check_constraints_reject_invalid_rows() {
         id: "t".into(),
         title: String::new(),
         description: String::new(),
+        auto: None,
+        after_id: None,
     };
     assert_eq!(err(db.update_task(&update, NOW)).code, ErrorCode::Invalid);
     assert_eq!(
@@ -899,6 +1152,11 @@ fn projects_are_stored_ordered_and_updated() {
         default_permission_mode: PermissionMode::Default,
         default_model: Some("opus".into()),
         description: "Il sito di prova".into(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     let p = db.update_project(&req, NOW + 1).unwrap();
     assert_eq!(p, db.project("a").unwrap());
@@ -984,6 +1242,11 @@ fn projects_are_stored_ordered_and_updated() {
         default_permission_mode: PermissionMode::BypassPermissions,
         default_model: None,
         description: String::new(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     db.update_project(&bypass_default, NOW + 3).unwrap();
     let p = db
@@ -1208,6 +1471,8 @@ fn attempt_and_turn_lifecycle_drives_the_task_status() {
         id: "t".into(),
         title: "Nuovo titolo".into(),
         description: "Dettagli".into(),
+        auto: None,
+        after_id: None,
     };
     let t = db.update_task(&update, NOW + 60).unwrap();
     assert_eq!(
@@ -1296,6 +1561,7 @@ fn settings_default_and_round_trip() {
         worktree_root: "/Volumes/dev/worktrees".into(),
         editor_app: "Zed".into(),
         remove_worktree_after_merge: false,
+        notifications: false,
     };
     db.save_settings(&custom).unwrap();
     assert_eq!(db.settings().unwrap(), custom);

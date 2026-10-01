@@ -3427,6 +3427,7 @@ async fn overview_core(fx: &Fx, name: &str, home: &Path) -> (Core, Project) {
         path_env: std::env::var_os("PATH"),
         extra_env,
         open_log: None,
+        notify_log: None,
     };
     let core = Core::new(config, Arc::new(|_: AppEvent| {})).unwrap();
     let settings = Settings {

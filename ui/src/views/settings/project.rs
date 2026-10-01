@@ -1,11 +1,13 @@
 //! Project settings page, the project's "Impostazioni" tab (spec F2): name, description and
-//! defaults (`update_project`), security (`set_project_security`; the native confirmation is
+//! defaults, the Autopilota (both `update_project`, each with the other's fields as stored),
+//! security (`set_project_security`; the native confirmation is
 //! the shell's, M6) and "Rimuovi dalla lista…" (the sidebar's `RemoveProjectDialog`).
 
 use atm_types::{
-    AppError, ConfigPolicy, ListBranches, ListProjects, MAX_PROJECT_DESCRIPTION, PermissionMode,
-    Project, ProjectIdReq, SetProjectSecurity, SetProjectSecurityReq, UpdateProject,
-    UpdateProjectReq,
+    AppError, ConfigPolicy, ListBranches, ListProjects, MAX_AUTOPILOT_FIXES,
+    MAX_PROJECT_DESCRIPTION, MAX_VERIFY_COMMAND, PermissionMode, Project, ProjectIdReq,
+    SetProjectSecurity, SetProjectSecurityReq, UpdateProject, UpdateProjectReq,
+    VERIFY_TIMEOUT_SECS,
 };
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -15,7 +17,7 @@ use crate::app::{AppCtx, use_app};
 use crate::ipc;
 use crate::ui::button::{Button, ButtonSize, ButtonVariant};
 use crate::ui::callout::{Callout, CalloutVariant};
-use crate::ui::input::Input;
+use crate::ui::input::{Input, InputType};
 use crate::ui::textarea::Textarea;
 use crate::views::start_dialog::mode_help;
 
@@ -47,6 +49,11 @@ pub fn ProjectSettings() -> impl IntoView {
     let model = RwSignal::new(String::new());
     let policy = RwSignal::new(String::new());
     let allow_bypass = RwSignal::new(false);
+    let autopilot = RwSignal::new(false);
+    let autopilot_merge = RwSignal::new(false);
+    let verify_command = RwSignal::new(String::new());
+    let verify_timeout = RwSignal::new(String::new());
+    let max_fixes = RwSignal::new(String::new());
     // The trust in effect as the backend computes it (`Project::trusted`): `Some` only while
     // the saved policy is Trusted.
     let trust = RwSignal::new(None::<bool>);
@@ -62,6 +69,11 @@ pub fn ProjectSettings() -> impl IntoView {
         model.set(p.default_model.clone().unwrap_or_default());
         policy.set(p.config_policy.as_str().to_owned());
         allow_bypass.set(p.allow_bypass);
+        autopilot.set(p.autopilot);
+        autopilot_merge.set(p.autopilot_merge);
+        verify_command.set(p.verify_command.clone().unwrap_or_default());
+        verify_timeout.set(p.verify_timeout_secs.to_string());
+        max_fixes.set(p.autopilot_max_fixes.to_string());
         trust.set((p.config_policy == ConfigPolicy::Trusted).then_some(p.trusted));
         trust_error.set(p.trust_error.clone());
     };
@@ -111,21 +123,26 @@ pub fn ProjectSettings() -> impl IntoView {
     let description_len = Memo::new(move |_| description.with(|d| d.trim().chars().count()));
     let description_over = move || description_len.get() > MAX_PROJECT_DESCRIPTION;
 
+    // The topbar's toggle flips the stored `autopilot` while the page is shown.
+    let stored_autopilot = Memo::new(move |_| {
+        let id = ctx.project.get();
+        ctx.projects
+            .with(|ps| ps.iter().any(|p| Some(&p.id) == id.as_ref() && p.autopilot))
+    });
+    Effect::new(move |_| autopilot.set(stored_autopilot.get()));
+
     let save_defaults = move |_| {
-        let Some(id) = ctx.project.get_untracked() else {
+        let Some(mut req) = stored_req(ctx) else {
             return;
         };
-        let req = UpdateProjectReq {
-            id,
-            name: name.get_untracked().trim().to_owned(),
-            default_target_branch: branch.get_untracked(),
-            default_permission_mode: mode
-                .get_untracked()
-                .parse()
-                .unwrap_or(PermissionMode::AcceptEdits),
-            default_model: non_empty(model.get_untracked()),
-            description: description.get_untracked(),
-        };
+        req.name = name.get_untracked().trim().to_owned();
+        req.default_target_branch = branch.get_untracked();
+        req.default_permission_mode = mode
+            .get_untracked()
+            .parse()
+            .unwrap_or(PermissionMode::AcceptEdits);
+        req.default_model = non_empty(model.get_untracked());
+        req.description = description.get_untracked();
         run(
             ctx,
             busy,
@@ -134,6 +151,45 @@ pub fn ProjectSettings() -> impl IntoView {
             drop,
         );
     };
+    let save_autopilot = move |_| {
+        let Some(mut req) = stored_req(ctx) else {
+            return;
+        };
+        let Some(timeout) = verify_timeout
+            .get_untracked()
+            .trim()
+            .parse()
+            .ok()
+            .filter(|t| VERIFY_TIMEOUT_SECS.contains(t))
+        else {
+            ctx.toasts.error(format!(
+                "Il timeout della verifica va da {} a {} secondi",
+                VERIFY_TIMEOUT_SECS.start(),
+                VERIFY_TIMEOUT_SECS.end()
+            ));
+            return;
+        };
+        req.autopilot = autopilot.get_untracked();
+        req.autopilot_merge = autopilot_merge.get_untracked();
+        req.verify_command = non_empty(verify_command.get_untracked());
+        req.verify_timeout_secs = timeout;
+        req.autopilot_max_fixes = max_fixes
+            .get_untracked()
+            .parse()
+            .unwrap_or(req.autopilot_max_fixes);
+        run(
+            ctx,
+            busy,
+            "Autopilota aggiornato",
+            async move { ipc::call::<UpdateProject>(&req).await },
+            drop,
+        );
+    };
+    let command_len = Memo::new(move |_| verify_command.with(|c| c.trim().chars().count()));
+    let command_over = move || command_len.get() > MAX_VERIFY_COMMAND;
+    let fix_options: Vec<(String, String)> = (0..=MAX_AUTOPILOT_FIXES)
+        .map(|n| (n.to_string(), n.to_string()))
+        .collect();
     let save_security = move |_| {
         let Some(id) = ctx.project.get_untracked() else {
             return;
@@ -239,6 +295,60 @@ pub fn ProjectSettings() -> impl IntoView {
                 </div>
             </Section>
 
+            <Section
+                title="Autopilota"
+                description="Avvia da soli i task affidati, li verifica, rimanda gli errori all'agente e, se vuoi, fa il merge."
+            >
+                <Checkbox id="project-autopilot" checked=autopilot>
+                    "Autopilota attivo"
+                </Checkbox>
+                <Field
+                    id="project-verify-command"
+                    label="Comando di verifica"
+                    hint="Gira con /bin/sh nel worktree del task dopo ogni turno completato. Esegue codice del repository sul tuo Mac con i tuoi permessi. Vuoto: nessuna verifica, il turno completato conta come verificato."
+                >
+                    <Input
+                        id="project-verify-command"
+                        class="font-mono"
+                        bind_value=verify_command
+                        placeholder="cargo test"
+                        autocomplete="off"
+                    />
+                    <Show when=command_over>
+                        <p class="text-destructive text-xs" role="alert">
+                            {format!("Al massimo {MAX_VERIFY_COMMAND} caratteri.")}
+                        </p>
+                    </Show>
+                </Field>
+                <div class="grid grid-cols-2 gap-4">
+                    <Field id="project-verify-timeout" label="Timeout della verifica (secondi)">
+                        <Input
+                            id="project-verify-timeout"
+                            r#type=InputType::Number
+                            min=VERIFY_TIMEOUT_SECS.start().to_string()
+                            max=VERIFY_TIMEOUT_SECS.end().to_string()
+                            bind_value=verify_timeout
+                        />
+                    </Field>
+                    <Field id="project-max-fixes" label="Tentativi di correzione">
+                        <Select id="project-max-fixes" value=max_fixes options=fix_options />
+                    </Field>
+                </div>
+                <Checkbox id="project-autopilot-merge" checked=autopilot_merge>
+                    "Merge automatico se verificato"
+                </Checkbox>
+                <div class="flex justify-end">
+                    <Button
+                        size=ButtonSize::Sm
+                        attr:data-action="save-autopilot"
+                        attr:disabled=move || busy.get() || command_over()
+                        on:click=save_autopilot
+                    >
+                        "Salva l'autopilota"
+                    </Button>
+                </div>
+            </Section>
+
             <Section title="Sicurezza" description="Che cosa del repository caricano gli agenti.">
                 <Field
                     id="project-policy"
@@ -307,6 +417,28 @@ pub fn ProjectSettings() -> impl IntoView {
             </section>
         </div>
     }
+}
+
+/// `update_project` with the selected project's settings as stored: each section of the page
+/// (and the topbar's Autopilota toggle) overrides only its own fields.
+pub(crate) fn stored_req(ctx: AppCtx) -> Option<UpdateProjectReq> {
+    let id = ctx.project.get_untracked()?;
+    let p = ctx
+        .projects
+        .with_untracked(|ps| ps.iter().find(|p| p.id == id).cloned())?;
+    Some(UpdateProjectReq {
+        id: p.id,
+        name: p.name,
+        default_target_branch: p.default_target_branch,
+        default_permission_mode: p.default_permission_mode,
+        default_model: p.default_model,
+        description: p.description,
+        autopilot: p.autopilot,
+        autopilot_merge: p.autopilot_merge,
+        verify_command: p.verify_command,
+        verify_timeout_secs: p.verify_timeout_secs,
+        autopilot_max_fixes: p.autopilot_max_fixes,
+    })
 }
 
 /// A card of the page: title, one-line description, then its fields.

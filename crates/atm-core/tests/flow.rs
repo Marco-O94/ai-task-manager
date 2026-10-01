@@ -148,6 +148,7 @@ impl Flow {
             path_env: Some(std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into())),
             extra_env: env,
             open_log: None,
+            notify_log: Some(dir.path().join("notify.jsonl")),
         };
         let seen = Seen::new();
         let core = Core::new(config.clone(), seen.notify()).unwrap();
@@ -208,6 +209,8 @@ impl Flow {
             description: description.into(),
             status: None,
             parent_id: None,
+            auto: false,
+            after_id: None,
         };
         self.core.create_task(req).await.unwrap().task
     }
@@ -1055,6 +1058,11 @@ async fn bypass_needs_the_project_setting_and_the_env_is_scrubbed() {
         default_permission_mode: bypass,
         default_model: None,
         description: String::new(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     let err = f.core.update_project(update).await.unwrap_err();
     assert_eq!(err.code, ErrorCode::Invalid);
@@ -1093,6 +1101,11 @@ async fn bypass_needs_the_project_setting_and_the_env_is_scrubbed() {
         default_permission_mode: bypass,
         default_model: None,
         description: String::new(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     let project = f.core.update_project(update).await.unwrap();
     assert_eq!(project.default_permission_mode, bypass);
@@ -1506,6 +1519,7 @@ async fn open_calls_are_recorded_with_open_log() {
         path_env: Some(std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into())),
         extra_env: hermetic(&[]),
         open_log: Some(log.clone()),
+        notify_log: None,
     };
     let core = Core::new(config, Seen::new().notify()).unwrap();
     let req = OpenLoginTerminalReq {
@@ -1651,6 +1665,11 @@ fn seeded_db() -> (Arc<Db>, String) {
         allow_bypass: false,
         created_at: 0,
         updated_at: 0,
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     })
     .unwrap();
     let task = CreateTaskReq {
@@ -1659,6 +1678,8 @@ fn seeded_db() -> (Arc<Db>, String) {
         description: String::new(),
         status: None,
         parent_id: None,
+        auto: false,
+        after_id: None,
     };
     db.insert_task("t", &task, 0).unwrap();
     let attempt = AttemptRow {
@@ -1684,6 +1705,10 @@ fn seeded_db() -> (Arc<Db>, String) {
         created_at: 0,
         updated_at: 0,
         closed_at: None,
+        verify_state: None,
+        verify_head: None,
+        verify_fixes: 0,
+        verify_summary: None,
     };
     let process = ProcessRow {
         id: "pr".into(),
@@ -2688,6 +2713,11 @@ async fn project_names_have_no_hidden_characters() {
                 default_permission_mode: PermissionMode::AcceptEdits,
                 default_model: None,
                 description: String::new(),
+                autopilot: false,
+                autopilot_merge: false,
+                verify_command: None,
+                verify_timeout_secs: 600,
+                autopilot_max_fixes: 2,
             })
             .await
             .unwrap_err();
@@ -2717,6 +2747,11 @@ async fn project_description_is_trimmed_and_bounded() {
         default_permission_mode: PermissionMode::AcceptEdits,
         default_model: None,
         description,
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     let project = f
         .core
@@ -2735,6 +2770,148 @@ async fn project_description_is_trimmed_and_bounded() {
 
     let task = f.task("Allegati", "").await;
     assert!(f.detail(&task.id).await.attachments.is_empty());
+}
+
+/// Round 2026-10-01: the autopilot settings are stored with the project (the verify command
+/// trimmed, empty = none) and bounded; a task's dependency is another task of its project.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_fields_are_validated() {
+    let f = Flow::new(&[]).await;
+    let update =
+        |verify_command: Option<&str>, verify_timeout_secs, autopilot_max_fixes| UpdateProjectReq {
+            id: f.project.id.clone(),
+            name: f.project.name.clone(),
+            default_target_branch: "main".into(),
+            default_permission_mode: PermissionMode::AcceptEdits,
+            default_model: None,
+            description: String::new(),
+            autopilot: true,
+            autopilot_merge: true,
+            verify_command: verify_command.map(Into::into),
+            verify_timeout_secs,
+            autopilot_max_fixes,
+        };
+    let project = f
+        .core
+        .update_project(update(Some("  cargo test \n"), 10, 5))
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            project.autopilot,
+            project.autopilot_merge,
+            project.verify_command.as_deref(),
+            project.verify_timeout_secs,
+            project.autopilot_max_fixes
+        ),
+        (true, true, Some("cargo test"), 10, 5)
+    );
+    let project = f
+        .core
+        .update_project(update(Some("   "), 3600, 0))
+        .await
+        .unwrap();
+    assert_eq!(project.verify_command, None);
+    let long = "x".repeat(MAX_VERIFY_COMMAND + 1);
+    for bad in [
+        update(Some(&long), 600, 2),
+        update(None, 9, 2),
+        update(None, 3601, 2),
+        update(None, 600, 6),
+    ] {
+        let err = f.core.update_project(bad).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    }
+
+    let first = f.task("Primo", "").await;
+    let req = CreateTaskReq {
+        project_id: f.project.id.clone(),
+        title: "Secondo".into(),
+        description: String::new(),
+        status: None,
+        parent_id: None,
+        auto: true,
+        after_id: Some(first.id.clone()),
+    };
+    let second = f.core.create_task(req.clone()).await.unwrap().task;
+    assert_eq!(
+        (second.auto, second.after_id.as_ref()),
+        (true, Some(&first.id))
+    );
+    let edit = |after_id| UpdateTaskReq {
+        id: second.id.clone(),
+        title: "Secondo".into(),
+        description: String::new(),
+        auto: None,
+        after_id,
+    };
+    let err = f
+        .core
+        .update_task(edit(Some(Some(second.id.clone()))))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    let card = f.core.update_task(edit(Some(None))).await.unwrap();
+    assert_eq!((card.task.auto, card.task.after_id), (true, None));
+
+    let other = f.dir.path().join("other");
+    common::init_repo(&other);
+    let other = f
+        .core
+        .add_project(AddProjectReq {
+            path: other.display().to_string(),
+        })
+        .await
+        .unwrap()
+        .project;
+    let foreign = CreateTaskReq {
+        project_id: other.id.clone(),
+        ..req.clone()
+    };
+    let missing = CreateTaskReq {
+        after_id: Some("nope".into()),
+        ..req
+    };
+    for bad in [foreign, missing] {
+        let err = f.core.create_task(bad).await.unwrap_err();
+        assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    }
+
+    // A cycle (`first` after `second`, which is after `first`) or a cancelled dependency
+    // would never start: both refused.
+    let edit_first = |after_id: &Id| UpdateTaskReq {
+        id: first.id.clone(),
+        title: "Primo".into(),
+        description: String::new(),
+        auto: None,
+        after_id: Some(Some(after_id.clone())),
+    };
+    f.core
+        .update_task(edit(Some(Some(first.id.clone()))))
+        .await
+        .unwrap();
+    let err = f
+        .core
+        .update_task(edit_first(&second.id))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
+    assert!(err.message.contains("circolare"), "{err}");
+    let cancelled = f.task("Annullato", "").await;
+    f.core
+        .move_task(MoveTaskReq {
+            id: cancelled.id.clone(),
+            status: TaskStatus::Cancelled,
+            before_id: None,
+        })
+        .await
+        .unwrap();
+    let err = f
+        .core
+        .update_task(edit_first(&cancelled.id))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid, "{err}");
 }
 
 /// Finding M6 #15: a configuration that cannot be fingerprinted says why: in the project
@@ -3832,7 +4009,8 @@ async fn board_tools_create_at_once_and_ask_before_a_move_or_a_start() {
     assert_eq!(
         answer(1),
         serde_json::json!([{"id": sub.id, "title": "Sotto task dal fake", "status": "todo",
-                            "parent_id": task.id, "agent": null}])
+                            "parent_id": task.id, "auto": false, "after_id": null,
+                            "agent": null, "verify": null}])
     );
     let own = answer(2);
     assert_eq!(
@@ -3929,6 +4107,11 @@ async fn board_start_of_a_top_level_task_uses_the_project_mode() {
         default_permission_mode: PermissionMode::Default,
         default_model: None,
         description: String::new(),
+        autopilot: false,
+        autopilot_merge: false,
+        verify_command: None,
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     };
     f.core.update_project(update).await.unwrap();
     let other = f.task("Altro", "[fake:simple]").await;
@@ -4064,6 +4247,8 @@ async fn board_tools_never_reach_another_project() {
             description: String::new(),
             status: None,
             parent_id: None,
+            auto: false,
+            after_id: None,
         })
         .await
         .unwrap()
@@ -4125,6 +4310,8 @@ async fn try_subtask(f: &Flow, parent_id: &str, title: &str) -> Result<Task, App
         description: "[fake:simple]".into(),
         status: None,
         parent_id: Some(parent_id.into()),
+        auto: false,
+        after_id: None,
     };
     Ok(f.core.create_task(req).await?.task)
 }
@@ -4161,6 +4348,8 @@ async fn subtasks_need_a_top_level_parent_of_the_project_and_notify_it() {
             description: String::new(),
             status: None,
             parent_id: None,
+            auto: false,
+            after_id: None,
         })
         .await
         .unwrap()
@@ -4201,6 +4390,8 @@ async fn subtasks_need_a_top_level_parent_of_the_project_and_notify_it() {
             id: child.id.clone(),
             title: "Figlio rinominato".into(),
             description: String::new(),
+            auto: None,
+            after_id: None,
         })
         .await
         .unwrap();
@@ -4295,6 +4486,8 @@ async fn deleting_a_parent_deletes_its_subtasks_and_their_files() {
             description: "[fake:hang]".into(),
             status: None,
             parent_id: Some(parent.id.clone()),
+            auto: false,
+            after_id: None,
         })
         .await
         .unwrap()
@@ -4354,4 +4547,837 @@ async fn deleting_a_parent_deletes_its_subtasks_and_their_files() {
         .await
         .unwrap();
     assert!(board.is_empty());
+}
+
+// ---- round 2026-10-01: autopilot ------------------------------------------------------------
+
+/// Bound of an autopilot chain (turns, verifications, merges).
+const CHAIN: Duration = Duration::from_secs(60);
+
+/// Turns the project's autopilot on with these settings.
+async fn autopilot(f: &Flow, merge: bool, verify_command: Option<&str>, max_fixes: u32, secs: u32) {
+    let req = UpdateProjectReq {
+        id: f.project.id.clone(),
+        name: f.project.name.clone(),
+        default_target_branch: "main".into(),
+        default_permission_mode: PermissionMode::AcceptEdits,
+        default_model: None,
+        description: String::new(),
+        autopilot: true,
+        autopilot_merge: merge,
+        verify_command: verify_command.map(Into::into),
+        verify_timeout_secs: secs,
+        autopilot_max_fixes: max_fixes,
+    };
+    f.core.update_project(req).await.unwrap();
+}
+
+async fn set_max_running(f: &Flow, max_running: u32) {
+    let settings = Settings {
+        max_running,
+        ..f.core.get_settings().await.unwrap()
+    };
+    f.core.update_settings(settings).await.unwrap();
+}
+
+/// A task given to the autopilot, after `after` if any.
+async fn auto_task(f: &Flow, title: &str, after: Option<&Task>) -> Task {
+    let req = CreateTaskReq {
+        project_id: f.project.id.clone(),
+        title: title.into(),
+        description: String::new(),
+        status: None,
+        parent_id: None,
+        auto: true,
+        after_id: after.map(|t| t.id.clone()),
+    };
+    f.core.create_task(req).await.unwrap().task
+}
+
+/// The task's attempts, oldest first (the DB's, with the verification fields).
+fn attempts_of(f: &Flow, task: &Task) -> Vec<AttemptRow> {
+    f.db().task_attempts(&task.id).unwrap()
+}
+
+fn task_now(f: &Flow, task: &Task) -> Task {
+    f.db().task(&task.id).unwrap()
+}
+
+/// `running` of every `env_changed` so far.
+fn running_counts(f: &Flow) -> Vec<u32> {
+    f.seen
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            AppEvent::EnvChanged(env) => Some(env.running),
+            AppEvent::Changed(_) => None,
+        })
+        .collect()
+}
+
+/// A verification that waits for the file `go` (at most 20 s), then passes.
+fn gated_command(go: &Path) -> String {
+    format!(
+        "i=0; while [ ! -f '{}' ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done; test -f '{0}'",
+        go.display()
+    )
+}
+
+/// `max_running = 1`: the autopilot starts the queued tasks in board order, one at a time,
+/// each as soon as the previous one frees its slot; without a command a verification counts
+/// as passed and, without «Merge automatico», the task waits in review, still the autopilot's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_queue_respects_max_running_and_fills_free_slots() {
+    let f = Flow::new(&[]).await;
+    set_max_running(&f, 1).await;
+    let manual = f.task("A mano", "").await;
+    autopilot(&f, false, None, 2, 600).await;
+    let mut tasks = Vec::new();
+    for title in ["Uno", "Due", "Tre"] {
+        tasks.push(auto_task(&f, title, None).await);
+    }
+    f.seen
+        .until("three verified tasks", CHAIN, async || {
+            tasks.iter().all(|t| {
+                attempts_of(&f, t)
+                    .first()
+                    .is_some_and(|a| a.verify_state == Some(VerifyState::Passed))
+            })
+        })
+        .await;
+    assert!(
+        running_counts(&f).iter().all(|&n| n <= 1),
+        "{:?}",
+        running_counts(&f)
+    );
+    let firsts: Vec<String> = prompts(&f)
+        .iter()
+        .map(|p| p.lines().next().unwrap().to_owned())
+        .collect();
+    assert_eq!(firsts, ["# Uno", "# Due", "# Tre"]);
+    for task in &tasks {
+        let card = f.card(&task.id).await;
+        assert_eq!(card.task.status, TaskStatus::InReview);
+        assert!(card.task.auto);
+        assert_eq!(
+            (card.verifying, card.verify_state, card.verify_fixes),
+            (false, Some(VerifyState::Passed), 0)
+        );
+    }
+    assert!(attempts_of(&f, &manual).is_empty());
+}
+
+/// `after`: the second task waits for the first to be done (merged by the autopilot), even
+/// with a free slot, then starts from the merged target and is merged in turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_after_waits_for_the_dependency_to_be_done() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, true, None, 2, 600).await;
+    let first = auto_task(&f, "Primo [fake:append]", None).await;
+    let second = auto_task(&f, "Secondo [fake:append]", Some(&first)).await;
+    f.seen
+        .until("both tasks merged", CHAIN, async || {
+            task_now(&f, &second).status == TaskStatus::Done
+        })
+        .await;
+    let (a, b) = (&attempts_of(&f, &first)[0], &attempts_of(&f, &second)[0]);
+    assert_eq!(a.state, AttemptState::Merged);
+    assert_eq!(b.state, AttemptState::Merged);
+    assert_eq!(Some(&b.base_commit), a.merge_commit.as_ref());
+    assert_eq!(
+        std::fs::read_to_string(f.repo.join("hello.txt")).unwrap(),
+        "Primo\nSecondo\n"
+    );
+    assert!(running_counts(&f).iter().all(|&n| n <= 1));
+}
+
+/// A failed verification goes back to the agent with the command, how it ended and its
+/// output; the fix passes, then the task is merged («Merge automatico») or waits verified.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_failed_verification_is_fixed_then_merged_or_ready() {
+    let command = "test -f fixed.txt || { echo 'fixed.txt missing'; exit 3; }";
+    for merge in [true, false] {
+        let f = Flow::new(&[("FAKE_CLAUDE_SCENARIO", "fix_on_resume")]).await;
+        autopilot(&f, merge, Some(command), 2, 600).await;
+        let task = auto_task(&f, "Da correggere", None).await;
+        f.seen
+            .until("the verified fix", CHAIN, async || {
+                attempts_of(&f, &task)
+                    .first()
+                    .is_some_and(|a| a.verify_state == Some(VerifyState::Passed))
+            })
+            .await;
+        let prompts = prompts(&f);
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        for part in [command, "exited with code 3", "fixed.txt missing"] {
+            assert!(prompts[1].contains(part), "{part}: {}", prompts[1]);
+        }
+        let calls = f.calls();
+        assert!(flag(&calls[1], "--resume=").is_some());
+        let attempt = &attempts_of(&f, &task)[0];
+        assert_eq!(attempt.verify_fixes, 1);
+        assert_eq!(attempt.verify_summary, None);
+        let logs = runner::attempt_log_dir(&f.config.data_dir, &attempt.id).join("verify");
+        let logs: Vec<_> = std::fs::read_dir(logs)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        assert_eq!(logs.len(), 2);
+        for log in &logs {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(log.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        if merge {
+            f.seen
+                .until("the merge", CHAIN, async || {
+                    task_now(&f, &task).status == TaskStatus::Done
+                })
+                .await;
+            assert!(f.repo.join("fixed.txt").exists());
+        } else {
+            let card = f.card(&task.id).await;
+            assert_eq!(card.task.status, TaskStatus::InReview);
+            assert!(card.task.auto);
+            assert_eq!(
+                (card.verify_state, card.verify_fixes),
+                (Some(VerifyState::Passed), 1)
+            );
+            assert_eq!(attempts_of(&f, &task)[0].state, AttemptState::Active);
+        }
+    }
+}
+
+/// Once the fixes are used up the autopilot lets the task go: in review, `auto` off, the
+/// failure and its output kept, no further turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_stops_when_the_fixes_are_used_up() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, true, Some("echo nope; exit 1"), 1, 600).await;
+    let task = auto_task(&f, "Sempre rosso", None).await;
+    f.seen
+        .until("the autopilot to let go", CHAIN, async || {
+            !task_now(&f, &task).auto
+        })
+        .await;
+    let attempt = &attempts_of(&f, &task)[0];
+    assert_eq!(attempt.verify_state, Some(VerifyState::Failed));
+    assert_eq!(attempt.verify_fixes, 1);
+    assert_eq!(attempt.verify_summary.as_deref(), Some("nope"));
+    assert_eq!(attempt.state, AttemptState::Active);
+    assert_eq!(f.calls().len(), 2);
+    assert_eq!(task_now(&f, &task).status, TaskStatus::InReview);
+}
+
+/// A verified branch that conflicts with its target gets the "Risolvi con l'agente"
+/// follow-up (counted as a fix); once resolved and verified again, it is merged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_sends_conflicts_back_to_the_agent() {
+    let f = Flow::new(&[]).await;
+    let go = f.dir.path().join("go");
+    autopilot(&f, true, Some(&gated_command(&go)), 2, 600).await;
+    let task = auto_task(&f, "Conflitto", None).await;
+    f.seen
+        .until("the verification", CHAIN, async || {
+            f.card(&task.id).await.verifying
+        })
+        .await;
+    std::fs::write(f.repo.join("hello.txt"), "main\n").unwrap();
+    common::git(&f.repo, &["add", "-A"]);
+    common::git(&f.repo, &["commit", "-q", "-m", "conflicting"]);
+    std::fs::write(&go, "").unwrap();
+    f.seen
+        .until("the merge", CHAIN, async || {
+            task_now(&f, &task).status == TaskStatus::Done
+        })
+        .await;
+    let prompts = prompts(&f);
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    assert!(
+        prompts[1].starts_with("This branch conflicts with `main` in: hello.txt."),
+        "{}",
+        prompts[1]
+    );
+    assert_eq!(attempts_of(&f, &task)[0].verify_fixes, 1);
+}
+
+/// Paused for the usage limit, the autopilot starts nothing (the task that hit the limit is
+/// let go, never retried); `resume_agents` starts the queue again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_starts_nothing_while_paused() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, false, None, 2, 600).await;
+    let limited = auto_task(&f, "Limite [fake:usage_limit]", None).await;
+    f.seen
+        .until("the limited task let go", CHAIN, async || {
+            !task_now(&f, &limited).auto
+        })
+        .await;
+    let next = auto_task(&f, "Dopo la pausa", None).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(attempts_of(&f, &next).is_empty());
+    assert_eq!(f.calls().len(), 1);
+
+    f.core.resume_agents().await.unwrap();
+    f.seen
+        .until("the queued task", CHAIN, async || {
+            attempts_of(&f, &next)
+                .first()
+                .is_some_and(|a| a.verify_state == Some(VerifyState::Passed))
+        })
+        .await;
+    assert_eq!(f.calls().len(), 2);
+    assert_eq!(attempts_of(&f, &limited)[0].verify_state, None);
+}
+
+/// The user's Stop ends the autopilot's work on the task: no verification, no new turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_never_overrides_a_user_stop() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, true, Some("true"), 2, 600).await;
+    let task = auto_task(&f, "Appeso [fake:hang]", None).await;
+    f.seen
+        .until("the running turn", CHAIN, async || {
+            f.card(&task.id).await.running
+        })
+        .await;
+    let attempt = attempts_of(&f, &task).remove(0);
+    f.stop(&attempt.id).await;
+    f.seen
+        .until("the autopilot to let go", CHAIN, async || {
+            !task_now(&f, &task).auto
+        })
+        .await;
+    let d = f.detail(&task.id).await;
+    assert_eq!(
+        state(&d.processes[0]),
+        (ProcessStatus::Killed, Some(StopReason::UserStop))
+    );
+    assert_eq!(d.processes.len(), 1);
+    assert_eq!(attempts_of(&f, &task)[0].verify_state, None);
+    assert_eq!(f.calls().len(), 1);
+}
+
+/// The queue lives in the DB: a new Core starts the queued task by itself, and a
+/// verification the closing cut is `error`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_queue_is_rebuilt_after_a_restart() {
+    let f = Flow::new(&[]).await;
+    let verified = f.task("Verificato", "").await;
+    let attempt = f.start(&verified).await;
+    let d = f.turn_end(&verified.id, 1, TURN).await;
+    let head = d.processes[0].head_after.clone().unwrap();
+    let queued = f.task("In coda", "").await;
+    autopilot(&f, false, None, 2, 600).await;
+    f.core.shutdown(runner::SHUTDOWN_DEADLINE).await;
+    let db = f.db();
+    db.begin_verify(&attempt.id, &head, 1).unwrap();
+    db.set_task_auto(&queued.id, true, 1).unwrap();
+
+    let seen = Seen::new();
+    let core = Core::new(f.config.clone(), seen.notify()).unwrap();
+    core.startup().await.unwrap();
+    assert_eq!(
+        db.attempt(&attempt.id).unwrap().verify_state,
+        Some(VerifyState::Error)
+    );
+    seen.until("the queued task", CHAIN, async || {
+        db.task_attempts(&queued.id)
+            .unwrap()
+            .first()
+            .is_some_and(|a| a.verify_state == Some(VerifyState::Passed))
+    })
+    .await;
+    core.shutdown(runner::SHUTDOWN_DEADLINE).await;
+}
+
+/// A verification past its timeout is killed with its whole group (a background job
+/// included) and counts as failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_verification_timeout_kills_the_group() {
+    let f = Flow::new(&[]).await;
+    let pids = f.dir.path().join("pids");
+    let command = format!(
+        "echo $$ > '{0}'; sleep 300 & echo $! >> '{0}'; wait",
+        pids.display()
+    );
+    autopilot(&f, false, Some(&command), 0, 10).await;
+    let task = auto_task(&f, "Lento", None).await;
+    f.seen
+        .until("the verification", CHAIN, async || {
+            f.card(&task.id).await.verifying
+        })
+        .await;
+    let started = Instant::now();
+    f.seen
+        .until("the timeout", CHAIN, async || !task_now(&f, &task).auto)
+        .await;
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        attempts_of(&f, &task)[0].verify_state,
+        Some(VerifyState::Failed)
+    );
+    let pids: Vec<i32> = std::fs::read_to_string(&pids)
+        .unwrap()
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .collect();
+    assert_eq!(pids.len(), 2);
+    eventually(
+        "the verification's group to die",
+        Duration::from_secs(5),
+        || pids.iter().all(|&pid| !claude::pid_alive(pid)),
+    )
+    .await;
+}
+
+/// A manual merge asked during a verification waits for it (the attempt's lock); meanwhile
+/// the card says it is verifying and the merge is blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_verification_never_races_a_manual_merge() {
+    let f = Flow::new(&[]).await;
+    let go = f.dir.path().join("go");
+    autopilot(&f, false, Some(&gated_command(&go)), 2, 600).await;
+    let task = auto_task(&f, "Da mergiare", None).await;
+    f.seen
+        .until("the verification", CHAIN, async || {
+            f.card(&task.id).await.verifying
+        })
+        .await;
+    let attempt = attempts_of(&f, &task).remove(0);
+    assert_eq!(attempt.verify_state, Some(VerifyState::Running));
+    let req = AttemptIdReq {
+        attempt_id: attempt.id.clone(),
+    };
+    let status = f.core.get_branch_status(req).await.unwrap();
+    assert!(
+        status
+            .merge_blocked
+            .as_deref()
+            .unwrap()
+            .contains("verifica"),
+        "{status:?}"
+    );
+
+    let merged = std::sync::atomic::AtomicBool::new(false);
+    let merge = async {
+        let req = MergeAttemptReq {
+            attempt_id: attempt.id.clone(),
+            message: "Merge".into(),
+        };
+        let outcome = f.core.merge_attempt(req).await.unwrap();
+        merged.store(true, std::sync::atomic::Ordering::SeqCst);
+        outcome
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!merged.load(std::sync::atomic::Ordering::SeqCst));
+        std::fs::write(&go, "").unwrap();
+    };
+    let (outcome, ()) = tokio::join!(merge, release);
+    assert!(
+        matches!(outcome, MergeOutcome::Merged { .. }),
+        "{outcome:?}"
+    );
+    let attempt = &attempts_of(&f, &task)[0];
+    assert_eq!(attempt.state, AttemptState::Merged);
+    assert_eq!(attempt.verify_state, Some(VerifyState::Passed));
+}
+
+/// `max_running = 1`: a failed verification's fix finds the slot taken by the next queued
+/// task. It waits (`verify_pending`, not counted), never lets the task go, and goes before
+/// the queue as soon as the slot is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_fix_waits_for_a_slot_before_the_queue() {
+    let f = Flow::new(&[]).await;
+    set_max_running(&f, 1).await;
+    autopilot(&f, false, Some("sleep 2; test -f fixed.txt"), 2, 600).await;
+    let first = auto_task(&f, "Primo", None).await;
+    let hang = auto_task(&f, "Appeso [fake:hang]", None).await;
+    let third = auto_task(&f, "Terzo", None).await;
+    // `verify_pending` emits no event: polled.
+    eventually("the fix waiting for the slot", CHAIN, || {
+        !f.db().pending_fixes().unwrap().is_empty()
+    })
+    .await;
+    let a = attempts_of(&f, &first).remove(0);
+    assert_eq!(f.db().pending_fixes().unwrap()[0].0, a.id);
+    assert_eq!(
+        (a.verify_state, a.verify_fixes),
+        (Some(VerifyState::Failed), 0)
+    );
+    assert!(task_now(&f, &first).auto);
+    assert!(f.card(&hang.id).await.running);
+
+    let b = attempts_of(&f, &hang).remove(0);
+    f.stop(&b.id).await;
+    f.seen
+        .until("the fix verified", CHAIN, async || {
+            attempts_of(&f, &first)[0].verify_state == Some(VerifyState::Passed)
+        })
+        .await;
+    let a = attempts_of(&f, &first).remove(0);
+    assert_eq!(a.verify_fixes, 1);
+    assert!(task_now(&f, &first).auto);
+    assert!(f.db().pending_fixes().unwrap().is_empty());
+    let firsts: Vec<String> = prompts(&f)
+        .iter()
+        .map(|p| p.lines().next().unwrap().to_owned())
+        .collect();
+    assert_eq!(firsts[..2], ["# Primo", "# Appeso [fake:hang]"]);
+    assert!(
+        firsts[2].starts_with("The project's verification command"),
+        "{firsts:?}"
+    );
+    assert!(running_counts(&f).iter().all(|&n| n <= 1));
+    // The queue goes on after the fix.
+    f.seen
+        .until("the third task", CHAIN, async || {
+            !attempts_of(&f, &third).is_empty()
+        })
+        .await;
+}
+
+/// A follow-up of the user sent during a verification gets the turn: the failed
+/// verification's fix is not sent (nor counted) and the task stays the autopilot's, whose
+/// chain resumes when the user's turn ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_keeps_a_task_the_user_talks_to_during_its_verification() {
+    let f = Flow::new(&[]).await;
+    let go = f.dir.path().join("go");
+    let command = format!("{}; test -f fixed.txt", gated_command(&go));
+    autopilot(&f, false, Some(&command), 2, 600).await;
+    let task = auto_task(&f, "Chiacchiera", None).await;
+    f.seen
+        .until("the verification", CHAIN, async || {
+            f.card(&task.id).await.verifying
+        })
+        .await;
+    let attempt = attempts_of(&f, &task).remove(0);
+    let follow_up = async {
+        let req = SendFollowUpReq {
+            attempt_id: attempt.id.clone(),
+            prompt: "Una domanda".into(),
+            permission_mode: None,
+            fresh_session: false,
+        };
+        f.core.send_follow_up(req).await.unwrap()
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(&go, "").unwrap();
+    };
+    tokio::join!(follow_up, release);
+    f.seen
+        .until("the fix verified", CHAIN, async || {
+            attempts_of(&f, &task)[0].verify_state == Some(VerifyState::Passed)
+        })
+        .await;
+    assert!(task_now(&f, &task).auto);
+    let prompts = prompts(&f);
+    assert_eq!(prompts.len(), 3, "{prompts:?}");
+    assert_eq!(prompts[1], "Una domanda");
+    assert_eq!(attempts_of(&f, &task)[0].verify_fixes, 1);
+}
+
+/// Discarding an attempt the autopilot still drives takes the task back: it is not started
+/// again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_discard_takes_the_task_back() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, false, None, 2, 600).await;
+    let task = auto_task(&f, "Scartato", None).await;
+    f.seen
+        .until("the verified task", CHAIN, async || {
+            attempts_of(&f, &task)
+                .first()
+                .is_some_and(|a| a.verify_state == Some(VerifyState::Passed))
+        })
+        .await;
+    let attempt = attempts_of(&f, &task).remove(0);
+    let req = AttemptIdReq {
+        attempt_id: attempt.id.clone(),
+    };
+    f.core.discard_attempt(req).await.unwrap();
+    let now = task_now(&f, &task);
+    assert_eq!((now.status, now.auto), (TaskStatus::Todo, false));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(attempts_of(&f, &task).len(), 1);
+}
+
+/// `shutdown` kills a verification running (its whole group), which stays `running` for the
+/// next startup to report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn autopilot_shutdown_kills_the_verification() {
+    let f = Flow::new(&[]).await;
+    let pids = f.dir.path().join("pids");
+    let command = format!(
+        "echo $$ > '{0}'; sleep 300 & echo $! >> '{0}'; wait",
+        pids.display()
+    );
+    autopilot(&f, false, Some(&command), 0, 600).await;
+    let task = auto_task(&f, "Interrotto", None).await;
+    let read = || {
+        std::fs::read_to_string(&pids)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect::<Vec<i32>>()
+    };
+    eventually("the verification's processes", CHAIN, || read().len() == 2).await;
+    f.core.shutdown(runner::SHUTDOWN_DEADLINE).await;
+    let pids = read();
+    eventually(
+        "the verification's group to die",
+        Duration::from_secs(5),
+        || pids.iter().all(|&pid| !claude::pid_alive(pid)),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let attempt = attempts_of(&f, &task).remove(0);
+    assert_eq!(attempt.verify_state, Some(VerifyState::Running));
+    assert!(task_now(&f, &task).auto);
+}
+
+// ---- round 2026-10-01: autopilot board tools and notifications (plan A4, A5) ------------------
+
+impl Flow {
+    /// Turns the project's autopilot on or off, every other setting as stored.
+    async fn set_autopilot(&self, on: bool) {
+        let p = self.core.project(&self.project.id).await.unwrap();
+        let req = UpdateProjectReq {
+            id: p.id,
+            name: p.name,
+            default_target_branch: p.default_target_branch,
+            default_permission_mode: p.default_permission_mode,
+            default_model: p.default_model,
+            description: p.description,
+            autopilot: on,
+            autopilot_merge: p.autopilot_merge,
+            verify_command: p.verify_command,
+            verify_timeout_secs: p.verify_timeout_secs,
+            autopilot_max_fixes: p.autopilot_max_fixes,
+        };
+        self.core.update_project(req).await.unwrap();
+    }
+
+    /// A task the autopilot drives.
+    async fn auto_task(&self, title: &str, description: &str) -> Task {
+        let task = self.task(title, description).await;
+        self.db().set_task_auto(&task.id, true, 1).unwrap();
+        self.db().task(&task.id).unwrap()
+    }
+
+    /// `[task_id, title, body]` of every notification, oldest first (`CoreConfig::notify_log`).
+    fn notifications(&self) -> Vec<[String; 3]> {
+        std::fs::read_to_string(self.dir.path().join("notify.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+/// `create_task` with `after` sets the dependency; a subtask of the caller's own task inherits
+/// its `auto`, and `list_tasks`/`get_task` show both. A task created otherwise is not the
+/// autopilot's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_subtasks_inherit_auto_and_take_after() {
+    let f = Flow::new(&[]).await;
+    let task = f.auto_task("Padre", "[fake:board_chain]").await;
+    f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let calls = board_calls(&f);
+    assert!(
+        calls.iter().all(|c| c.0 == "create_task" && !c.1),
+        "{calls:?}"
+    );
+    let answer = |i: usize| serde_json::from_str::<Value>(&calls[i].2).unwrap();
+    let (first, second) = (answer(0), answer(1));
+    assert_eq!(
+        (&first["auto"], &first["after_id"]),
+        (&Value::Bool(true), &Value::Null)
+    );
+    assert_eq!(second["auto"], true);
+    assert_eq!(second["after_id"], first["id"]);
+    let d = f.detail(&task.id).await;
+    let subs: Vec<(&str, bool, Option<&str>)> = d
+        .subtasks
+        .iter()
+        .map(|c| {
+            (
+                c.task.title.as_str(),
+                c.task.auto,
+                c.task.after_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        subs,
+        [
+            ("Primo passo", true, None),
+            ("Secondo passo", true, first["id"].as_str())
+        ]
+    );
+    let parent_attempt = attempts_of(&f, &task).remove(0).id;
+    for sub in &d.subtasks {
+        let by = f.db().task_auto_by(&sub.task.id).unwrap();
+        assert_eq!(by.as_ref(), Some(&parent_attempt));
+    }
+
+    // Not inherited from a task the autopilot does not drive.
+    let manual = f.task("Manuale", "[fake:board_chain]").await;
+    f.start(&manual).await;
+    f.turn_end(&manual.id, 1, TURN).await;
+    let d = f.detail(&manual.id).await;
+    assert_eq!(d.subtasks.len(), 2);
+    assert!(d.subtasks.iter().all(|c| !c.task.auto));
+    assert!(d.subtasks[1].task.after_id.is_some());
+}
+
+/// `get_task` shows `auto`, the `after` task and the active attempt's verification; an `after`
+/// outside the project is not found, like any other id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_get_task_shows_auto_after_and_verify() {
+    let f = Flow::new(&[]).await;
+    let before = f.task("Prima", "").await;
+    let task = f.auto_task("Padre", "[fake:board_tools] [ask:skip]").await;
+    let req = UpdateTaskReq {
+        id: task.id.clone(),
+        title: task.title.clone(),
+        description: task.description.clone(),
+        auto: None,
+        after_id: Some(Some(before.id.clone())),
+    };
+    f.core.update_task(req).await.unwrap();
+    let attempt = f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let calls = board_calls(&f);
+    let (tool, is_error, text) = &calls[2];
+    assert_eq!((tool.as_str(), *is_error), ("get_task", false));
+    let own: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(own["auto"], true);
+    assert_eq!(
+        own["after"],
+        serde_json::json!({"id": before.id, "title": "Prima", "status": "todo"})
+    );
+    assert_eq!(own["attempt"]["verify"], Value::Null);
+
+    // The verification the autopilot records is what the next call shows.
+    let db = f.db();
+    db.begin_verify(&attempt.id, "abc", 1).unwrap();
+    db.finish_verify(&attempt.id, VerifyState::Failed, Some("1 failed"), "abc", 2)
+        .unwrap();
+    db.add_verify_fix(&attempt.id, 3).unwrap();
+    let card = f.card(&task.id).await;
+    assert_eq!(
+        (card.verify_state, card.verify_fixes),
+        (Some(VerifyState::Failed), 1)
+    );
+}
+
+/// `start_task` without a free slot in a project with the autopilot on queues the task
+/// (`auto`, still in todo) instead of the `ConcurrencyLimit` error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn board_start_without_a_slot_is_queued_in_an_autopilot_project() {
+    let f = Flow::new(&[]).await;
+    let settings = f.core.get_settings().await.unwrap();
+    f.core
+        .update_settings(Settings {
+            max_running: 1,
+            ..settings
+        })
+        .await
+        .unwrap();
+    f.set_autopilot(true).await;
+    let task = f.task("Padre", "[fake:board_tools] [status:todo]").await;
+    f.run_board_tools(&task).await;
+    let calls = board_calls(&f);
+    let (tool, is_error, text) = &calls[5];
+    assert_eq!((tool.as_str(), *is_error), ("start_task", false), "{text}");
+    let answer: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(answer["queued"], true);
+    let sub = f.detail(&task.id).await.subtasks[0].task.clone();
+    assert_eq!(answer["task_id"], sub.id.as_str());
+    assert!(sub.auto);
+    assert_eq!(sub.status, TaskStatus::Todo);
+
+    // Once the slot is free it starts as the caller's `start_task` would have: started by it
+    // (so it cannot start agents itself), in its mode.
+    let caller = attempts_of(&f, &task).remove(0);
+    assert_eq!(
+        f.db().task_auto_by(&sub.id).unwrap(),
+        Some(caller.id.clone())
+    );
+    f.seen
+        .until("the queued sub-task", CHAIN, async || {
+            !attempts_of(&f, &sub).is_empty()
+        })
+        .await;
+    let started = attempts_of(&f, &sub).remove(0);
+    assert_eq!(started.started_by_attempt, Some(caller.id));
+    assert_eq!(started.permission_mode, caller.permission_mode);
+}
+
+/// The notifications of a `[fake:board_tools]` turn (three approvals: update, move, start) on
+/// a task the autopilot drives or not, with notifications on or off.
+async fn approval_notifications(auto: bool, notifications: bool) -> (Task, Vec<[String; 3]>) {
+    let f = Flow::new(&[]).await;
+    let settings = f.core.get_settings().await.unwrap();
+    f.core
+        .update_settings(Settings {
+            notifications,
+            ..settings
+        })
+        .await
+        .unwrap();
+    let task = if auto {
+        f.auto_task("Automatico", "[fake:board_tools]").await
+    } else {
+        f.task("Manuale", "[fake:board_tools]").await
+    };
+    f.run_board_tools(&task).await;
+    (task, f.notifications())
+}
+
+/// A pending approval notifies only on a task the autopilot drives, at most once per task in
+/// 30 s, and never with notifications off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_approvals_of_autopilot_tasks_notify_once() {
+    let (task, sent) = approval_notifications(true, true).await;
+    assert_eq!(
+        sent,
+        [[
+            task.id,
+            "Autopilota: approvazione richiesta".to_owned(),
+            "«Automatico» chiede di usare mcp__atm__update_task".to_owned()
+        ]]
+    );
+    assert_eq!(approval_notifications(false, true).await.1.len(), 0);
+    assert_eq!(approval_notifications(true, false).await.1.len(), 0);
+}
+
+/// The pause for a usage limit notifies when some project has the autopilot on, not otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn usage_limit_pause_notifies_with_the_autopilot_on() {
+    let f = Flow::new(&[]).await;
+    let task = f.task("Limite", "[fake:usage_limit]").await;
+    f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    assert_eq!(f.notifications(), Vec::<[String; 3]>::new());
+    f.core.resume_agents().await.unwrap();
+
+    f.set_autopilot(true).await;
+    let task = f.task("Limite di nuovo", "[fake:usage_limit]").await;
+    f.start(&task).await;
+    f.turn_end(&task.id, 1, TURN).await;
+    let sent = f.notifications();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        (sent[0][0].as_str(), sent[0][1].as_str()),
+        ("", "Autopilota in pausa")
+    );
 }

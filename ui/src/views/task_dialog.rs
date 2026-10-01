@@ -1,5 +1,5 @@
-//! Create/edit task dialog (spec §9.2), with the task's attachments (spec F5). Owner:
-//! M2-UI-BOARD, attachments UI-TASKS.
+//! Create/edit task dialog (spec §9.2), with the task's attachments (spec F5) and its
+//! autopilot fields (also in the task panel). Owner: M2-UI-BOARD, attachments UI-TASKS.
 
 use std::time::Duration;
 
@@ -22,6 +22,7 @@ use crate::ui::dialog::{
 use crate::ui::input::Input;
 use crate::ui::kbd::{Kbd, KbdGroup};
 use crate::ui::label::Label;
+use crate::ui::select_native::SelectNative;
 use crate::ui::skeleton::Skeleton;
 use crate::ui::textarea::Textarea;
 use crate::views::board::column_title;
@@ -57,6 +58,8 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
     let open = RwSignal::new(false);
     let title = RwSignal::new(String::new());
     let description = RwSignal::new(String::new());
+    let auto = RwSignal::new(false);
+    let after = RwSignal::new(String::new());
     let error = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
     let confirm_delete = RwSignal::new(false);
@@ -79,6 +82,14 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
             };
             title.set(t);
             description.set(d);
+            let (a, af) = match m {
+                TaskDialogMode::Create { .. } => Default::default(),
+                TaskDialogMode::Edit(task) => {
+                    (task.auto, task.after_id.clone().unwrap_or_default())
+                }
+            };
+            auto.set(a);
+            after.set(af);
             error.set(None);
             confirm_delete.set(false);
             // After the dialog has focused its first control (the close button).
@@ -128,6 +139,7 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
             }
         };
         let project_id = ctx.project.get_untracked();
+        let (auto, after_id) = (auto.get_untracked(), non_empty(after.get_untracked()));
         let tokens = files.staged_tokens();
         let session = files.session.get_value();
         busy.set(true);
@@ -141,6 +153,8 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                             description: d,
                             status: Some(status),
                             parent_id: parent.map(|(id, _)| id),
+                            auto,
+                            after_id,
                         })
                         .await;
                         if let Ok(card) = &created {
@@ -154,6 +168,8 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                     id: task.id,
                     title: t,
                     description: d,
+                    auto: Some(auto),
+                    after_id: Some(after_id),
                 })
                 .await
                 .map(|_| ()),
@@ -294,6 +310,13 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
                         </div>
                         <AttachmentsField mode files saving=busy />
                         {move || {
+                            let task_id = mode.with(|m| match m {
+                                Some(TaskDialogMode::Edit(t)) => Some(t.id.clone()),
+                                _ => None,
+                            });
+                            view! { <AutopilotFields auto_id="task-auto" after_id="task-after" task_id auto after /> }
+                        }}
+                        {move || {
                             error
                                 .get()
                                 .map(|e| {
@@ -346,6 +369,94 @@ pub fn TaskDialog(mode: RwSignal<Option<TaskDialogMode>>) -> impl IntoView {
             </DialogContent>
         </Dialog>
     }
+}
+
+/// «Affida all'autopilota» (`[data-auto-toggle]`) and «Parte dopo…» (`[data-after]`, the
+/// select inside), over the board's tasks but `task_id` itself; `after` is `""` for none.
+/// The dialog saves them with the form, the task panel at each `on_change`.
+#[component]
+pub fn AutopilotFields(
+    auto_id: &'static str,
+    after_id: &'static str,
+    task_id: Option<Id>,
+    auto: RwSignal<bool>,
+    after: RwSignal<String>,
+    #[prop(optional)] on_change: Option<Callback<()>>,
+) -> impl IntoView {
+    let ctx = use_app();
+    let options = Memo::new(move |_| {
+        ctx.cards.with(|cards| {
+            cards
+                .iter()
+                // A cancelled task is never done: the core refuses it.
+                .filter(|c| {
+                    Some(&c.task.id) != task_id.as_ref() && c.task.status != TaskStatus::Cancelled
+                })
+                .map(|c| (c.task.id.clone(), c.task.title.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    let changed = move || {
+        if let Some(f) = on_change {
+            f.run(());
+        }
+    };
+    view! {
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+            <label for=auto_id class="flex items-center gap-2 text-[13px]">
+                <input
+                    type="checkbox"
+                    id=auto_id
+                    class="accent-primary size-4 shrink-0"
+                    data-auto-toggle=""
+                    prop:checked=move || auto.get()
+                    on:change=move |ev| {
+                        auto.set(event_target_checked(&ev));
+                        changed();
+                    }
+                />
+                "Affida all'autopilota"
+            </label>
+            <div class="flex min-w-0 flex-1 items-center gap-2" data-after="">
+                <label for=after_id class="text-muted-foreground shrink-0 text-[13px]">
+                    "Parte dopo…"
+                </label>
+                <div class="min-w-0 flex-1">
+                    <SelectNative
+                        id=after_id
+                        class="h-8 text-[13px]"
+                        value=after.read_only()
+                        on_change=Callback::new(move |ev| {
+                            after.set(event_target_value(&ev));
+                            changed();
+                        })
+                    >
+                        <option value="" prop:selected=move || after.with(String::is_empty)>
+                            "Nessun task"
+                        </option>
+                        <For each=move || options.get() key=|o| o.clone() let:option>
+                            {
+                                let (id, title) = option;
+                                let selected = {
+                                    let id = id.clone();
+                                    move || after.with(|a| *a == id)
+                                };
+                                view! {
+                                    <option value=id prop:selected=selected>
+                                        {title}
+                                    </option>
+                                }
+                            }
+                        </For>
+                    </SelectNative>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+fn non_empty(s: String) -> Option<String> {
+    (!s.is_empty()).then_some(s)
 }
 
 /// Attachments of the dialog (spec F5). Create: the picks are only staged, since the task id

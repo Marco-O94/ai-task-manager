@@ -746,6 +746,7 @@ impl Turn {
         } else if let Some(max) = subagent {
             self.count_subagent(&pending, max)
         } else {
+            self.notify_pending(&req.tool_name);
             return self.changed();
         };
         d.send(response);
@@ -756,6 +757,16 @@ impl Turn {
         if subagent.is_some() && matches!(decision, ApprovalDecision::Allow { .. }) {
             // `subagents_used` changed: the task panel shows it.
             self.changed();
+        }
+    }
+
+    /// A pending approval on a task the autopilot drives: the user is not watching the board.
+    fn notify_pending(&self, tool: &str) {
+        let task = &self.plan.ctx.task;
+        if self.inner.db.task(&task.id).is_ok_and(|t| t.auto) {
+            let body = format!("«{}» chiede di usare {tool}", task.title);
+            self.inner
+                .notify(Some(&task.id), "Autopilota: approvazione richiesta", &body);
         }
     }
 
@@ -1006,8 +1017,21 @@ impl Turn {
         match result.filter(|r| r.is_error).and_then(|r| r.limit) {
             Some(LimitKind::UsageLimit | LimitKind::Billing) => {
                 let text = result.and_then(|r| r.text.clone());
-                *guard(&inner.paused) =
-                    Some(text.unwrap_or_else(|| "limite d'uso raggiunto".into()));
+                let was = guard(&inner.paused)
+                    .replace(text.unwrap_or_else(|| "limite d'uso raggiunto".into()));
+                let autopilot = || {
+                    inner
+                        .db
+                        .projects()
+                        .is_ok_and(|p| p.iter().any(|p| p.autopilot))
+                };
+                if was.is_none() && autopilot() {
+                    inner.notify(
+                        None,
+                        "Autopilota in pausa",
+                        "Limite d'uso raggiunto: nessun agente parte finché non riprendi.",
+                    );
+                }
             }
             // The next status check re-reads `auth status` (spec §7.10).
             Some(LimitKind::AuthFailure) => *inner.probe.lock().await = None,

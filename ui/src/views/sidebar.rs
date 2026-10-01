@@ -1,12 +1,13 @@
 //! Sidebar (projects with their menu, "Aggiungi repository", running meter, app settings, the
-//! removal confirmation) and topbar (project name, pending approvals and page tabs, account
-//! chip, pause banner with "Riprendi"), spec §9.2. Owner: M2-UI-BOARD, UI-SHELL.
+//! removal confirmation) and topbar (project name, pending approvals, Autopilota toggle and
+//! page tabs, account chip, pause banner with "Riprendi"), spec §9.2. Owner: M2-UI-BOARD,
+//! UI-SHELL.
 
 use atm_types::{
     AddProject, AddProjectReq, AuthState, Empty, EnvStatus, GetBoard, GetSettings, Id, IdReq,
-    PickRepoFolder, ProjectIdReq, RemoveProject, ResumeAgents, TaskCard,
+    PickRepoFolder, ProjectIdReq, RemoveProject, ResumeAgents, TaskCard, UpdateProject,
 };
-use icons::{Ellipsis, Folder, Plus, Settings2, Trash2, TriangleAlert, Zap};
+use icons::{Bot, Ellipsis, Folder, Plus, Settings2, Trash2, TriangleAlert, Zap};
 use leptos::ev;
 use leptos::html;
 use leptos::prelude::*;
@@ -27,7 +28,7 @@ use crate::ui::kbd::Kbd;
 use crate::ui::scroll_area::ScrollArea;
 use crate::ui::spinner::Spinner;
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
-use crate::views::settings::SettingsDialog;
+use crate::views::settings::{SettingsDialog, stored_req};
 use crate::widgets::context_menu::{ContextMenu, ContextMenuItem, ContextMenuSeparator, MenuState};
 use crate::widgets::status::{FOCUS_RING, PILL_TABLIST, Status, StatusDot, pill_tab};
 
@@ -507,6 +508,7 @@ pub fn Topbar() -> impl IntoView {
                 // Outside the closure above, which re-runs on every `refresh_projects`.
                 <Show when=move || has_project.get()>
                     <ApprovalsPill cards />
+                    <AutopilotToggle />
                     <PageTabs count />
                 </Show>
                 {move || ctx.env.get().map(|env| view! { <EnvChips env /> })}
@@ -594,6 +596,75 @@ fn ApprovalsPill(cards: RwSignal<Option<Vec<TaskCard>>>) -> impl IntoView {
                 }}
             </button>
         </Show>
+    }
+}
+
+/// "Autopilota" chip of the selected project (`aria-pressed`): `update_project` with only
+/// `autopilot` flipped, the other settings as stored. Built once behind a memoized `Show`; the
+/// click reads the project then.
+#[component]
+fn AutopilotToggle() -> impl IntoView {
+    let ctx = use_app();
+    let on = Memo::new(move |_| {
+        let id = ctx.project.get();
+        ctx.projects
+            .with(|ps| ps.iter().any(|p| Some(&p.id) == id.as_ref() && p.autopilot))
+    });
+    let busy = RwSignal::new(false);
+    let toggle = move |_| {
+        let Some(mut req) = stored_req(ctx) else {
+            return;
+        };
+        req.autopilot = !req.autopilot;
+        busy.set(true);
+        spawn_local(async move {
+            match ipc::call::<UpdateProject>(&req).await {
+                Ok(saved) => {
+                    ctx.projects.try_update(|ps| {
+                        if let Some(p) = ps.iter_mut().find(|p| p.id == saved.id) {
+                            *p = saved;
+                        }
+                    });
+                }
+                Err(e) => ctx.toasts.app_error(&e),
+            }
+            busy.try_set(false);
+        });
+    };
+    view! {
+        <button
+            type="button"
+            class=move || {
+                let tone = if on.get() {
+                    "bg-status-running/12 text-status-running hover:bg-status-running/20"
+                } else {
+                    "text-muted-foreground hover:bg-muted hover:text-foreground"
+                };
+                format!(
+                    "inline-flex h-7 shrink-0 items-center gap-1.5 rounded-full px-2.5 text-xs font-medium whitespace-nowrap transition-colors disabled:opacity-50 {tone} {FOCUS_RING}",
+                )
+            }
+            title=move || {
+                if on.get() {
+                    "Autopilota attivo: avvia, verifica e corregge i task affidati"
+                } else {
+                    "Accendi l'autopilota del progetto"
+                }
+            }
+            aria-pressed=move || on.get().to_string()
+            data-action="toggle-autopilot"
+            disabled=move || busy.get()
+            on:click=toggle
+        >
+            {move || {
+                if on.get() {
+                    view! { <StatusDot status=Status::Running ping=true /> }.into_any()
+                } else {
+                    view! { <Bot class="size-3.5" /> }.into_any()
+                }
+            }}
+            "Autopilota"
+        </button>
     }
 }
 

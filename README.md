@@ -201,8 +201,43 @@ dell'agente. L'autonomia è **"crea libero, il resto chiede"**, in ogni modalit�
   esempio «Sposta «X» in Fatto», e non offre "Approva sempre": ogni chiamata chiede di nuovo. L'app esegue solo la
   chiamata che hai approvato, anche se il CLI non chiedesse.
 
-`start_task` rispetta "agenti in parallelo" (oltre il limite l'agente riceve un errore e il task non parte) e le
-opzioni sub-agent del chiamante; un agente avviato da un altro agente non può a sua volta avviare agenti.
+`start_task` rispetta "agenti in parallelo" (oltre il limite l'agente riceve un errore e il task non parte; con
+l'Autopilota acceso il task va invece in coda, sotto) e le opzioni sub-agent del chiamante; un agente avviato da un
+altro agente non può a sua volta avviare agenti.
+
+**Autopilota** (round del 2026-10-01). Un interruttore per progetto, nella topbar («Autopilota», con un puntino indaco
+quando è acceso) e nella pagina Impostazioni. Acceso, l'app guida da sola i task che le hai **affidato**: li avvia
+quando c'è un agente libero, a fine turno esegue il **comando di verifica**, rimanda all'agente gli errori e, se vuoi,
+fa il merge. Ti avvisa solo quando serve.
+- **Impostazioni del progetto**, sezione «Autopilota»: «Comando di verifica» (per esempio `cargo test`; vuoto =
+  nessuna verifica, il turno completato conta come verificato), «Timeout della verifica» (10–3600 s, default 600),
+  «Tentativi di correzione» (0–5, default 2), «Merge automatico se verificato» (spento di default).
+- **Il comando di verifica esegue codice del repository** sul tuo Mac, con i tuoi permessi e **senza chiedere**, anche
+  in Supervisionato e Auto-edit, dopo ogni turno completato: l'agente può aver modificato proprio i test o gli script
+  che il comando lancia. Gira con `/bin/sh -c` nel worktree del task, con lo stesso ambiente ripulito degli agenti, in
+  un process group suo che l'app chiude al timeout, alla fine, se scarti o elimini il task e quando esci. Si legge solo
+  dalle impostazioni dell'app, mai da file del repository. L'output va nei log del tentativo (0600) e la sua coda nel
+  pannello.
+- **Affidare un task**: nel dialog del task o nel pannello, «Affida all'autopilota»; «Parte dopo…» lo fa partire solo
+  quando un altro task del progetto è Fatto (una sola dipendenza; niente cicli né task annullati). I task affidati
+  partono in ordine di board, rispettando "agenti in parallelo" e la pausa per limite d'uso.
+- **Dopo un turno completato**: verifica. Se fallisce, l'app manda all'agente comando, codice d'uscita e coda
+  dell'output (fino ai tentativi impostati), anche aspettando che si liberi uno slot: una correzione passa prima dei
+  task in coda. Se passa: con «Merge automatico» fa lo squash merge del solo commit verificato (se ci sono conflitti li
+  rimanda all'agente, contandoli come correzione; se il worktree ha file non committati, per esempio scritti dalla
+  verifica, si ferma), altrimenti il task resta In revisione con il badge «Verificato».
+- **Non insiste mai**: un turno fallito, uno Stop, un limite d'uso, una verifica che non parte o i tentativi esauriti
+  fanno lasciare il task all'autopilota (resta In revisione, con una notifica). Scartare il tentativo riprende il task
+  (non riparte da solo).
+- **Sulla board**: un'icona robot sui task affidati, «In coda» (il tooltip dice perché aspetta), «Verifica…»,
+  «Verificato», «Verifica fallita (1/2)»; nel pannello la riga «Verifica: `comando` · passata · correzioni n/max» con
+  l'output collassabile.
+- **Agenti**: il sotto task che un agente affidato crea con `parent_id: "self"` è affidato anche lui e parte da solo
+  (con `after` in sequenza); uno `start_task` approvato senza slot liberi mette il task in coda invece di dare errore.
+  In entrambi i casi parte come se l'avesse avviato quell'agente, quindi non può avviare altri agenti.
+- **Notifiche macOS** (Impostazioni app, «Notifiche macOS», accese di default): un'approvazione in attesa su un task
+  affidato, pronto per il merge, mergiato, verifica fallita dopo i tentativi, avvio non riuscito, pausa per limite
+  d'uso. Al massimo una ogni 30 s per task e tipo.
 
 **Allegati.** Nel dialog del task, "Aggiungi file…" apre il selettore nativo del Mac: file qualsiasi (immagini
 comprese), al massimo 20 per task e 25 MB l'uno. L'app ne fa una **copia** in
@@ -327,8 +362,9 @@ conflitto; `background` lascia un `sleep 300` in un process group suo, che l'app
 `FAKE_CLAUDE_SUBAGENTS` sub-agent, default 3, e registra per ciascuno se l'app l'ha concesso o negato; `board_tools` usa i
 tool board come un agente: crea un sotto task di sé, elenca e legge, poi chiede di modificare, spostare (a
 `[status:S]` del messaggio, default `inreview`) e avviare (`[target:ID]`, default il sotto task creato), e con
-`[ask:skip]` chiama questi tre senza chiedere, per provare che l'app li rifiuta; `mcp_other` interroga un server MCP
-che l'app non ha). Scenario e tag si leggono fuori dalla sezione `## Parent task` del prompt di un sotto task. Come il
+`[ask:skip]` chiama questi tre senza chiedere, per provare che l'app li rifiuta; `board_chain` crea due sotto task di
+sé, il secondo con `after` sul primo; `fix_on_resume` è `simple`, ma in una sessione ripresa scrive anche `fixed.txt`,
+e lo gioca da solo il prompt di correzione dell'autopilota; `mcp_other` interroga un server MCP che l'app non ha). Scenario e tag si leggono fuori dalla sezione `## Parent task` del prompt di un sotto task. Come il
 CLI reale, fake-claude fa l'handshake MCP con il server `atm` dell'app prima di `system/init`, a ogni processo. Il
 follow-up di "Risolvi con l'agente" gioca da solo `resolve_merge`, sul target che il prompt dell'app nomina. Variabili:
 `FAKE_CLAUDE_AUTH=in|out` (stato di `auth status`), `FAKE_CLAUDE_AUTH_FILE` (file con `in`/`out` che la vince sulla
@@ -485,8 +521,13 @@ pannello del padre elenca, la card del padre conta "0/1" e la Lista mostra annid
 `board_tools_agent` (un task `[fake:board_tools]` con agenti in parallelo = 1: il sotto task nasce subito, modifica,
 spostamento e avvio chiedono con la frase leggibile e senza "Approva sempre", e l'avvio torna all'agente come errore
 `ConcurrencyLimit`) e `subtask_cascade` (eliminare il padre avvisa "Elimina anche 1 sotto task." e toglie padre e
-figlio); infine `project_removal`, il menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic
-fuori, e la sua rimozione dalla lista, mentre `main` resta selezionato.
+figlio); dal round del 2026-10-01, `autopilot_fix_and_merge` (l'interruttore della topbar e le Impostazioni del
+progetto con il comando `test -f fixed.txt` e il merge automatico; un task affidato dal dialog parte da solo, la
+prima verifica fallisce, la correzione dell'autopilota scrive `fixed.txt` e il task è mergiato da solo, con le
+notifiche registrate in un file invece che mostrate) e `autopilot_after` (con agenti in parallelo = 1, il secondo di
+due task affidati resta «In coda» finché il primo non è Fatto, poi parte ed è mergiato anche lui); infine
+`project_removal`, il menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic fuori, e la sua
+rimozione dalla lista, mentre `main` resta selezionato.
 
 L'app gira con `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CLAUDE_CODE_SESSION_ID`, `CLAUDE_CODE_MESSAGING_TOKEN`, `CLAUDE_EFFORT`, `GIT_DIR`, le variabili di cmux e il suo
@@ -507,7 +548,7 @@ passo 3; nella fase 2, tutti dopo i merge del passo 10 (che non devono farne fal
 
 I report JSON delle fasi 2 e 3 (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
 `security_confirmations`, `task_list_view`, `attachment_to_the_agent`, `subagent_limit`, `subtasks_from_the_panel`,
-`board_tools_agent`, `subtask_cascade`, `project_removal`,
+`board_tools_agent`, `subtask_cascade`, `autopilot_fix_and_merge`, `autopilot_after`, `project_removal`,
 `command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
 `perf_flood`, `csp_violations` sommate su tutti i caricamenti di pagina, `details` con cosa è stato verificato, con le
 misure della fase 3, o perché è fallito) sono l'unica cosa su stdout (i log di build vanno su stderr); lo script esce
@@ -642,6 +683,13 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
   agente avviato da un agente non può avviarne altri; l'approvazione di `start_task` non mostra la modalità che avrà il
   nuovo agente; il loro funzionamento con il CLI reale dipende da un protocollo non documentato di Claude Code,
   verificato solo dallo spike (sopra).
+- Autopilota: non riprova mai da solo un turno fallito, fermato o al limite d'uso, e non riprende un turno interrotto
+  dalla chiusura dell'app; una verifica interrotta dalla chiusura diventa "non eseguita" e il task resta a te. Il
+  comando di verifica gira senza chiedere in ogni modalità (sopra). Un file non ignorato scritto dalla verifica blocca
+  il merge automatico. Spegnere l'autopilota non ferma una verifica in corso. Un task annullato dopo essere stato
+  scelto in «Parte dopo…» blocca chi dipende da lui. Notifiche solo macOS, al massimo una ogni 30 s per task e tipo,
+  senza azioni. Le card mostrano un cambio dell'autopilota del progetto o dei tentativi alla loro prossima modifica, e
+  la riga «Verifica:» del pannello mostra il comando attuale, non la durata (spec §13.7).
 - L'E2E non automatizza i selettori nativi di cartelle e di file né il drag nativo col mouse; i tempi della sua fase 3
   si misurano solo con lo schermo sbloccato e la finestra visibile (altrimenti il report li dà come non misurati).
 
@@ -720,4 +768,5 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | Regola `ask` su `Agent` con il CLI reale in ogni modalità, deny del limite, `CLAUDE_CODE_SUBAGENT_MODEL`, `--add-dir` con spazi | **verificato** il 2026-09-29 con il CLI 2.1.284: 4 test `#[ignore]` di `tests/real_cli.rs` passati, 7 turni reali (sopra) | round 2026-09-29 |
 | Server MCP `sdk` in-process sul control protocol (spike del 2026-09-30) | **verificato** con il CLI 2.1.285 (2 turni haiku): `--mcp-config={"mcpServers":{"atm":{"type":"sdk","name":"atm"}}}` compatibile con `--strict-mcp-config`; handshake `initialize`, `notifications/initialized`, `tools/list` come `mcp_message` prima di `system/init`; `tools/call` con `_meta."claudecode/toolUseId"`; risposte `{"mcp_response": …}`; tool `mcp__atm__<nome>`; la regola `ask` manda `can_use_tool` (con `mcp_server.source = "sdk"`) in `default` e in `bypassPermissions` | round 2026-09-30 |
 | Sotto task e tool board con fake-claude | confermato: sotto task validati (un livello, stesso progetto), eliminazione a cascata con worktree, allegati e log, `Busy` senza toccare nulla se gira il padre o un figlio (`tests/flow.rs::deleting_a_parent_deletes_its_subtasks_and_their_files`, `deleting_a_running_parent_removes_nothing`), sezione `## Parent task` nel prompt (`a_subtask_prompt_carries_its_parent`); tool board: creazione immediata, modifica, spostamento e avvio solo dopo l'approvazione, rifiuto rispettato, chiamata non approvata rifiutata dall'app, `ConcurrencyLimit`, profondità 2, modalità del progetto per un task non figlio, nessun accesso ad altri progetti (`board_tools_*`, `board_start_*`, `a_denied_board_tool_changes_nothing`, `an_unapproved_board_call_is_refused`); E2E `subtasks_from_the_panel`, `board_tools_agent`, `subtask_cascade` | round 2026-09-30 |
+| Autopilota con fake-claude | confermato: coda che rispetta "agenti in parallelo" e riempie gli slot liberi, `after`, verifica fallita → correzione → merge automatico o «pronto», tentativi esauriti, conflitti rimandati all'agente, nulla in pausa, Stop rispettato, coda ricostruita al riavvio, timeout e chiusura dell'app che uccidono il gruppo della verifica, nessuna corsa con un merge manuale, correzione che aspetta uno slot e passa prima della coda, follow-up dell'utente durante una verifica, discard che riprende il task, cicli di dipendenze rifiutati, task in coda da un agente avviati con `started_by_attempt` (`tests/flow.rs::autopilot_*`, `board_start_without_a_slot_is_queued_in_an_autopilot_project`, `board_subtasks_inherit_auto_and_take_after`); E2E `autopilot_fix_and_merge`, `autopilot_after` | round 2026-10-01 |
 | Tool board con il CLI reale nell'app, in Supervisionato, Auto-edit e Autonomo | **verificato** il 2026-10-01 con il CLI 2.1.286: `real_cli_board_tools_ask_in_every_mode`, 3 turni haiku, circa 0,19 USD | round 2026-09-30 |

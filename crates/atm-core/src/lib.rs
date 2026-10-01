@@ -4,9 +4,11 @@
 //!
 //! Module owners after M1 (spec §11.2): `db` M2-DB, `git` M2-GIT, `claude`/`wire`/`normalize`
 //! M2-CLAUDE, `lib`/`runner`/`live` M3-CORE; `attachments` CORE-RUNNER (feature round of
-//! 2026-09-29). Public signatures are frozen; owners only add.
+//! 2026-09-29), `autopilot` (round of 2026-10-01). Public signatures are frozen; owners only
+//! add.
 
 pub mod attachments;
+mod autopilot;
 pub mod claude;
 pub mod db;
 pub mod git;
@@ -27,13 +29,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use atm_types::{
     AddProjectReq, AddProjectRes, AddTaskAttachmentsReq, AppError, Attachment, AttemptIdReq,
     AttemptState, AttemptView, AuthState, BranchList, BranchStatus, Changed, ConfigPolicy,
-    CreateTaskReq, DiffResult, EVENT_CHANGED, EVENT_ENV_CHANGED, EntryPage, EnvStatus, ErrorCode,
-    GetEntriesReq, GetEnvReq, Id, IdReq, MAX_ATTACHMENTS_PER_TASK, MAX_PROJECT_DESCRIPTION,
-    MAX_SUBAGENTS, MODEL_ALIASES, MergeAttemptReq, MergeOutcome, Millis, MoveTaskReq,
-    OpenAttemptReq, OpenLoginTerminalReq, OpenTarget, OpenUrlReq, PermissionMode, PickedFile,
-    ProcessInfo, Project, ProjectIdReq, ProjectOverview, RespondApprovalReq, SendFollowUpReq,
-    SetProjectSecurityReq, Settings, StartAttemptReq, Task, TaskCard, TaskDetail, TaskStatus,
-    UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq, WorktreeState,
+    CreateTaskReq, DEFAULT_AUTOPILOT_MAX_FIXES, DEFAULT_VERIFY_TIMEOUT_SECS, DiffResult,
+    EVENT_CHANGED, EVENT_ENV_CHANGED, EntryPage, EnvStatus, ErrorCode, GetEntriesReq, GetEnvReq,
+    Id, IdReq, MAX_ATTACHMENTS_PER_TASK, MAX_AUTOPILOT_FIXES, MAX_PROJECT_DESCRIPTION,
+    MAX_SUBAGENTS, MAX_VERIFY_COMMAND, MODEL_ALIASES, MergeAttemptReq, MergeOutcome, Millis,
+    MoveTaskReq, OpenAttemptReq, OpenLoginTerminalReq, OpenTarget, OpenUrlReq, PermissionMode,
+    PickedFile, ProcessInfo, Project, ProjectIdReq, ProjectOverview, RespondApprovalReq,
+    SendFollowUpReq, SetProjectSecurityReq, Settings, StartAttemptReq, Task, TaskCard, TaskDetail,
+    TaskStatus, UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq, VERIFY_TIMEOUT_SECS,
+    WorktreeState,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -85,6 +89,9 @@ pub struct CoreConfig {
     /// the login, Finder, editor, URLs) is appended to this file as a JSON array of its
     /// arguments instead. Ignored in release builds.
     pub open_log: Option<PathBuf>,
+    /// Tests and the E2E: every macOS notification ([`Inner::notify`]) is appended to this
+    /// file as a JSON array `[task_id, title, body]` instead of running `osascript`.
+    pub notify_log: Option<PathBuf>,
 }
 
 /// Unix time in milliseconds.
@@ -103,6 +110,10 @@ pub fn new_id() -> Id {
 const ENV_TTL: Duration = Duration::from_secs(60);
 /// The login script outlives the UI's polling (at most 10 minutes, spec §7.10).
 const LOGIN_SCRIPT_TTL: Duration = Duration::from_secs(600);
+/// At most one notification per task in this window ([`Inner::notify`]).
+const NOTIFY_EVERY: Duration = Duration::from_secs(30);
+/// An `osascript` still running after this is killed with its group.
+const NOTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The application service. One method per IPC command (spec §6.3), all returning typed
 /// [`AppError`]s; `pick_repo_folder` and the native confirmations live in the shell.
@@ -140,6 +151,11 @@ struct Inner {
     commit_configs: Mutex<HashMap<(String, String), Result<ConfigSnapshot, AppError>>>,
     /// Files the picker returned, by one-use token (spec F5).
     picks: Mutex<attachments::Staging>,
+    /// The scheduler's wake-up and the verifications running now (round of 2026-10-01).
+    autopilot: autopilot::Autopilot,
+    /// When each task (`""`: the app) last had a notification of each title
+    /// ([`Inner::notify`]).
+    notified: Mutex<HashMap<String, Instant>>,
 }
 
 /// Size of [`Inner::commit_configs`] past which it starts over.
@@ -243,17 +259,26 @@ impl Core {
                 home_canonical,
                 commit_configs: Mutex::default(),
                 picks: Mutex::default(),
+                autopilot: autopilot::Autopilot::default(),
+                notified: Mutex::default(),
             }),
         })
     }
 
     /// Runs before the UI loads data (spec §7.9): orphan recovery (`Db::mark_orphans`,
-    /// verified kill, cancelled tools, auto-commit), worktree reconciliation, first env check.
+    /// verified kill, cancelled tools, auto-commit), verifications cut by the app closing →
+    /// `error` (`Db::mark_stale_verifies`, with a notification), worktree reconciliation,
+    /// first env check, then the autopilot's scheduler (it rebuilds its queue from the DB).
     pub async fn startup(&self) -> Result<(), AppError> {
-        self.inner.recover_orphans().await?;
-        self.inner.reconcile_worktrees().await;
-        self.inner.probe(false).await;
-        self.inner.emit_changed(None, None);
+        let s = &self.inner;
+        s.recover_orphans().await?;
+        for attempt_id in s.db.mark_stale_verifies(now_ms())? {
+            s.stale_verify(&attempt_id);
+        }
+        s.reconcile_worktrees().await;
+        s.probe(false).await;
+        s.emit_changed(None, None);
+        autopilot::spawn(s);
         Ok(())
     }
 
@@ -268,6 +293,10 @@ impl Core {
             s.closing.store(true, Ordering::SeqCst);
             turns.values().cloned().collect()
         };
+        // The scheduler sees `closing` and ends; a verification running is killed (one spawned
+        // later sees `closing`).
+        s.autopilot.wake();
+        s.autopilot.kill_verifies(None).await;
         for turn in &turns {
             turn.stop(StopCause::Shutdown, StopTimings::SHUTDOWN);
         }
@@ -335,6 +364,7 @@ impl Core {
     /// Clears the usage-limit pause; emits `env_changed`.
     pub async fn resume_agents(&self) -> Result<EnvStatus, AppError> {
         *guard(&self.inner.paused) = None;
+        self.inner.autopilot.wake();
         Ok(self.inner.emit_env().await)
     }
 
@@ -414,6 +444,7 @@ impl Core {
         if rediscover || old.max_running != req.max_running {
             s.emit_env().await;
         }
+        s.autopilot.wake();
         Ok(req)
     }
 
@@ -474,6 +505,11 @@ impl Core {
             allow_bypass: false,
             created_at: now,
             updated_at: now,
+            autopilot: false,
+            autopilot_merge: false,
+            verify_command: None,
+            verify_timeout_secs: DEFAULT_VERIFY_TIMEOUT_SECS,
+            autopilot_max_fixes: DEFAULT_AUTOPILOT_MAX_FIXES,
         };
         s.db.insert_project(&row)?;
         s.emit_changed(None, None);
@@ -483,8 +519,10 @@ impl Core {
         })
     }
 
-    /// The description is trimmed. Errors: `NotFound`, `Invalid` (target branch not in
-    /// `refs/heads`, description over [`MAX_PROJECT_DESCRIPTION`] characters).
+    /// The description and the verify command are trimmed (an empty command = none). Errors:
+    /// `NotFound`, `Invalid` (target branch not in `refs/heads`, description over
+    /// [`MAX_PROJECT_DESCRIPTION`] characters, verify command over [`MAX_VERIFY_COMMAND`],
+    /// timeout outside [`VERIFY_TIMEOUT_SECS`], fixes over [`MAX_AUTOPILOT_FIXES`]).
     pub async fn update_project(&self, req: UpdateProjectReq) -> Result<Project, AppError> {
         let s = &self.inner;
         let row = s.db.project(&req.id)?;
@@ -504,6 +542,27 @@ impl Core {
                 "La descrizione può avere al massimo {MAX_PROJECT_DESCRIPTION} caratteri"
             )));
         }
+        let verify_command = non_empty(req.verify_command.clone());
+        if verify_command
+            .as_ref()
+            .is_some_and(|c| c.chars().count() > MAX_VERIFY_COMMAND)
+        {
+            return Err(AppError::invalid(format!(
+                "Il comando di verifica può avere al massimo {MAX_VERIFY_COMMAND} caratteri"
+            )));
+        }
+        if !VERIFY_TIMEOUT_SECS.contains(&req.verify_timeout_secs) {
+            return Err(AppError::invalid(format!(
+                "Il timeout della verifica va da {} a {} secondi",
+                VERIFY_TIMEOUT_SECS.start(),
+                VERIFY_TIMEOUT_SECS.end()
+            )));
+        }
+        if req.autopilot_max_fixes > MAX_AUTOPILOT_FIXES {
+            return Err(AppError::invalid(format!(
+                "I tentativi di correzione vanno da 0 a {MAX_AUTOPILOT_FIXES}"
+            )));
+        }
         check_bypass(req.default_permission_mode, &row)?;
         s.git()
             .await
@@ -517,10 +576,12 @@ impl Core {
             name: name.to_owned(),
             default_model: non_empty(req.default_model),
             description: description.to_owned(),
+            verify_command,
             ..req
         };
         let row = s.db.update_project(&req, now_ms())?;
         s.emit_changed(None, None);
+        s.autopilot.wake();
         Ok(s.project_view(&row).await)
     }
 
@@ -730,8 +791,13 @@ impl Core {
         if let Some(parent_id) = &req.parent_id {
             check_parent(&s.db, &req.project_id, parent_id)?;
         }
-        let task = s.db.insert_task(&new_id(), &req, now_ms())?;
+        let id = new_id();
+        if let Some(after_id) = &req.after_id {
+            check_after(&s.db, &req.project_id, &id, after_id)?;
+        }
+        let task = s.db.insert_task(&id, &req, now_ms())?;
         s.emit_changed(Some(&task.project_id), Some(&task.id));
+        s.autopilot.wake();
         s.card(&task.id)
     }
 
@@ -741,8 +807,13 @@ impl Core {
             title: req.title.trim().to_owned(),
             ..req
         };
+        if let Some(Some(after_id)) = &req.after_id {
+            let task = s.db.task(&req.id)?;
+            check_after(&s.db, &task.project_id, &task.id, after_id)?;
+        }
         let task = s.db.update_task(&req, now_ms())?;
         s.emit_changed(Some(&task.project_id), Some(&task.id));
+        s.autopilot.wake();
         s.card(&task.id)
     }
 
@@ -759,6 +830,7 @@ impl Core {
         }
         s.db.move_task(&req.id, req.status, req.before_id.as_deref(), now_ms())?;
         s.emit_changed(Some(&task.project_id), Some(&task.id));
+        s.autopilot.wake();
         Ok(())
     }
 
@@ -769,6 +841,12 @@ impl Core {
         let task = s.db.task(&req.id)?;
         let project = s.db.project(&task.project_id)?;
         let git = s.git().await;
+        // A verification would hold its attempt's lock until it ends.
+        let mut attempts = Vec::new();
+        for id in std::iter::once(task.id.clone()).chain(s.db.task_children(&task.id)?) {
+            attempts.extend(s.db.task_attempts(&id)?.into_iter().map(|a| a.id));
+        }
+        s.autopilot.kill_verifies(Some(&attempts)).await;
         // Every task's lock across the whole cascade, parent first: none of them starts, and
         // no sub-task is created (`create_task` takes the parent's) until it is over.
         let _task = s.lock(task_key(&task.id)).await;
@@ -790,6 +868,8 @@ impl Core {
         if let Some(parent_id) = &task.parent_id {
             s.emit_changed(Some(&task.project_id), Some(parent_id));
         }
+        // Its dependents' `after_id` is now null.
+        s.autopilot.wake();
         Ok(())
     }
 
@@ -1000,6 +1080,10 @@ impl Core {
             max_subagents: req.max_subagents,
             subagents_used: 0,
             started_by_attempt: started_by,
+            verify_state: None,
+            verify_head: None,
+            verify_fixes: 0,
+            verify_summary: None,
             allow_rules: Vec::new(),
             merge_commit: None,
             created_at: now,
@@ -1201,6 +1285,8 @@ impl Core {
             .map_err(|e| s.missing_on(e, &ctx))?;
         if s.turn(&a.id).is_some() {
             status.merge_blocked = Some("Un turno dell'agente è in corso".into());
+        } else if s.autopilot.is_verifying(&a.id) {
+            status.merge_blocked = Some("La verifica dell'autopilota è in corso".into());
         }
         Ok(status)
     }
@@ -1208,6 +1294,26 @@ impl Core {
     /// Spec §8.7. Errors: `Busy`, `WorktreeMissing`, `BranchMismatch`,
     /// `TargetCheckoutDirty`, `GitIdentityMissing`, `Git`.
     pub async fn merge_attempt(&self, req: MergeAttemptReq) -> Result<MergeOutcome, AppError> {
+        let merged = self.merge_checked(req, None).await?;
+        Ok(merged.expect("no verified head to compare"))
+    }
+
+    /// The autopilot's merge of the verified commit `head` alone: `None` if the worktree's
+    /// HEAD is no longer `head` (verify again). Errors: those of [`Core::merge_attempt`], and
+    /// `Invalid` for changes not committed since the verification (it may have written them).
+    pub(crate) async fn merge_attempt_at(
+        &self,
+        req: MergeAttemptReq,
+        head: &str,
+    ) -> Result<Option<MergeOutcome>, AppError> {
+        self.merge_checked(req, Some(head)).await
+    }
+
+    async fn merge_checked(
+        &self,
+        req: MergeAttemptReq,
+        verified: Option<&str>,
+    ) -> Result<Option<MergeOutcome>, AppError> {
         let s = &self.inner;
         let _attempt = s.lock(attempt_key(&req.attempt_id)).await;
         let ctx = s.db.attempt_ctx(&req.attempt_id)?;
@@ -1222,6 +1328,17 @@ impl Core {
         }
         let worktree = s.present_worktree(&ctx)?;
         let git = s.git().await;
+        // Under the attempt's lock: no turn can move the HEAD before the squash.
+        if let Some(head) = verified {
+            if git.head(worktree).await.ok().as_deref() != Some(head) {
+                return Ok(None);
+            }
+            if !git.is_clean(worktree).await? {
+                return Err(AppError::invalid(
+                    "il worktree ha modifiche non verificate (scritte dalla verifica?)",
+                ));
+            }
+        }
         let repo = Path::new(&ctx.project.repo_path);
         let _repo = s.lock(repo_key(&ctx.project.repo_path)).await;
         let outcome = git
@@ -1239,7 +1356,7 @@ impl Core {
             commit, strategy, ..
         } = outcome
         else {
-            return Ok(outcome);
+            return Ok(Some(outcome));
         };
         s.db.finish_merge(&a.id, &commit, now_ms())?;
         let mut cleanup_warning = None;
@@ -1249,14 +1366,17 @@ impl Core {
             cleanup_warning = Some(e.message);
         }
         s.emit_changed(Some(&ctx.project.id), Some(&ctx.task.id));
-        Ok(MergeOutcome::Merged {
+        // The tasks queued after this one may start.
+        s.autopilot.wake();
+        Ok(Some(MergeOutcome::Merged {
             commit,
             strategy,
             cleanup_warning,
-        })
+        }))
     }
 
-    /// Stops the turn, snapshot commit, removes the worktree (spec §5.4).
+    /// Stops the turn (and the autopilot's verification), snapshot commit, removes the
+    /// worktree (spec §5.4). The task is no longer the autopilot's: it would start it again.
     pub async fn discard_attempt(&self, req: AttemptIdReq) -> Result<(), AppError> {
         let s = &self.inner;
         if s.db.attempt(&req.attempt_id)?.state != AttemptState::Active {
@@ -1266,6 +1386,9 @@ impl Core {
             turn.stop(StopCause::User, StopTimings::NORMAL);
             turn.finished().await;
         }
+        s.autopilot
+            .kill_verifies(Some(std::slice::from_ref(&req.attempt_id)))
+            .await;
         let _attempt = s.lock(attempt_key(&req.attempt_id)).await;
         if s.turn(&req.attempt_id).is_some() {
             return Err(busy_turn());
@@ -1284,7 +1407,11 @@ impl Core {
             )?;
         }
         s.db.finish_discard(&ctx.attempt.id, now_ms())?;
+        if ctx.task.auto {
+            s.db.set_task_auto(&ctx.task.id, false, now_ms())?;
+        }
         s.emit_changed(Some(&ctx.project.id), Some(&ctx.task.id));
+        s.autopilot.wake();
         Ok(())
     }
 
@@ -1614,6 +1741,74 @@ impl Inner {
         }
     }
 
+    /// A macOS notification about `task` (`None`: the app). Skipped when the settings turn
+    /// notifications off or when the same task had one with the same title less than
+    /// [`NOTIFY_EVERY`] ago. Never
+    /// blocks: `osascript` runs in a spawned task, argv only (the texts are the script's
+    /// `argv`, never part of it), with a scrubbed environment, in a process group of its own,
+    /// killed with its tree after [`NOTIFY_TIMEOUT`], output discarded. With
+    /// `CoreConfig::notify_log` it is recorded there instead.
+    pub(crate) fn notify(&self, task: Option<&str>, title: &str, body: &str) {
+        if !self.db.settings().is_ok_and(|s| s.notifications) {
+            return;
+        }
+        // Per task and kind: an approval asked does not hide the autopilot's outcome.
+        let key = format!("{}\n{title}", task.unwrap_or_default());
+        {
+            let mut notified = guard(&self.notified);
+            let now = Instant::now();
+            notified.retain(|_, at| now.duration_since(*at) < NOTIFY_EVERY);
+            if notified.contains_key(&key) {
+                return;
+            }
+            notified.insert(key, now);
+        }
+        if let Some(log) = &self.config.notify_log {
+            use std::io::Write as _;
+            let line = serde_json::to_string(&[task.unwrap_or_default(), title, body])
+                .unwrap_or_default()
+                + "\n";
+            let written = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)
+                .and_then(|mut f| f.write_all(line.as_bytes()));
+            if let Err(e) = written {
+                eprintln!("{}: notification not recorded: {e}", log.display());
+            }
+            return;
+        }
+        let env = ChildEnv::new(self.base_env(), "/usr/bin:/bin".as_ref(), false);
+        let mut cmd = tokio::process::Command::new("/usr/bin/osascript");
+        cmd.args(["-e", "on run argv", "-e"])
+            .arg("display notification (item 2 of argv) with title (item 1 of argv)")
+            // `--`: a text that starts with `-` is an argument, not an option.
+            .args(["-e", "end run", "--", title, body])
+            .current_dir("/")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true);
+        env.apply(&mut cmd);
+        tokio::spawn(async move {
+            let mut child = match cmd.spawn() {
+                Ok(child) => child,
+                Err(e) => return eprintln!("osascript: {e}"),
+            };
+            let pgid = child.id().map(|id| id as i32);
+            if tokio::time::timeout(NOTIFY_TIMEOUT, child.wait())
+                .await
+                .is_err()
+            {
+                if let Some(pgid) = pgid {
+                    claude::kill_tree(pgid);
+                }
+                let _ = child.wait().await;
+            }
+        });
+    }
+
     fn turn(&self, attempt_id: &str) -> Option<Arc<TurnHandle>> {
         guard(&self.turns).get(attempt_id).cloned()
     }
@@ -1633,6 +1828,10 @@ impl Inner {
             .attempt_id
             .as_deref()
             .map_or((false, 0), |id| self.live_state(id));
+        card.verifying = card
+            .attempt_id
+            .as_deref()
+            .is_some_and(|id| self.autopilot.is_verifying(id));
     }
 
     fn card(&self, task_id: &str) -> Result<TaskCard, AppError> {
@@ -2004,6 +2203,36 @@ fn check_parent(db: &Db, project_id: &str, parent_id: &str) -> Result<(), AppErr
         return Err(AppError::invalid(
             "Un sotto task non può avere a sua volta sotto task",
         ));
+    }
+    Ok(())
+}
+
+/// A task's dependency (`after_id`): an existing task of the same project, not cancelled
+/// (it would never be done), and no cycle back to the task itself (none of them would ever
+/// start). Errors: `Invalid`.
+fn check_after(db: &Db, project_id: &str, task_id: &str, after_id: &str) -> Result<(), AppError> {
+    if after_id == task_id {
+        return Err(AppError::invalid("Un task non può partire dopo se stesso"));
+    }
+    let after = db.task(after_id).map_err(|e| match e.code {
+        ErrorCode::NotFound => AppError::invalid("Il task da cui dipende non esiste"),
+        _ => e,
+    })?;
+    if after.project_id != project_id {
+        return Err(AppError::invalid(
+            "Il task da cui dipende appartiene a un altro progetto",
+        ));
+    }
+    if after.status == TaskStatus::Cancelled {
+        return Err(AppError::invalid("Il task da cui dipende è annullato"));
+    }
+    let (mut next, mut seen) = (after.after_id, vec![after.id]);
+    while let Some(id) = next.filter(|id| !seen.contains(id)) {
+        if id == task_id {
+            return Err(AppError::invalid("Dipendenza circolare tra i task"));
+        }
+        next = db.task(&id)?.after_id;
+        seen.push(id);
     }
     Ok(())
 }

@@ -677,7 +677,9 @@ pub fn append_prompt(worktree: &Path, branch: &str, target_branch: &str) -> Stri
          what they ask. If a CLAUDE.md or AGENTS.md exists at the repository root, read it \
          first and follow its conventions. \
          The mcp__atm__* tools manage this project's task board. To split your work into \
-         subtasks, use mcp__atm__create_task with parent_id \"self\".",
+         subtasks, use mcp__atm__create_task with parent_id \"self\". When your task is \
+         driven by the autopilot, its subtasks start on their own: give a subtask `after` \
+         (another task's id) to start it only once that task is done.",
         worktree.display()
     )
 }

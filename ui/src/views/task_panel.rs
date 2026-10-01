@@ -1,14 +1,15 @@
 //! Task panel (right split, 55 %): header on three rows (column and date with the actions:
 //! Avvia, Merge, Stop, Continua, Scarta, Apri in…, "Sposta in…"; the title, under a sub-task's
 //! "↳ parent" link; the agent badge, the branch and the attachments) plus the attempt's
-//! label/value line, a top-level task's "Sotto task", and the Agente / Modifiche tabs (spec
+//! label/value line, the autopilot's fields and its verification, a top-level task's "Sotto task", and the Agente / Modifiche tabs (spec
 //! §9.2). Refetches `get_task_detail` when `AppCtx::detail_version`
 //! changes. Owner: M2-UI-TASK, attachments and model line UI-TASKS.
 
 use atm_types::{
     AppError, AttemptIdReq, AttemptView, CONTINUE_PROMPT, GetTaskDetail, Id, IdReq, MoveTask,
     MoveTaskReq, OpenAttempt, OpenAttemptReq, OpenTarget, SendFollowUp, SendFollowUpReq,
-    StopAttempt, Task, TaskCard, TaskDetail, TaskStatus, WorktreeState,
+    StopAttempt, Task, TaskCard, TaskDetail, TaskStatus, UpdateTask, UpdateTaskReq, VerifyState,
+    WorktreeState,
 };
 use icons::{
     Code, FolderOpen, GitBranch, GitMerge, Paperclip, Play, Plus, RotateCw, Square, SquareTerminal,
@@ -38,7 +39,7 @@ use crate::views::diff::{ClosedAttempt, DiffView};
 use crate::views::merge_dialog::DiscardDialog;
 use crate::views::overview::short_commit;
 use crate::views::start_dialog::StartDialog;
-use crate::views::task_dialog::{TaskDialogMode, format_size};
+use crate::views::task_dialog::{AutopilotFields, TaskDialogMode, format_size};
 use crate::views::transcript::{Transcript, mode_label};
 use crate::widgets::status::{AgentBadge, FOCUS_RING, Status, StatusDot, agent_state};
 
@@ -201,6 +202,39 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
     });
     let start_for = RwSignal::new(None::<Id>);
     let discard_open = RwSignal::new(false);
+    // The autopilot's fields follow the task and save at each change.
+    let auto = RwSignal::new(false);
+    let after = RwSignal::new(String::new());
+    let follow = move || {
+        let (a, af) = task.with_untracked(|t| (t.auto, t.after_id.clone()));
+        auto.set(a);
+        after.set(af.unwrap_or_default());
+    };
+    Effect::new(move |_| {
+        task.track();
+        follow();
+    });
+    let save_auto = Callback::new(move |()| {
+        let t = task.get_untracked();
+        let after_id = Some(after.get_untracked()).filter(|a| !a.is_empty());
+        let req = UpdateTaskReq {
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            auto: Some(auto.get_untracked()),
+            after_id: Some(after_id),
+        };
+        spawn_local(async move {
+            if let Err(e) = ipc::call::<UpdateTask>(&req).await {
+                ctx.toasts.app_error(&e);
+                follow();
+            }
+        });
+    });
+    let editable = Memo::new(move |_| {
+        task.with(|t| !matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled))
+    });
+    let own_id = task.with_untracked(|t| t.id.clone());
     let task_id = move || task.with_untracked(|t| t.id.clone());
     let open_start = move |_| start_for.set(Some(task_id()));
 
@@ -422,6 +456,19 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                     </For>
                 </dl>
             </Show>
+            <VerifyLine task active />
+            <Show when=move || editable.get()>
+                <div class="mt-2.5" data-testid="task-autopilot">
+                    <AutopilotFields
+                        auto_id="panel-auto"
+                        after_id="panel-after"
+                        task_id=Some(own_id.clone())
+                        auto
+                        after
+                        on_change=save_auto
+                    />
+                </div>
+            </Show>
         </header>
         // One level only: a sub-task has none of its own.
         <Show when=move || parent_id.with(Option::is_none)>
@@ -509,6 +556,87 @@ fn PanelBody(detail: RwSignal<Option<TaskDetail>>, initial: Task) -> impl IntoVi
                     view! { <DiscardDialog open=discard_open attempt_id branch /> }
                 })
         }}
+    }
+}
+
+/// "Verifica: `cmd` · passata · correzioni 1/2" of the active attempt (autopilot), with the
+/// output's tail in a collapsible; nothing before its first verification. `cmd` is the
+/// project's command now (it may have changed since), and no duration is recorded (spec §9.2).
+#[component]
+fn VerifyLine(task: Memo<Task>, active: Memo<Option<AttemptView>>) -> impl IntoView {
+    let ctx = use_app();
+    let verifying = Memo::new(move |_| {
+        let id = task.with(|t| t.id.clone());
+        ctx.cards
+            .with(|cards| cards.iter().any(|c| c.task.id == id && c.verifying))
+    });
+    let project = Memo::new(move |_| {
+        let project_id = task.with(|t| t.project_id.clone());
+        ctx.projects.with(|ps| {
+            ps.iter()
+                .find(|p| p.id == project_id)
+                .map(|p| (p.verify_command.clone(), p.autopilot_max_fixes))
+        })
+    });
+    let state = Memo::new(move |_| {
+        let (state, fixes, summary) = active.with(|a| {
+            a.as_ref()
+                .map(|a| (a.verify_state, a.verify_fixes, a.verify_summary.clone()))
+        })?;
+        let state = if verifying.get() {
+            VerifyState::Running
+        } else {
+            state?
+        };
+        Some((state, fixes, summary))
+    });
+    move || {
+        state.get().map(|(state, fixes, summary)| {
+            let (label, name, status) = match state {
+                VerifyState::Running => ("in corso", "running", Status::Running),
+                VerifyState::Passed => ("passata", "passed", Status::Done),
+                VerifyState::Failed => ("fallita", "failed", Status::Failed),
+                VerifyState::Error => ("non eseguita", "error", Status::Failed),
+            };
+            let (command, max) = project.get().unwrap_or_default();
+            let fixes = (fixes > 0 || state == VerifyState::Failed)
+                .then(|| format!(" · correzioni {fixes}/{max}"));
+            view! {
+                <div class="mt-2.5 flex flex-col gap-1.5 text-xs" data-verify=name>
+                    <p class="flex min-w-0 items-center gap-1.5">
+                        <StatusDot status ping=status.pings() />
+                        <span class="text-muted-foreground shrink-0">"Verifica:"</span>
+                        {command
+                            .map(|c| {
+                                view! {
+                                    <code
+                                        class="bg-muted min-w-0 truncate rounded px-1 font-mono text-[11px]"
+                                        title=format!("Comando attuale del progetto: {c}")
+                                    >
+                                        {c.clone()}
+                                    </code>
+                                    <span aria-hidden="true">"·"</span>
+                                }
+                            })}
+                        <span class="shrink-0">{label}{fixes}</span>
+                    </p>
+                    {summary
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|summary| {
+                            view! {
+                                <details class="group">
+                                    <summary class=format!(
+                                        "text-muted-foreground hover:text-foreground w-fit cursor-pointer rounded-sm {FOCUS_RING}",
+                                    )>"Output della verifica"</summary>
+                                    <pre class="bg-muted mt-1.5 max-h-60 overflow-auto rounded-md p-2 font-mono text-[11px] whitespace-pre-wrap [overflow-wrap:anywhere]">
+                                        {summary}
+                                    </pre>
+                                </details>
+                            }
+                        })}
+                </div>
+            }
+        })
     }
 }
 
@@ -667,6 +795,9 @@ fn panel_state(d: &TaskDetail) -> Option<(&'static str, Status)> {
         worktree_state: Some(attempt.worktree_state),
         subtasks_done: 0,
         subtasks_total: 0,
+        verifying: false,
+        verify_state: None,
+        verify_fixes: 0,
     })
 }
 

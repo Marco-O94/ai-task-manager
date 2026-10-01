@@ -33,6 +33,8 @@ fn task() -> Task {
         created_at: 1_790_000_000_000,
         updated_at: 1_790_000_000_500,
         parent_id: Some(id(9)),
+        auto: true,
+        after_id: Some(id(14)),
     }
 }
 
@@ -51,6 +53,11 @@ fn project() -> Project {
         created_at: 1,
         updated_at: 2,
         trust_error: None,
+        autopilot: true,
+        autopilot_merge: false,
+        verify_command: Some("cargo test".into()),
+        verify_timeout_secs: 600,
+        autopilot_max_fixes: 2,
     }
 }
 
@@ -77,6 +84,10 @@ fn attempt() -> AttemptView {
         created_at: 3,
         closed_at: None,
         started_by_attempt: Some(id(12)),
+        verify_state: Some(VerifyState::Failed),
+        verify_head: Some("abc124".into()),
+        verify_fixes: 1,
+        verify_summary: Some("test result: FAILED".into()),
     }
 }
 
@@ -454,6 +465,7 @@ fn db_enums_match_db_and_cli_strings() {
     check_db_enum(ConfigPolicy::ALL);
     check_db_enum(Effort::ALL);
     check_db_enum(StopReason::ALL);
+    check_db_enum(VerifyState::ALL);
     assert_eq!(PermissionMode::AcceptEdits.as_str(), "acceptEdits");
     assert_eq!(Effort::XHigh.as_str(), "xhigh");
 }
@@ -468,6 +480,7 @@ fn enum_snapshots() {
     insta::assert_json_snapshot!("config_policy", ConfigPolicy::ALL);
     insta::assert_json_snapshot!("effort", Effort::ALL);
     insta::assert_json_snapshot!("stop_reason", StopReason::ALL);
+    insta::assert_json_snapshot!("verify_state", VerifyState::ALL);
     insta::assert_json_snapshot!("error_code", ERROR_CODES);
     insta::assert_json_snapshot!("level", LEVELS);
     insta::assert_json_snapshot!("notice_action", NOTICE_ACTIONS);
@@ -533,6 +546,9 @@ fn model_types_round_trip() {
         worktree_state: Some(WorktreeState::Missing),
         subtasks_done: 1,
         subtasks_total: 3,
+        verifying: true,
+        verify_state: Some(VerifyState::Running),
+        verify_fixes: 1,
     });
     round_trip(&attempt());
     round_trip(&process());
@@ -563,6 +579,9 @@ fn model_types_round_trip() {
             worktree_state: None,
             subtasks_done: 0,
             subtasks_total: 0,
+            verifying: false,
+            verify_state: None,
+            verify_fixes: 0,
         }],
     });
     round_trip(&attachment());
@@ -646,6 +665,11 @@ fn api_types_round_trip() {
         default_permission_mode: PermissionMode::BypassPermissions,
         default_model: None,
         description: "d".into(),
+        autopilot: true,
+        autopilot_merge: true,
+        verify_command: Some("make check".into()),
+        verify_timeout_secs: 10,
+        autopilot_max_fixes: 5,
     });
     round_trip(&SetProjectSecurityReq {
         id: id(2),
@@ -658,12 +682,22 @@ fn api_types_round_trip() {
         description: String::new(),
         status: Some(TaskStatus::Cancelled),
         parent_id: Some(id(1)),
+        auto: true,
+        after_id: Some(id(5)),
     });
-    round_trip(&UpdateTaskReq {
-        id: id(1),
-        title: "t".into(),
-        description: "d".into(),
-    });
+    for (auto, after_id) in [
+        (None, None),
+        (Some(true), Some(None)),
+        (Some(false), Some(Some(id(5)))),
+    ] {
+        round_trip(&UpdateTaskReq {
+            id: id(1),
+            title: "t".into(),
+            description: "d".into(),
+            auto,
+            after_id,
+        });
+    }
     round_trip(&MoveTaskReq {
         id: id(1),
         status: TaskStatus::Done,
@@ -806,6 +840,70 @@ fn update_project_description_defaults_to_empty() {
     assert_eq!(req.description, "");
 }
 
+/// The autopilot fields are optional on the wire (JSON that predates them): off, no command,
+/// the DB defaults (600 s, 2 fixes), notifications on, `UpdateTaskReq` leaving them unchanged.
+#[test]
+fn autopilot_fields_default_when_absent() {
+    let req: UpdateProjectReq = serde_json::from_value(serde_json::json!({
+        "id": "p", "name": "demo", "default_target_branch": "main",
+        "default_permission_mode": "acceptEdits", "default_model": null}))
+    .unwrap();
+    assert!(!req.autopilot && !req.autopilot_merge && req.verify_command.is_none());
+    assert_eq!((req.verify_timeout_secs, req.autopilot_max_fixes), (600, 2));
+
+    let mut v = serde_json::to_value(project()).unwrap();
+    let o = v.as_object_mut().unwrap();
+    for key in [
+        "autopilot",
+        "autopilot_merge",
+        "verify_command",
+        "verify_timeout_secs",
+        "autopilot_max_fixes",
+    ] {
+        o.remove(key);
+    }
+    let p: Project = serde_json::from_value(v).unwrap();
+    assert!(!p.autopilot && p.verify_command.is_none());
+    assert_eq!((p.verify_timeout_secs, p.autopilot_max_fixes), (600, 2));
+
+    let mut v = serde_json::to_value(task()).unwrap();
+    v.as_object_mut().unwrap().remove("auto");
+    v.as_object_mut().unwrap().remove("after_id");
+    let t: Task = serde_json::from_value(v).unwrap();
+    assert_eq!((t.auto, t.after_id), (false, None));
+
+    let mut v = serde_json::to_value(attempt()).unwrap();
+    let o = v.as_object_mut().unwrap();
+    for key in [
+        "verify_state",
+        "verify_head",
+        "verify_fixes",
+        "verify_summary",
+    ] {
+        o.remove(key);
+    }
+    let a: AttemptView = serde_json::from_value(v).unwrap();
+    assert_eq!((a.verify_state, a.verify_fixes), (None, 0));
+
+    let mut v = serde_json::to_value(Settings {
+        notifications: false,
+        ..Settings::default()
+    })
+    .unwrap();
+    v.as_object_mut().unwrap().remove("notifications");
+    assert!(serde_json::from_value::<Settings>(v).unwrap().notifications);
+
+    let unchanged: UpdateTaskReq =
+        serde_json::from_value(serde_json::json!({"id": "t", "title": "t", "description": ""}))
+            .unwrap();
+    assert_eq!((unchanged.auto, unchanged.after_id), (None, None));
+    let cleared: UpdateTaskReq = serde_json::from_value(
+        serde_json::json!({"id": "t", "title": "t", "description": "", "after_id": null}),
+    )
+    .unwrap();
+    assert_eq!(cleared.after_id, Some(None));
+}
+
 /// The sub-task and board-tool fields are optional on the wire (JSON that predates them):
 /// they read back as `None`, 0 or empty.
 #[test]
@@ -832,6 +930,9 @@ fn subtask_fields_default_when_absent() {
         worktree_state: None,
         subtasks_done: 2,
         subtasks_total: 5,
+        verifying: false,
+        verify_state: None,
+        verify_fixes: 0,
     };
     let mut v = serde_json::to_value(&card).unwrap();
     let o = v.as_object_mut().unwrap();

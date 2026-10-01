@@ -179,6 +179,8 @@ mod tests {
             created_at: 0,
             updated_at: 0,
             parent_id: None,
+            auto: false,
+            after_id: None,
         }
     }
 
@@ -195,6 +197,9 @@ mod tests {
             worktree_state: None,
             subtasks_done: 0,
             subtasks_total: 0,
+            verifying: false,
+            verify_state: None,
+            verify_fixes: 0,
         }
     }
 

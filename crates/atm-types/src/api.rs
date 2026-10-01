@@ -106,6 +106,19 @@ pub struct UpdateProjectReq {
     /// Trimmed, at most `MAX_PROJECT_DESCRIPTION` characters (`Invalid`). Absent = empty.
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub autopilot: bool,
+    #[serde(default)]
+    pub autopilot_merge: bool,
+    /// Trimmed, empty = `None`, at most `MAX_VERIFY_COMMAND` characters (`Invalid`).
+    #[serde(default)]
+    pub verify_command: Option<String>,
+    /// In `VERIFY_TIMEOUT_SECS` (`Invalid`).
+    #[serde(default = "crate::model::default_verify_timeout_secs")]
+    pub verify_timeout_secs: u32,
+    /// 0..=`MAX_AUTOPILOT_FIXES` (`Invalid`).
+    #[serde(default = "crate::model::default_autopilot_max_fixes")]
+    pub autopilot_max_fixes: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +139,12 @@ pub struct CreateTaskReq {
     /// otherwise); `None` = top-level task.
     #[serde(default)]
     pub parent_id: Option<Id>,
+    /// Entrusted to the autopilot.
+    #[serde(default)]
+    pub auto: bool,
+    /// A task of the same project to start after (`Invalid` otherwise); `None` = none.
+    #[serde(default)]
+    pub after_id: Option<Id>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +152,27 @@ pub struct UpdateTaskReq {
     pub id: Id,
     pub title: String,
     pub description: String,
+    /// `None` (absent) = unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
+    /// Absent = unchanged, `null` = no dependency, an id = a task of the same project, not
+    /// this one (`Invalid` otherwise).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub after_id: Option<Option<Id>>,
+}
+
+/// A field that may be `null`: present (even as `null`) → `Some`, absent → `None` (through
+/// `#[serde(default)]`).
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

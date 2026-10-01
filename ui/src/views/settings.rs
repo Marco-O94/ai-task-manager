@@ -18,6 +18,7 @@ use crate::ui::input::Input;
 use crate::ui::label::Label;
 use crate::ui::select_native::SelectNative;
 pub use project::ProjectSettings;
+pub(crate) use project::stored_req;
 
 /// `--model` choices (spec §9.2): `""` = the CLI default, then [`MODEL_ALIASES`].
 fn models() -> Vec<(String, String)> {
@@ -61,6 +62,7 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
     let editor_app = RwSignal::new(String::new());
     let remove_worktree = RwSignal::new(true);
     let allow_env_api_key = RwSignal::new(false);
+    let notifications = RwSignal::new(true);
     let saving = RwSignal::new(false);
 
     Effect::new(move |_| {
@@ -77,6 +79,7 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
                     editor_app.try_set(s.editor_app.clone());
                     remove_worktree.try_set(s.remove_worktree_after_merge);
                     allow_env_api_key.try_set(s.allow_env_api_key);
+                    notifications.try_set(s.notifications);
                     loaded.try_set(Some(s));
                 }
                 Err(e) => ctx.toasts.app_error(&e),
@@ -99,6 +102,7 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
             worktree_root: worktree_root.get_untracked().trim().to_owned(),
             editor_app: editor_app.get_untracked().trim().to_owned(),
             remove_worktree_after_merge: remove_worktree.get_untracked(),
+            notifications: notifications.get_untracked(),
         };
         saving.set(true);
         spawn_local(async move {
@@ -155,6 +159,9 @@ fn AppSettings(open: RwSignal<bool>) -> impl IntoView {
             </Checkbox>
             <Checkbox id="settings-api-key" checked=allow_env_api_key>
                 "Passa agli agenti la chiave API dell'ambiente (fatturata via API, chiede conferma)"
+            </Checkbox>
+            <Checkbox id="settings-notifications" checked=notifications>
+                "Notifiche macOS (autopilota: approvazioni, verifiche, merge)"
             </Checkbox>
             <DialogFooter>
                 <Button

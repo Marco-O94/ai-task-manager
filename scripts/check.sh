@@ -49,6 +49,14 @@ m=$(scan -rnF -e 'find-generic-password' -e 'SecKeychain' -e 'TcpListener' -e 'U
     -e 'UnixListener' -e '0.0.0.0' crates src-tauri/src)
 hits "crates, src-tauri/src" "$m"
 
+# osascript only in `Inner::notify`, and its one script takes the texts as `argv` (never
+# interpolated into the AppleScript, round 2026-10-01).
+m=$(scan -rnF 'osascript' crates/*/src src-tauri/src | scan -vE '^crates/atm-core/src/lib\.rs:')
+hits "osascript outside Inner::notify" "$m"
+m=$(scan -rnF 'display notification' crates/*/src src-tauri/src |
+    scan -vF '"display notification (item 2 of argv) with title (item 1 of argv)"')
+hits "osascript script with interpolated text" "$m"
+
 # credentials.json may appear only inside the `DENY_RULES` constant (up to its closing `];`).
 m=$(scan -rlF 'credentials.json' crates src-tauri/src |
     while IFS= read -r f; do

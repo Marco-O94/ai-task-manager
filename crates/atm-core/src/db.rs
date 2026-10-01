@@ -12,7 +12,7 @@ use atm_types::{
     AppError, Attachment, AttemptState, AttemptView, ConfigPolicy, CreateTaskReq, Effort, Entry,
     EntryBody, EntryPage, Id, MAX_ATTACHMENTS_PER_TASK, Millis, PermissionMode, ProcessInfo,
     ProcessStatus, Project, Settings, StopReason, Task, TaskCard, TaskStatus, ToolStatus,
-    UpdateProjectReq, UpdateTaskReq, WorktreeState,
+    UpdateProjectReq, UpdateTaskReq, VerifyState, WorktreeState,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
@@ -25,11 +25,13 @@ pub const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAG
 
 /// Migration `i` brings `PRAGMA user_version` from `i` to `i + 1`: 0001 the base schema,
 /// 0002 overview, attachments and sub-agent limits, 0003 sub-tasks (`tasks.parent_id`) and
-/// `attempts.started_by_attempt`.
+/// `attempts.started_by_attempt`, 0004 the autopilot (project settings, `tasks.auto` and
+/// `after_id`, the attempts' verification).
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_overview_attachments_subagents.sql"),
     include_str!("../migrations/0003_subtasks.sql"),
+    include_str!("../migrations/0004_autopilot.sql"),
 ];
 
 /// Gap between consecutive positions (appends use `max + GAP`, renumbering uses `k * GAP`).
@@ -79,6 +81,14 @@ pub struct ProjectRow {
     pub allow_bypass: bool,
     pub created_at: Millis,
     pub updated_at: Millis,
+    pub autopilot: bool,
+    pub autopilot_merge: bool,
+    /// `None` = no verification.
+    pub verify_command: Option<String>,
+    /// CHECK 10..=3600.
+    pub verify_timeout_secs: u32,
+    /// CHECK 0..=5.
+    pub autopilot_max_fixes: u32,
 }
 
 impl ProjectRow {
@@ -99,6 +109,11 @@ impl ProjectRow {
             created_at: self.created_at,
             updated_at: self.updated_at,
             trust_error: None,
+            autopilot: self.autopilot,
+            autopilot_merge: self.autopilot_merge,
+            verify_command: self.verify_command.clone(),
+            verify_timeout_secs: self.verify_timeout_secs,
+            autopilot_max_fixes: self.autopilot_max_fixes,
         }
     }
 
@@ -147,6 +162,11 @@ pub struct AttemptRow {
     /// Attempt whose agent started this one via the board tools; `None` = the user. Plain
     /// text, no foreign key.
     pub started_by_attempt: Option<Id>,
+    /// Latest verification ([`Db::begin_verify`], [`Db::finish_verify`]); `None` = never.
+    pub verify_state: Option<VerifyState>,
+    pub verify_head: Option<String>,
+    pub verify_fixes: u32,
+    pub verify_summary: Option<String>,
     /// `Tool(ruleContent)` strings from "Consenti sempre" (spec §7.8); JSON array in the DB.
     pub allow_rules: Vec<String>,
     pub merge_commit: Option<String>,
@@ -180,6 +200,10 @@ impl AttemptRow {
             created_at: self.created_at,
             closed_at: self.closed_at,
             started_by_attempt: self.started_by_attempt.clone(),
+            verify_state: self.verify_state,
+            verify_head: self.verify_head.clone(),
+            verify_fixes: self.verify_fixes,
+            verify_summary: self.verify_summary.clone(),
         }
     }
 }
@@ -387,8 +411,10 @@ impl Db {
             c.execute(
                 "INSERT INTO projects (id, name, repo_path, default_target_branch,
                     default_permission_mode, default_model, config_policy, trusted_fingerprint,
-                    allow_bypass, created_at, updated_at, description)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    allow_bypass, created_at, updated_at, description, autopilot, autopilot_merge,
+                    verify_command, verify_timeout_secs, autopilot_max_fixes)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                    ?17)",
                 params![
                     p.id,
                     p.name,
@@ -402,6 +428,11 @@ impl Db {
                     p.created_at,
                     p.updated_at,
                     p.description,
+                    p.autopilot,
+                    p.autopilot_merge,
+                    p.verify_command,
+                    p.verify_timeout_secs,
+                    p.autopilot_max_fixes,
                 ],
             )?;
             Ok(())
@@ -425,8 +456,8 @@ impl Db {
         })
     }
 
-    /// Updates the editable fields (description included) and `updated_at`. Errors:
-    /// `NotFound`, `Invalid` (Autonomo without the opt-in, a CHECK).
+    /// Updates the editable fields (description and autopilot included) and `updated_at`.
+    /// Errors: `NotFound`, `Invalid` (Autonomo without the opt-in, a CHECK).
     pub fn update_project(
         &self,
         req: &UpdateProjectReq,
@@ -439,7 +470,8 @@ impl Db {
                 .query_row(
                     "UPDATE projects SET name = ?2, default_target_branch = ?3,
                         default_permission_mode = ?4, default_model = ?5, updated_at = ?6,
-                        description = ?7
+                        description = ?7, autopilot = ?8, autopilot_merge = ?9,
+                        verify_command = ?10, verify_timeout_secs = ?11, autopilot_max_fixes = ?12
                      WHERE id = ?1 AND (?4 <> 'bypassPermissions' OR allow_bypass = 1)
                      RETURNING *",
                     params![
@@ -450,6 +482,11 @@ impl Db {
                         req.default_model,
                         now,
                         req.description,
+                        req.autopilot,
+                        req.autopilot_merge,
+                        req.verify_command,
+                        req.verify_timeout_secs,
+                        req.autopilot_max_fixes,
                     ],
                     project_row,
                 )
@@ -558,9 +595,9 @@ impl Db {
     // ---- tasks ----------------------------------------------------------------------------
 
     /// Inserts task `id` at the end of column `req.status` (default todo): `max + GAP`, with
-    /// `req.parent_id` stored as is (the one-level, same-project rule is the caller's).
-    /// Errors: `NotFound` (project), `Invalid` (CHECK: title 1..=200, description ≤ 100000),
-    /// `Db` (unknown parent: foreign key).
+    /// `req.parent_id`, `auto` and `after_id` stored as is (the one-level and same-project rules
+    /// are the caller's). Errors: `NotFound` (project, or an unknown parent or `after_id`:
+    /// foreign key), `Invalid` (CHECK: title 1..=200, description ≤ 100000).
     pub fn insert_task(
         &self,
         id: &str,
@@ -572,8 +609,8 @@ impl Db {
             let position = end_of_column(c, &req.project_id, status, id)?;
             Ok(c.query_row(
                 "INSERT INTO tasks (id, project_id, title, description, status, position,
-                    created_at, updated_at, parent_id)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8) RETURNING *",
+                    created_at, updated_at, parent_id, auto, after_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10) RETURNING *",
                 params![
                     id,
                     req.project_id,
@@ -582,7 +619,9 @@ impl Db {
                     status.as_str(),
                     position,
                     now,
-                    req.parent_id
+                    req.parent_id,
+                    req.auto,
+                    req.after_id,
                 ],
                 task_row,
             )?)
@@ -594,16 +633,86 @@ impl Db {
         self.read(|c| get_task(c, id))
     }
 
-    /// Updates title and description. Errors: `NotFound`, `Invalid`.
+    /// Updates title and description, and `auto` and `after_id` when `Some` (the same-project
+    /// rule is the caller's); a given `auto` is the user's, so `auto_by` is cleared. Errors:
+    /// `NotFound` (also an unknown `after_id`), `Invalid`.
     pub fn update_task(&self, req: &UpdateTaskReq, now: Millis) -> Result<Task, AppError> {
         self.write(|c| {
             c.query_row(
-                "UPDATE tasks SET title = ?2, description = ?3, updated_at = ?4
+                "UPDATE tasks SET title = ?2, description = ?3, updated_at = ?4,
+                    auto = COALESCE(?5, auto), after_id = CASE WHEN ?6 THEN ?7 ELSE after_id END,
+                    auto_by = CASE WHEN ?5 IS NULL THEN auto_by END
                  WHERE id = ?1 RETURNING *",
-                params![req.id, req.title, req.description, now],
+                params![
+                    req.id,
+                    req.title,
+                    req.description,
+                    now,
+                    req.auto,
+                    req.after_id.is_some(),
+                    req.after_id.clone().flatten(),
+                ],
                 task_row,
             )
             .or_missing("Task", &req.id)
+        })
+    }
+
+    /// Sets `auto` alone (the autopilot letting go of a task), `auto_by` cleared. Errors:
+    /// `NotFound`.
+    pub fn set_task_auto(&self, id: &str, auto: bool, now: Millis) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET auto = ?2, auto_by = NULL, updated_at = ?3 WHERE id = ?1",
+                params![id, auto, now],
+            )?;
+            updated(n, "Task", id)
+        })
+    }
+
+    /// The agent of attempt `by` gives the task to the autopilot (`auto`, `auto_by = by`): it
+    /// starts it as that agent's `start_task` would. Errors: `NotFound`.
+    pub fn set_task_auto_by(&self, id: &str, by: &str, now: Millis) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET auto = 1, auto_by = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, by, now],
+            )?;
+            updated(n, "Task", id)
+        })
+    }
+
+    /// The attempt whose agent gave the task to the autopilot (`None`: the user). Errors:
+    /// `NotFound`.
+    pub fn task_auto_by(&self, id: &str) -> Result<Option<Id>, AppError> {
+        self.read(|c| {
+            c.query_row("SELECT auto_by FROM tasks WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .or_missing("Task", id)
+        })
+    }
+
+    /// What the autopilot may start in a project, in board order (position; every candidate is
+    /// todo): tasks with `auto`, in todo, without an active attempt, whose `after_id` is unset
+    /// (or gone) or done, and whose parent (if any) is not cancelled. The project's own
+    /// `autopilot` flag is the caller's.
+    pub fn autopilot_candidates(&self, project_id: &str) -> Result<Vec<Task>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT t.* FROM tasks t
+                 WHERE t.project_id = ?1 AND t.auto = 1 AND t.status = 'todo'
+                    AND NOT EXISTS (SELECT 1 FROM attempts a
+                        WHERE a.task_id = t.id AND a.state = 'active')
+                    AND (t.after_id IS NULL OR EXISTS (SELECT 1 FROM tasks d
+                        WHERE d.id = t.after_id AND d.status = 'done'))
+                    AND (t.parent_id IS NULL OR EXISTS (SELECT 1 FROM tasks p
+                        WHERE p.id = t.parent_id AND p.status <> 'cancelled'))
+                 ORDER BY t.position, t.rowid",
+                [project_id],
+                task_row,
+            )
         })
     }
 
@@ -947,6 +1056,112 @@ impl Db {
                 get_attempt(c, attempt_id)?;
             }
             Ok(used)
+        })
+    }
+
+    /// A verification starts on `head`: state `running`, `verify_head = head`, summary and
+    /// pending fix cleared. Errors: `NotFound`.
+    pub fn begin_verify(&self, attempt_id: &str, head: &str, now: Millis) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE attempts SET verify_state = 'running', verify_head = ?2,
+                    verify_summary = NULL, verify_pending = NULL, updated_at = ?3
+                 WHERE id = ?1",
+                params![attempt_id, head, now],
+            )?;
+            updated(n, "Attempt", attempt_id)
+        })
+    }
+
+    /// The verification's outcome (`Passed`, `Failed` or `Error`) with the output's tail and
+    /// the commit it ran on. Errors: `NotFound`.
+    pub fn finish_verify(
+        &self,
+        attempt_id: &str,
+        state: VerifyState,
+        summary: Option<&str>,
+        head: &str,
+        now: Millis,
+    ) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE attempts SET verify_state = ?2, verify_summary = ?3, verify_head = ?4,
+                    updated_at = ?5
+                 WHERE id = ?1",
+                params![attempt_id, state.as_str(), summary, head, now],
+            )?;
+            updated(n, "Attempt", attempt_id)
+        })
+    }
+
+    /// Counts one autopilot fix (a follow-up after a failed verification or a conflict);
+    /// returns `verify_fixes` after the increment. Errors: `NotFound`.
+    pub fn add_verify_fix(&self, attempt_id: &str, now: Millis) -> Result<u32, AppError> {
+        self.write(|c| {
+            c.query_row(
+                "UPDATE attempts SET verify_fixes = verify_fixes + 1, updated_at = ?2
+                 WHERE id = ?1 RETURNING verify_fixes",
+                params![attempt_id, now],
+                |r| r.get(0),
+            )
+            .or_missing("Attempt", attempt_id)
+        })
+    }
+
+    /// The prompt of a fix waiting for a slot (`Some`), or none any more. Errors: `NotFound`.
+    pub fn set_verify_pending(
+        &self,
+        attempt_id: &str,
+        prompt: Option<&str>,
+        now: Millis,
+    ) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE attempts SET verify_pending = ?2, updated_at = ?3 WHERE id = ?1",
+                params![attempt_id, prompt, now],
+            )?;
+            updated(n, "Attempt", attempt_id)
+        })
+    }
+
+    /// The fixes waiting for a slot: `(attempt id, prompt)` of the active attempts with a
+    /// `verify_pending`, oldest first.
+    pub fn pending_fixes(&self) -> Result<Vec<(Id, String)>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT id, verify_pending FROM attempts
+                 WHERE state = 'active' AND verify_pending IS NOT NULL
+                 ORDER BY updated_at, rowid",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+    }
+
+    /// Gives back a fix [`Db::add_verify_fix`] counted but not sent. Errors: `NotFound`.
+    pub fn undo_verify_fix(&self, attempt_id: &str, now: Millis) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE attempts SET verify_fixes = max(verify_fixes - 1, 0), updated_at = ?2
+                 WHERE id = ?1",
+                params![attempt_id, now],
+            )?;
+            updated(n, "Attempt", attempt_id)
+        })
+    }
+
+    /// Startup recovery: every verification still `running` (the app closed during it) →
+    /// `error`. Returns the ids of the attempts marked.
+    pub fn mark_stale_verifies(&self, now: Millis) -> Result<Vec<Id>, AppError> {
+        self.write(|c| {
+            all(
+                c,
+                "UPDATE attempts SET verify_state = 'error', updated_at = ?1
+                 WHERE verify_state = 'running' RETURNING id",
+                [now],
+                |r| r.get(0),
+            )
         })
     }
 
@@ -1448,6 +1663,11 @@ fn project_row(r: &Row<'_>) -> rusqlite::Result<ProjectRow> {
         allow_bypass: r.get("allow_bypass")?,
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
+        autopilot: r.get("autopilot")?,
+        autopilot_merge: r.get("autopilot_merge")?,
+        verify_command: r.get("verify_command")?,
+        verify_timeout_secs: r.get("verify_timeout_secs")?,
+        autopilot_max_fixes: r.get("autopilot_max_fixes")?,
     })
 }
 
@@ -1462,6 +1682,8 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
         parent_id: r.get("parent_id")?,
+        auto: r.get("auto")?,
+        after_id: r.get("after_id")?,
     })
 }
 
@@ -1484,6 +1706,10 @@ fn attempt_row(r: &Row<'_>) -> rusqlite::Result<AttemptRow> {
         max_subagents: r.get("max_subagents")?,
         subagents_used: r.get("subagents_used")?,
         started_by_attempt: r.get("started_by_attempt")?,
+        verify_state: opt_text(r, "verify_state")?,
+        verify_head: r.get("verify_head")?,
+        verify_fixes: r.get("verify_fixes")?,
+        verify_summary: r.get("verify_summary")?,
         allow_rules: r.get::<_, Json<_>>("allow_rules")?.0,
         merge_commit: r.get("merge_commit")?,
         created_at: r.get("created_at")?,
@@ -1542,6 +1768,8 @@ const CARD_SELECT: &str = "SELECT t.*,
             AS subtasks_done,
         (SELECT COUNT(*) FROM tasks s WHERE s.parent_id = t.id) AS subtasks_total,
         a.id AS attempt_id, a.state AS attempt_state, a.branch, a.worktree_state,
+        CASE WHEN a.state = 'active' THEN a.verify_state END AS verify_state,
+        CASE WHEN a.state = 'active' THEN a.verify_fixes ELSE 0 END AS verify_fixes,
         p.status AS last_status, p.stop_reason AS last_stop_reason,
         EXISTS (SELECT 1 FROM processes r WHERE r.attempt_id = a.id AND r.status = 'running')
             AS running
@@ -1564,6 +1792,9 @@ fn card_row(r: &Row<'_>) -> rusqlite::Result<TaskCard> {
         worktree_state: opt_text(r, "worktree_state")?,
         subtasks_done: r.get("subtasks_done")?,
         subtasks_total: r.get("subtasks_total")?,
+        verifying: false,
+        verify_state: opt_text(r, "verify_state")?,
+        verify_fixes: r.get("verify_fixes")?,
     })
 }
 
