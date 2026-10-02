@@ -8,8 +8,8 @@
 # half is plugins.updater.pubkey in src-tauri/tauri.conf.json) and, only if the key has one,
 # TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
 #
-# The release stays a draft until both platforms are uploaded (the `publish` job): an
-# installed app never sees a `latest.json` with one platform only. Every action is pinned to
+# The release stays a draft until the build is uploaded (the `publish` job): an installed
+# app never sees a half-written release. Every action is pinned to
 # a commit (the tag in a comment): the signing key is in the job's environment, and a moved
 # tag must not get it.
 name: release
@@ -27,13 +27,9 @@ concurrency:
 
 jobs:
   macos:
+    # One universal build (Apple Silicon + Intel in one .app): a single job writes latest.json,
+    # with both darwin-aarch64 and darwin-x86_64 pointing at the same signed archive.
     runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      # One at a time: each job adds its platform to the release's latest.json.
-      max-parallel: 1
-      matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -49,18 +45,25 @@ jobs:
       - name: Rust toolchain and targets
         run: |
           rustup show active-toolchain || rustup toolchain install
-          rustup target add ${{ matrix.target }} wasm32-unknown-unknown
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: ${{ matrix.target }}
+          key: universal
+          # A failed release still warms the next one.
+          cache-on-failure: true
 
-      # As in the README's Setup; Trunk then downloads Tailwind, wasm-bindgen and wasm-opt
-      # itself (ui/Trunk.toml [tools]).
-      - name: Trunk and the Tauri CLI
+      # Prebuilt Trunk (checked against its published sha256) instead of `cargo install`, which
+      # took ~9 min; Trunk then downloads Tailwind, wasm-bindgen and wasm-opt itself
+      # (ui/Trunk.toml [tools]). The Tauri CLI comes prebuilt from npm (tauriScript below).
+      - name: Trunk
         run: |
-          command -v trunk >/dev/null || cargo install trunk --version 0.21.14 --locked
-          command -v cargo-tauri >/dev/null || cargo install tauri-cli --version 2.12.0 --locked
+          base=https://github.com/trunk-rs/trunk/releases/download/v0.21.14
+          f=trunk-aarch64-apple-darwin.tar.gz
+          curl -fsSLO "$base/$f" && curl -fsSLO "$base/$f.sha256"
+          echo "$(cat "$f.sha256")  $f" | shasum -a 256 -c -
+          tar -xzf "$f" -C "$HOME/.cargo/bin" trunk
+          trunk --version
 
       - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
@@ -68,8 +71,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tauriScript: cargo tauri
-          args: --target ${{ matrix.target }} -- --locked
+          tauriScript: npx --yes @tauri-apps/cli@2.12.0
+          args: --target universal-apple-darwin -- --locked
           tagName: v__VERSION__
           releaseName: AI Task Manager v__VERSION__
           releaseBody: Vedi il README per l'installazione (app non firmata da Apple).
