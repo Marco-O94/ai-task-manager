@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "ai-task-manager"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "atm-core",
  "atm-types",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "atm-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "atm-types",
  "insta",
@@ -253,7 +253,7 @@ dependencies = [
 
 [[package]]
 name = "atm-types"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "insta",
  "serde",
@@ -262,7 +262,7 @@ dependencies = [
 
 [[package]]
 name = "atm-ui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "atm-types",
  "console_error_panic_hook",
