@@ -593,6 +593,44 @@ pub async fn open_url(core: CoreState<'_>, req: Req<OpenUrl>) -> Result<Res<Open
     logged(OpenUrl::NAME, core.open_url(req).await)
 }
 
+#[tauri::command]
+pub async fn start_plan(
+    core: CoreState<'_>,
+    req: Req<StartPlan>,
+) -> Result<Res<StartPlan>, AppError> {
+    logged(StartPlan::NAME, core.start_plan(req).await)
+}
+
+#[tauri::command]
+pub async fn get_plan(core: CoreState<'_>, req: Req<GetPlan>) -> Result<Res<GetPlan>, AppError> {
+    logged(GetPlan::NAME, core.get_plan(req).await)
+}
+
+#[tauri::command]
+pub async fn resolve_plan(
+    core: CoreState<'_>,
+    req: Req<ResolvePlan>,
+) -> Result<Res<ResolvePlan>, AppError> {
+    logged(ResolvePlan::NAME, core.resolve_plan(req).await)
+}
+
+#[tauri::command]
+pub async fn app_info(app: AppHandle) -> Result<Res<GetAppInfo>, AppError> {
+    Ok(AppInfo {
+        version: app.package_info().version.to_string(),
+    })
+}
+
+#[tauri::command]
+pub async fn check_update(app: AppHandle) -> Result<Res<CheckUpdate>, AppError> {
+    Ok(crate::updater::pending(&app))
+}
+
+#[tauri::command]
+pub async fn install_update(app: AppHandle) -> Result<Res<InstallUpdate>, AppError> {
+    logged(InstallUpdate::NAME, crate::updater::install(&app).await)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +848,12 @@ mod tests {
             delete_branch: DeleteBranch,
             open_attempt: OpenAttempt,
             open_url: OpenUrl,
+            start_plan: StartPlan,
+            get_plan: GetPlan,
+            resolve_plan: ResolvePlan,
+            app_info: GetAppInfo,
+            check_update: CheckUpdate,
+            install_update: InstallUpdate,
         ];
         for (f, name) in &pairs {
             assert_eq!(f, name);

@@ -30,6 +30,8 @@ pub const MAX_AUTOPILOT_FIXES: u32 = 5;
 pub const DEFAULT_AUTOPILOT_MAX_FIXES: u32 = 2;
 /// Longest `Project::verify_command`, in characters.
 pub const MAX_VERIFY_COMMAND: usize = 1000;
+/// Longest title of a plan's hidden task (the prompt's first line, truncated with `…`).
+pub const MAX_PLAN_TITLE: usize = 80;
 
 /// Enums whose strings are shared with the DB `CHECK`s and the CLI (spec §5.3). Each gets
 /// `ALL` (declaration order), `as_str()`, `Display` and `FromStr` (`Invalid` on unknown input),
@@ -156,6 +158,40 @@ db_enum! {
 }
 
 db_enum! {
+    /// `tasks.kind`: a plan is the hidden task of «Pianifica con un agente», never on the
+    /// board nor visible to the board tools or the autopilot.
+    #[derive(Default)]
+    TaskKind {
+        #[default]
+        Task = "task",
+        Plan = "plan",
+    }
+}
+
+db_enum! {
+    /// `tasks.plan_state` of a plan (`TaskKind::Plan`).
+    PlanState {
+        /// The planner's turn is running (or about to).
+        Running = "running",
+        /// Completed in mode Default: «Avvia N task?» waits for `resolve_plan`.
+        Awaiting = "awaiting",
+        /// Its tasks were handed to the scheduler (or none was created).
+        Started = "started",
+        /// The user answered No: its tasks stay in todo.
+        Dismissed = "dismissed",
+        /// The turn did not complete (stop, crash, limit...): its tasks are left untouched.
+        Failed = "failed",
+    }
+}
+
+impl PlanState {
+    /// Running or awaiting: at most one such plan per project.
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::Running | Self::Awaiting)
+    }
+}
+
+db_enum! {
     /// `attempts.verify_state`: the autopilot's run of the project's `verify_command` on the
     /// attempt's worktree (`None` = never verified).
     VerifyState {
@@ -243,6 +279,15 @@ pub struct Task {
     /// Deleting that task clears it.
     #[serde(default)]
     pub after_id: Option<Id>,
+    /// `Plan` only for the hidden task of a plan (never in a board nor a `TaskDetail` the UI
+    /// gets); absent = `Task`.
+    #[serde(default)]
+    pub kind: TaskKind,
+    /// Handed to the scheduler by a plan (round 2026-10-02): it starts as soon as an agent is
+    /// free and its `after` is done, even with the autopilot off. Cleared when it starts or
+    /// leaves Da fare (the card shows «In coda»).
+    #[serde(default)]
+    pub launch: bool,
 }
 
 /// One board card: the task plus its active (else most recent) attempt, merged with the
@@ -358,6 +403,37 @@ pub struct TaskDetail {
     /// Cards of the task's sub-tasks, in board order (column, then position).
     #[serde(default)]
     pub subtasks: Vec<TaskCard>,
+}
+
+/// The latest plan of a project («Pianifica con un agente»): its hidden task, its attempt
+/// and the tasks it created.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanView {
+    /// The plan's hidden task (`resolve_plan`'s `plan_id`).
+    pub id: Id,
+    pub prompt: String,
+    /// Of the plan's attempt; `None` = the CLI's default.
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+    pub state: PlanState,
+    /// The plan's attempt (discarded once the plan ended: its transcript stays readable);
+    /// `None` only in the instant between the plan's row and its attempt's.
+    pub attempt_id: Option<Id>,
+    /// Tasks created by the planner (`tasks.planned_by`), oldest first, deleted ones gone.
+    pub created: Vec<PlannedTask>,
+    pub created_at: Millis,
+}
+
+/// One task of [`PlanView::created`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlannedTask {
+    pub id: Id,
+    pub title: String,
+    pub status: TaskStatus,
+    /// Set for a sub-task of another created task: never handed to the scheduler (its
+    /// parent's agent starts it), not counted in «Avvia N task?».
+    #[serde(default)]
+    pub parent_id: Option<Id>,
 }
 
 /// A file attached to a task: a copy in the app's data dir (never in a worktree, never

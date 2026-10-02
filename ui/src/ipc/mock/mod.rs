@@ -2,7 +2,8 @@
 //! `ipc::tauri`. This file routes commands by `NAME` and emulates events and channels; the
 //! data lives in `board.rs` (env, settings, projects, board: M2-UI-BOARD), `attempt.rs`
 //! (task detail, attempts, transcript, diff, merge: M2-UI-TASK), `overview.rs` (project
-//! overview: UI-SHELL) and `attachments.rs` (task attachments: UI-TASKS).
+//! overview: UI-SHELL), `attachments.rs` (task attachments: UI-TASKS), `plan.rs` (the
+//! planner, round 2026-10-02) and `update.rs` (app version and updates).
 //!
 //! Hooks for those files: [`emit`] (like `app.emit`), [`send_transcript`] (like
 //! `Channel::send`), [`sleep`], [`now_ms`], [`new_id`]. `subscribe_transcript` and
@@ -15,6 +16,8 @@ mod attachments;
 mod attempt;
 mod board;
 mod overview;
+mod plan;
+mod update;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -92,7 +95,9 @@ pub async fn call<C: Command>(req: &C::Req) -> Result<C::Res, AppError> {
             Ok(Value::Null)
         }
         GetProjectOverview::NAME => overview::handle(req),
+        StartPlan::NAME | GetPlan::NAME | ResolvePlan::NAME => plan::handle(C::NAME, req),
         name if ATTACHMENT_COMMANDS.contains(&name) => attachments::handle(name, req),
+        name if update::COMMANDS.contains(&name) => update::handle(name, req).await,
         name if BOARD_COMMANDS.contains(&name) => board::handle(name, req).await,
         name if COMMAND_NAMES.contains(&name) => attempt::handle(name, req).await,
         name => Err(AppError::not_implemented(name)),

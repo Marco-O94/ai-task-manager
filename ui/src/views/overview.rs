@@ -9,7 +9,8 @@
 //! §10.3 forbids.
 //!
 //! Layout of the design: a hero card (branch, configuration, name, description, task
-//! distribution) over a 12-column bento of the repository's files.
+//! distribution), the planner card (`views/planner.rs`, its own `get_plan`) and a 12-column
+//! bento of the repository's files.
 
 use atm_types::{
     AppError, ConfigPolicy, ContextFile, ContextFileKind, Empty, GetProjectOverview, GetSettings,
@@ -30,19 +31,21 @@ use crate::ui::collapsible::{Collapsible, CollapsibleContent, CollapsibleTrigger
 use crate::ui::skeleton::Skeleton;
 use crate::ui::spinner::Spinner;
 use crate::views::board::column_title;
+use crate::views::planner::PlannerCard;
 use crate::views::sidebar::project_cards;
 use crate::views::start_dialog::mode_help;
 use crate::views::transcript::mode_label;
 use crate::widgets::status::{Status, StatusDot};
 
-const CARD: &str = "rounded-xl border border-border bg-card text-card-foreground shadow-xs";
-const BTN_OUTLINE: &str = "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium whitespace-nowrap text-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
-const BTN_OUTLINE_SM: &str = "inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium whitespace-nowrap text-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
-const BTN_PRIMARY: &str = "inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[13px] font-medium whitespace-nowrap text-primary-foreground shadow-xs transition-colors hover:bg-primary/90 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
-const LINK: &str = "rounded-sm font-medium text-primary hover:underline outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+pub(crate) const CARD: &str =
+    "rounded-xl border border-border bg-card text-card-foreground shadow-xs";
+pub(crate) const BTN_OUTLINE: &str = "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium whitespace-nowrap text-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-50 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+pub(crate) const BTN_OUTLINE_SM: &str = "inline-flex h-7 shrink-0 items-center justify-center gap-1.5 rounded-md border border-border bg-card px-3 text-[13px] font-medium whitespace-nowrap text-foreground shadow-xs transition-colors hover:bg-accent hover:text-accent-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+pub(crate) const BTN_PRIMARY: &str = "inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-primary px-3 text-[13px] font-medium whitespace-nowrap text-primary-foreground shadow-xs transition-colors hover:bg-primary/90 outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
+pub(crate) const LINK: &str = "rounded-sm font-medium text-primary hover:underline outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background";
 /// Branch and configuration chips of the hero.
 const CHIP: &str = "inline-flex h-6 items-center gap-1.5 rounded-md border border-border bg-background px-2 text-[11px]";
-const OUTLINE_BADGE: &str = "inline-flex h-5 shrink-0 items-center rounded-md border border-border px-1.5 text-[11px] font-medium whitespace-nowrap text-muted-foreground";
+pub(crate) const OUTLINE_BADGE: &str = "inline-flex h-5 shrink-0 items-center rounded-md border border-border px-1.5 text-[11px] font-medium whitespace-nowrap text-muted-foreground";
 /// A name under `.claude/` or an MCP key.
 const NAME_CHIP: &str = "rounded-sm bg-muted px-1.5 font-mono text-[11px]";
 /// A file the repository does not have.
@@ -113,6 +116,7 @@ pub fn Overview() -> impl IntoView {
     view! {
         <div class="mx-auto w-full max-w-[1120px] space-y-4 px-8 py-6" data-view="overview">
             <Hero project overview cards loading refresh />
+            <PlannerCard project app_model />
             // Keyed by the fetch: each reply mounts its sections afresh instead of patching the
             // previous ones in place.
             <For
@@ -509,7 +513,7 @@ impl Config {
 
 /// Bento card: title, optional description and right slot, then the body.
 #[component]
-fn BentoCard(
+pub(crate) fn BentoCard(
     title: &'static str,
     #[prop(optional)] description: Option<&'static str>,
     #[prop(optional)] aside: Option<AnyView>,

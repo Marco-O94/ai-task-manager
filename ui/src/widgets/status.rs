@@ -109,10 +109,10 @@ pub fn verify_state(card: &TaskCard, max_fixes: u32) -> Option<(String, Status, 
     })
 }
 
-/// "In coda": a task given to the autopilot that waits in Da fare for a free slot or for
-/// its dependency (`after_id`).
+/// "In coda": a task given to the autopilot, or handed to the scheduler by a plan (`launch`),
+/// that waits in Da fare for a free slot or for its dependency (`after_id`).
 pub fn queued(card: &TaskCard) -> bool {
-    card.task.auto
+    (card.task.auto || card.task.launch)
         && card.task.status == TaskStatus::Todo
         && card.attempt_state != Some(AttemptState::Active)
 }
@@ -194,6 +194,8 @@ mod tests {
                 parent_id: None,
                 auto: false,
                 after_id: None,
+                kind: Default::default(),
+                launch: false,
             },
             attempt_id: Some("a".into()),
             attempt_state: Some(AttemptState::Active),
@@ -277,5 +279,9 @@ mod tests {
         assert!(!queued(&c), "an active attempt is not queued");
         c.attempt_state = None;
         assert!(queued(&c));
+        c.task.auto = false;
+        assert!(!queued(&c));
+        c.task.launch = true;
+        assert!(queued(&c), "handed over by a plan");
     }
 }

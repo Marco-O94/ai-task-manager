@@ -2,6 +2,7 @@
   "build": {
     "beforeBuildCommand": { "script": "trunk build --release --features testkit", "cwd": "../ui" }
   },
+  "bundle": { "createUpdaterArtifacts": false },
   "app": {
     "windows": [
       {

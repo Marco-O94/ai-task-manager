@@ -1786,6 +1786,7 @@ fn turn_args(guard: &Guard, cwd: &Path, mode: PermissionMode, allow_rules: &[Str
         subagent_model: None,
         attachments_dir: None,
         append_prompt: claude::append_prompt(cwd, "main", "main"),
+        plan: false,
     }
 }
 

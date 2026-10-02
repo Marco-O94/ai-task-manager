@@ -26,6 +26,10 @@ tauri = { version = "=2.12.0", features = [] }
 tauri-build = "=2.7.0"
 tauri-plugin-dialog = "=2.8.0"
 tauri-plugin-single-instance = "=2.5.0"
+# Unfrozen for the updater (round 2026-10-02, user-authorized): macOS .app.tar.gz from GitHub
+# Releases, no zip (Windows is a later round).
+tauri-plugin-updater = { version = "=2.13.1", default-features = false, features = [
+  "rustls-tls", "system-proxy"] }
 leptos = { version = "=0.8.21", features = ["csr"] }
 leptos_ui = "=0.3.22"
 tw_merge = { version = "=0.1.22", features = ["variant"] }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use atm_types::{
     AppError, AttemptView, CreateTaskReq, Effort, ErrorCode, Id, IdReq, MoveTaskReq, ProjectIdReq,
-    StartAttemptReq, Task, TaskCard, TaskStatus, UpdateTaskReq, VerifyState,
+    StartAttemptReq, Task, TaskCard, TaskKind, TaskStatus, UpdateTaskReq, VerifyState,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -16,6 +16,9 @@ use serde_json::{Value, json};
 
 use crate::db::AttemptCtx;
 use crate::{Core, Inner, now_ms};
+
+/// Board tools a plan's agent may not call (round 2026-10-02).
+const PLAN_DENIED: &[&str] = &["update_task", "move_task", "start_task"];
 
 /// The id that names the calling attempt's own task.
 const SELF_ID: &str = "self";
@@ -139,6 +142,13 @@ async fn run(
         inner: Arc::clone(inner),
     };
     let project_id = ctx.project.id.clone();
+    let plan = ctx.task.kind == TaskKind::Plan;
+    // Denied by the plan's argv too (`claude::PLAN_DENY`): the planner only reads and creates.
+    if plan && PLAN_DENIED.contains(&name) {
+        return Err(AppError::invalid(
+            "You are the planner: you may only list, read and create tasks.",
+        ));
+    }
     match name {
         "list_tasks" => {
             let a: ListArgs = parse(args)?;
@@ -188,6 +198,19 @@ async fn run(
                 Some(id) => Some(own_task(inner, ctx, &id)?),
                 None => None,
             };
+            // A plan adds sub-tasks only to the tasks it created, never to the user's.
+            if plan
+                && let Some(p) = &parent
+                && !inner
+                    .db
+                    .plan_tasks(&ctx.task.id)?
+                    .iter()
+                    .any(|t| t.id == p.id)
+            {
+                return Err(AppError::invalid(
+                    "You are the planner: you may add sub-tasks only to the tasks you created.",
+                ));
+            }
             let after_id = match a.after.map(|id| resolve(ctx, id)) {
                 Some(id) => Some(own_task(inner, ctx, &id)?.id),
                 None => None,
@@ -213,6 +236,12 @@ async fn run(
                 after_id,
             };
             let task = core.create_task(req).await?.task;
+            if plan {
+                // The plan's own: its card lists it, its end starts it (never `auto` here).
+                inner.db.set_planned_by(&task.id, &ctx.task.id, now_ms())?;
+                inner.emit_changed(Some(&project_id), Some(&task.id));
+                return Ok(task_json(&inner.db.task(&task.id)?));
+            }
             if !auto {
                 return Ok(task_json(&task));
             }
@@ -326,11 +355,12 @@ fn resolve(ctx: &AttemptCtx, id: String) -> String {
     }
 }
 
-/// The task `id` if it belongs to the calling attempt's project; any other is not found, so
-/// that an agent learns nothing of other projects.
+/// The task `id` if it belongs to the calling attempt's project and is not a plan (hidden
+/// everywhere, the caller's own included); any other is not found, so that an agent learns
+/// nothing of other projects.
 fn own_task(inner: &Inner, ctx: &AttemptCtx, id: &str) -> Result<Task, AppError> {
     match inner.db.task(id) {
-        Ok(task) if task.project_id == ctx.project.id => Ok(task),
+        Ok(task) if task.project_id == ctx.project.id && task.kind == TaskKind::Task => Ok(task),
         Ok(_)
         | Err(AppError {
             code: ErrorCode::NotFound,

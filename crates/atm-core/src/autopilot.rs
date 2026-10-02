@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use atm_types::{
     AppError, AttemptIdReq, AttemptState, AttemptView, ErrorCode, Id, MergeAttemptReq,
-    MergeOutcome, ProcessStatus, SendFollowUpReq, StartAttemptReq, StopReason, Task, VerifyState,
-    merge_message,
+    MergeOutcome, ProcessStatus, SendFollowUpReq, StartAttemptReq, StopReason, Task, TaskKind,
+    VerifyState, merge_message,
 };
 use tokio::sync::Notify;
 
@@ -174,7 +174,15 @@ impl Inner {
             Ok(projects) => projects,
             Err(e) => return eprintln!("autopilot: {e}"),
         };
-        let projects: Vec<_> = projects.into_iter().filter(|p| p.autopilot).collect();
+        // The autopilot's projects, and those with tasks a plan handed over (`launch`).
+        let launching = match self.db.projects_with_launch() {
+            Ok(ids) => ids,
+            Err(e) => return eprintln!("autopilot: {e}"),
+        };
+        let projects: Vec<_> = projects
+            .into_iter()
+            .filter(|p| p.autopilot || launching.contains(&p.id))
+            .collect();
         if projects.is_empty() {
             return;
         }
@@ -197,7 +205,7 @@ impl Inner {
             Err(e) => eprintln!("autopilot: {e}"),
         }
         for project in projects {
-            let tasks = match self.db.autopilot_candidates(&project.id) {
+            let tasks = match self.db.autopilot_candidates(&project.id, project.autopilot) {
                 Ok(tasks) => tasks,
                 Err(e) => {
                     eprintln!("autopilot {}: {e}", project.id);
@@ -219,7 +227,12 @@ impl Inner {
                     // Started meanwhile (by the user or an agent).
                     Err(e) if e.code == ErrorCode::Conflict => {}
                     Err(e) => {
-                        if let Err(e) = self.db.set_task_auto(&task.id, false, crate::now_ms()) {
+                        let now = crate::now_ms();
+                        if let Err(e) = self
+                            .db
+                            .set_task_auto(&task.id, false, now)
+                            .and_then(|()| self.db.set_task_launch(&task.id, false, now))
+                        {
                             eprintln!("autopilot {}: {e}", task.id);
                         }
                         let body = format!("Impossibile avviare «{}»: {}", task.title, e.message);
@@ -269,6 +282,12 @@ impl Inner {
     async fn after_turn(self: &Arc<Self>, attempt_id: &str, process_id: &str) {
         if self.closing.load(Ordering::SeqCst) {
             return;
+        }
+        // A plan's turn has an end of its own, never the autopilot's (round 2026-10-02).
+        if let Ok(ctx) = self.db.attempt_ctx(attempt_id)
+            && ctx.task.kind == TaskKind::Plan
+        {
+            return self.plan_ended(ctx, process_id).await;
         }
         let Some(ctx) = self.autopilot_ctx(attempt_id) else {
             return;

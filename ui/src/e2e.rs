@@ -14,8 +14,8 @@
 //!   Quit → `NSApp terminate:` → `RunEvent::Exit`);
 //! - phase 2: step 4's order after the real process restart, the rest of step 8, steps 9–12,
 //!   the security confirmations, then the feature round's checks (the task list view on main,
-//!   attachments, sub-agent limits, sub-tasks, the agents' board tools and the Autopilota on a
-//!   scratch project, whose removal from the sidebar menu comes last) and the report on stdout; the
+//!   attachments, sub-agent limits, sub-tasks, the agents' board tools, the Autopilota and the
+//!   planner card on a scratch project, whose removal from the sidebar menu comes last) and the report on stdout; the
 //!   app then exits through `app.exit` (`ExitRequested`) during one more `[fake:hang_ignore]`
 //!   turn, which the script checks afterwards;
 //! - phase 3 (M6, also alone with `scripts/e2e.sh --perf`): `[fake:flood]` on three concurrent
@@ -41,9 +41,9 @@ use atm_types::debug::{
 use atm_types::{
     AttemptIdReq, AttemptState, CONTINUE_PROMPT, ConfigPolicy, Empty, Entry, EntryBody, ErrorCode,
     FileStatus, GetBoard, GetBranchStatus, GetDiff, GetEntries, GetEntriesReq, GetEnv, GetEnvReq,
-    GetProjectOverview, GetTaskDetail, IdReq, ListProjects, ProcessInfo, ProcessStatus, Project,
-    ProjectIdReq, StopReason, TaskCard, TaskDetail, TaskStatus, ToolStatus, VerifyState,
-    WorktreeState,
+    GetPlan, GetPlanReq, GetProjectOverview, GetTaskDetail, IdReq, ListProjects, PermissionMode,
+    PlanState, ProcessInfo, ProcessStatus, Project, ProjectIdReq, StopReason, TaskCard, TaskDetail,
+    TaskKind, TaskStatus, ToolStatus, VerifyState, WorktreeState,
 };
 use js_sys::{Array, Function, Object, Reflect};
 use leptos::prelude::*;
@@ -137,6 +137,12 @@ const VERIFY_COMMAND: &str = "test -f fixed.txt";
 const AUTO_TITLE: &str = "Verifica e correggi [fake:fix_on_resume]";
 /// Two autopilot tasks, the second «Parte dopo…» the first, with Agenti in parallelo = 1.
 const AFTER_TITLES: [&str; 2] = ["Primo in coda [fake:append]", "Dopo il primo [fake:append]"];
+/// The planner's prompt: fake-claude's `plan` scenario creates two tasks, the second «Parte
+/// dopo…» the first (round 2026-10-02).
+const PLAN_PROMPT: &str = "Dividi il lavoro in task [fake:plan]";
+/// A plan whose turn never ends by itself: its running state (live transcript, «Ferma») is
+/// deterministic, and «Ferma» fails it.
+const HANG_PLAN_PROMPT: &str = "Esplora soltanto [fake:hang]";
 /// The `--disallowedTools` of a turn that may start no sub-agent (none allowed, or none left).
 const NO_SUBAGENTS: &str = "--disallowedTools=AskUserQuestion,Agent,Task,Workflow";
 /// Default wait of a UI reaction.
@@ -395,6 +401,11 @@ async fn phase2(run: &mut Run) -> R<Next> {
     run.check("autopilot_fix_and_merge", r)?;
     let r = autopilot_after(&scratch).await;
     run.check("autopilot_after", r)?;
+    // Round 2026-10-02: the app's version, then, still on the scratch project, the planner.
+    let r = app_version().await;
+    run.check("app_version", r)?;
+    let r = planner_card(&scratch).await;
+    run.check("planner_card", r)?;
     let r = project_removal(&scratch).await;
     run.check("project_removal", r)?;
     let r = only_expected_failures(&EXPECTED_FAILURES_PHASE2).await;
@@ -2938,6 +2949,225 @@ async fn autopilot_after(scratch: &Scratch) -> R<String> {
         "Agenti in parallelo 1: «{}» «In coda» ({reason}) while the first ran, started once it \
          was Fatto; both merged in order on {}",
         AFTER_TITLES[1], started.target_branch
+    ))
+}
+
+/// Round 2026-10-02 (section U): the sidebar footer shows the bundle's version, as `app_info`
+/// gives it (no update check in a debug build: no banner, no modal).
+async fn app_version() -> R<String> {
+    let want = format!("AI Task Manager v{}", env!("CARGO_PKG_VERSION"));
+    let shown = until("the app's version in the sidebar", UI, || {
+        q("[data-testid=app-version]")
+            .map(|e| text(&e).trim().to_owned())
+            .filter(|t| !t.is_empty())
+    })
+    .await?;
+    if shown != want {
+        return Err(format!("sidebar version {shown:?}, want {want:?}"));
+    }
+    if q("[data-banner=update]").is_some() || q("[data-testid=update-required]").is_some() {
+        return Err("an update is announced in a debug build".into());
+    }
+    Ok(shown)
+}
+
+/// Round 2026-10-02 (section P): «Pianifica con un agente» on the scratch project's Riepilogo,
+/// with the project in Supervisionato so that the plan asks before starting anything. The card
+/// is idle with «Pianifica» disabled until a prompt is typed. A first plan that never ends
+/// ([`HANG_PLAN_PROMPT`]) must show its live transcript and «Ferma», which fails it. The second
+/// ([`PLAN_PROMPT`]; an inline approval, if the planner gets one, is approved) reaches «Avvia 2
+/// task?» with the two tasks it created, while «Pianifica» stays disabled. The two tasks are
+/// on the board in Da fare with no attempt, the second «Parte dopo…» the first; the plan's
+/// hidden task is neither in `get_board` nor on the board. «No» leaves them there (dismissed,
+/// as `get_plan` says too); the finished plan's transcript opens on request; a created task
+/// opens its panel on the Task page.
+async fn planner_card(scratch: &Scratch) -> R<String> {
+    const CARD: &str = "[data-view=overview] [data-planner]";
+    let in_card = |sel: &str| q(&format!("{CARD} {sel}"));
+    select_tasks(SCRATCH).await?;
+    click(&wait_q("[data-project-view=settings]").await?);
+    let page = wait_q("[data-testid=project-settings]").await?;
+    set_select(
+        &find_in(&page, "#project-mode").ok_or("no Modalità predefinita")?,
+        PermissionMode::Default.as_str(),
+    )?;
+    let since = last_toast();
+    click(&button_in(&page, "Salva il progetto").ok_or("no Salva il progetto")?);
+    toast_after(since, "project saved", |t| {
+        t.contains("Progetto aggiornato")
+    })
+    .await?;
+    let project = project_named(SCRATCH).await?;
+    if project.default_permission_mode != PermissionMode::Default {
+        return Err(format!("mode {:?}", project.default_permission_mode));
+    }
+    click(&wait_q("[data-project-view=overview]").await?);
+    let start = until("planner card with no plan", UI, || {
+        in_card("[data-planner-state=none]")?;
+        in_card("[data-action=start-plan]")
+    })
+    .await?;
+    if !start.has_attribute("disabled") {
+        return Err("Pianifica enabled with an empty prompt".into());
+    }
+
+    // 1. A plan that hangs: its running state is asserted, then «Ferma» fails it.
+    set_value(
+        &in_card("#planner-prompt").ok_or("no prompt")?,
+        HANG_PLAN_PROMPT,
+    )?;
+    let start = until("Pianifica enabled", UI, || {
+        in_card("[data-action=start-plan]").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&start);
+    let stop = until("running plan with live transcript and Ferma", TURN, || {
+        in_card("[data-planner-state=running] [data-planner-transcript] [data-view=transcript]")?;
+        in_card("[data-planner-state=running] [data-action=stop-plan]")
+            .filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&stop);
+    until("stopped plan failed", TURN, || {
+        in_card("[data-planner-state=failed]")
+    })
+    .await?;
+
+    // 2. A plan that completes in Supervisionato: «Avvia 2 task?».
+    let before = board(&scratch.repo).await?;
+    set_value(&in_card("#planner-prompt").ok_or("no prompt")?, PLAN_PROMPT)?;
+    let start = until("Pianifica enabled after a failed plan", UI, || {
+        in_card("[data-action=start-plan]").filter(|b| !b.has_attribute("disabled"))
+    })
+    .await?;
+    click(&start);
+
+    let mut approved = 0;
+    until("plan awaiting confirmation", 3 * TURN, || {
+        if let Some(allow) = in_card("[data-approval] [data-action=allow]") {
+            click(&allow);
+            approved += 1;
+        }
+        in_card("[data-planner-state=awaiting]")
+    })
+    .await?;
+    let question = in_card("[data-testid=plan-question]")
+        .map(|e| text(&e).trim().to_owned())
+        .unwrap_or_default();
+    if question != "Avvia 2 task?" {
+        return Err(format!("question {question:?}"));
+    }
+    let rows: Vec<String> = q_all(&format!("{CARD} [data-planned-task]"))
+        .iter()
+        .filter_map(|e| e.get_attribute("data-planned-task"))
+        .collect();
+    if rows.len() != 2 {
+        return Err(format!("created tasks listed {rows:?}"));
+    }
+    set_value(&in_card("#planner-prompt").ok_or("no prompt")?, PLAN_PROMPT)?;
+    let help = until("one plan at a time", UI, || {
+        in_card("[data-testid=planner-help]")
+            .map(|h| text(&h))
+            .filter(|h| h.contains("Una pianificazione alla volta"))
+    })
+    .await?;
+    if !in_card("[data-action=start-plan]").is_some_and(|b| b.has_attribute("disabled")) {
+        return Err(format!("Pianifica enabled while awaiting ({help})"));
+    }
+    set_value(&in_card("#planner-prompt").ok_or("no prompt")?, "")?;
+
+    let plan = ipc::call::<GetPlan>(&GetPlanReq {
+        project_id: project.id.clone(),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("get_plan: no plan")?;
+    let after = board(&scratch.repo).await?;
+    let new: Vec<&TaskCard> = after
+        .iter()
+        .filter(|c| !before.iter().any(|b| b.task.id == c.task.id))
+        .collect();
+    let mut new_ids: Vec<&str> = new.iter().map(|c| c.task.id.as_str()).collect();
+    let mut listed: Vec<&str> = rows.iter().map(String::as_str).collect();
+    new_ids.sort_unstable();
+    listed.sort_unstable();
+    if new_ids != listed {
+        return Err(format!("new on the board {new_ids:?}, listed {listed:?}"));
+    }
+    if let Some(c) = new
+        .iter()
+        .find(|c| c.task.status != TaskStatus::Todo || c.attempt_id.is_some() || c.task.auto)
+    {
+        return Err(format!("created task not idle in Da fare: {:?}", c.task));
+    }
+    let second = new
+        .iter()
+        .find(|c| c.task.id == rows[1])
+        .ok_or("second task not on the board")?;
+    if second.task.after_id.as_deref() != Some(rows[0].as_str()) {
+        return Err(format!("second task after {:?}", second.task.after_id));
+    }
+    if after
+        .iter()
+        .any(|c| c.task.id == plan.id || c.task.kind == TaskKind::Plan)
+    {
+        return Err("the plan's task is on the board".into());
+    }
+
+    click(&in_card("[data-action=plan-dismiss]").ok_or("no No")?);
+    let outcome = until("plan dismissed", UI, || {
+        in_card("[data-planner-state=dismissed]")?;
+        in_card("[data-testid=plan-outcome]").map(|o| text(&o))
+    })
+    .await?;
+    if !outcome.contains("restano in Da fare") {
+        return Err(format!("outcome {outcome:?}"));
+    }
+    let plan = ipc::call::<GetPlan>(&GetPlanReq {
+        project_id: project.id.clone(),
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .ok_or("get_plan: no plan")?;
+    if plan.state != PlanState::Dismissed || plan.created.len() != 2 || plan.attempt_id.is_none() {
+        return Err(format!("get_plan after No: {plan:?}"));
+    }
+    if let Some(c) = board(&scratch.repo).await?.iter().find(|c| {
+        rows.contains(&c.task.id) && (c.task.status != TaskStatus::Todo || c.attempt_id.is_some())
+    }) {
+        return Err(format!("{} moved after No: {:?}", c.task.id, c.task.status));
+    }
+
+    click(&in_card("[data-action=toggle-plan-transcript]").ok_or("no Mostra la trascrizione")?);
+    let shown = until("the finished plan's transcript", UI, || {
+        let n = q_all(&format!("{CARD} [data-planner-transcript] [data-entry]")).len();
+        in_card("[data-planner-transcript] [data-turn-end]").and((n > 0).then_some(n))
+    })
+    .await?;
+
+    let first_title = new
+        .iter()
+        .find(|c| c.task.id == rows[0])
+        .map(|c| c.task.title.clone())
+        .unwrap_or_default();
+    click(&in_card(&format!("[data-planned-task=\"{}\"]", rows[0])).ok_or("no created task row")?);
+    until("the created task's panel on the Task page", UI, || {
+        (q("[data-project-view=tasks][aria-selected=true]").is_some()
+            && panel_header().contains(&first_title))
+        .then_some(())
+    })
+    .await?;
+    if q(&format!("[data-task-id=\"{}\"]", plan.id)).is_some() {
+        return Err("the plan's card is on the board".into());
+    }
+    Ok(format!(
+        "Supervisionato; idle card, Pianifica off until a prompt; a hanging plan running with \
+         its live transcript and Ferma, Ferma → failed; then ({approved} inline approvals) \
+         «{question}» listing {} \
+         (Da fare, no attempt, the second after the first), Pianifica off meanwhile; plan hidden \
+         from get_board and the board; No → dismissed, tasks untouched; finished transcript \
+         {shown} entries; a created task opens its panel",
+        rows.join(", ")
     ))
 }
 

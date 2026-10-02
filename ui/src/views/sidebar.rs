@@ -29,6 +29,7 @@ use crate::ui::scroll_area::ScrollArea;
 use crate::ui::spinner::Spinner;
 use crate::ui::tooltip::{Tooltip, TooltipContent, TooltipPosition};
 use crate::views::settings::{SettingsDialog, stored_req};
+use crate::views::update::{UpdateBanner, use_update, version_label};
 use crate::widgets::context_menu::{ContextMenu, ContextMenuItem, ContextMenuSeparator, MenuState};
 use crate::widgets::status::{FOCUS_RING, PILL_TABLIST, Status, StatusDot, pill_tab};
 
@@ -37,6 +38,7 @@ use crate::widgets::status::{FOCUS_RING, PILL_TABLIST, Status, StatusDot, pill_t
 pub fn Sidebar() -> impl IntoView {
     let ctx = use_app();
     let settings_open = RwSignal::new(false);
+    let updates = use_update();
     let loaded = projects_loaded(ctx);
     let menu = ProjectMenu {
         state: MenuState::new(),
@@ -130,6 +132,9 @@ pub fn Sidebar() -> impl IntoView {
                             }
                         })
                 }}
+                <p class="text-muted-foreground px-2 text-[11px] leading-4" data-testid="app-version">
+                    {move || version_label(updates).map(|v| format!("AI Task Manager {v}"))}
+                </p>
             </div>
             <SettingsDialog open=settings_open />
             <ContextMenu state=menu.state label=menu_label>
@@ -514,6 +519,7 @@ pub fn Topbar() -> impl IntoView {
                 {move || ctx.env.get().map(|env| view! { <EnvChips env /> })}
             </header>
             <Banners />
+            <UpdateBanner />
         </div>
     }
 }

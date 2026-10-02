@@ -12,9 +12,9 @@ use atm_core::db::{
 };
 use atm_types::{
     AppError, AttemptState, ConfigPolicy, CreateTaskReq, Effort, Entry, EntryBody, EntryPage,
-    ErrorCode, MAX_ATTACHMENTS_PER_TASK, MAX_PROJECT_DESCRIPTION, PermissionMode, ProcessStatus,
-    Settings, StopReason, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq, VerifyState,
-    WorktreeState,
+    ErrorCode, MAX_ATTACHMENTS_PER_TASK, MAX_PLAN_TITLE, MAX_PROJECT_DESCRIPTION, PermissionMode,
+    PlanState, ProcessStatus, Settings, StopReason, TaskKind, TaskStatus, ToolStatus,
+    UpdateProjectReq, UpdateTaskReq, VerifyState, WorktreeState,
 };
 use rusqlite::{Connection, ffi};
 
@@ -447,6 +447,56 @@ fn migrates_a_v2_database_with_rows_to_v3() {
     assert_eq!(db.task_children("t").unwrap(), ["c"]);
 }
 
+/// Migration 0005 on a v4 DB with rows: every task stays a visible task, no plan, no launch,
+/// and the one-active-plan index holds.
+#[test]
+fn migrates_a_v4_database_with_rows_to_v5() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("atm.sqlite3");
+    {
+        let mut c = Connection::open(&path).unwrap();
+        c.execute_batch(db::PRAGMAS).unwrap();
+        let tx = c.transaction().unwrap();
+        for sql in &MIGRATIONS[..4] {
+            tx.execute_batch(sql).unwrap();
+        }
+        tx.pragma_update(None, "user_version", 4).unwrap();
+        tx.commit().unwrap();
+        c.execute_batch(
+            "INSERT INTO projects (id, name, repo_path, default_target_branch, created_at,
+                updated_at)
+                VALUES ('p', 'Vecchio', '/r', 'main', 1, 2);
+             INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at,
+                auto)
+                VALUES ('t', 'p', 'T', 'todo', 1024, 0, 0, 1);",
+        )
+        .unwrap();
+    }
+
+    let db = Db::open(&path).unwrap();
+    let t = db.task("t").unwrap();
+    assert_eq!((t.kind, t.auto), (TaskKind::Task, true));
+    assert_eq!(db.latest_plan("p").unwrap(), None);
+    assert!(db.projects_with_launch().unwrap().is_empty());
+    let c = Connection::open(&path).unwrap();
+    c.execute_batch(
+        "INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at,
+            kind, plan_state) VALUES ('x', 'p', 'X', 'todo', 1, 0, 0, 'plan', 'awaiting')",
+    )
+    .unwrap();
+    let e = c
+        .execute_batch(
+            "INSERT INTO tasks (id, project_id, title, status, position, created_at, updated_at,
+                kind, plan_state) VALUES ('y', 'p', 'Y', 'todo', 1, 0, 0, 'plan', 'running')",
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("UNIQUE"), "{e}");
+    let e = c
+        .execute_batch("UPDATE tasks SET kind = 'other' WHERE id = 't'")
+        .unwrap_err();
+    assert!(e.to_string().contains("CHECK"), "{e}");
+}
+
 /// A database of the third schema with rows migrates to the fourth: the rows are kept with the
 /// autopilot off and the documented defaults, no attempt was verified, and the new columns'
 /// CHECKs and `after_id`'s `ON DELETE SET NULL` hold.
@@ -576,7 +626,7 @@ fn autopilot_candidates_follow_the_rules() {
     db.set_task_status("busy", Todo, NOW).unwrap();
 
     let ids = |project| -> Vec<String> {
-        db.autopilot_candidates(project)
+        db.autopilot_candidates(project, true)
             .unwrap()
             .into_iter()
             .map(|t| t.id)
@@ -592,6 +642,143 @@ fn autopilot_candidates_follow_the_rules() {
         err(db.set_task_auto("nope", true, NOW)).code,
         ErrorCode::NotFound
     );
+}
+
+/// Round 2026-10-02: a plan is a hidden task (board, sub-task cards, candidates), one active
+/// per project; its created tasks are launched (`launch` or `auto`) in one transaction with
+/// the state, `launch` is cleared when the task starts; startup fails a plan cut mid-turn.
+#[test]
+fn plans_are_hidden_and_launch_their_tasks() {
+    let db = seeded();
+    let plan = db
+        .insert_plan("pl", "p", "\n  Rifai il sito\ncon calma", NOW)
+        .unwrap();
+    assert_eq!(
+        (plan.kind, plan.title.as_str(), plan.status),
+        (TaskKind::Plan, "Rifai il sito", TaskStatus::Todo)
+    );
+    assert_eq!(db.task("t").unwrap().kind, TaskKind::Task);
+    assert_eq!(db.plan_state("pl").unwrap(), PlanState::Running);
+    assert_eq!(db.latest_plan("p").unwrap().as_deref(), Some("pl"));
+    assert_eq!(db.latest_plan("nope").unwrap(), None);
+    assert_eq!(
+        err(db.insert_plan("pl2", "p", "Altro", NOW)).code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(
+        err(db.insert_plan("pl3", "p", " \n ", NOW)).code,
+        ErrorCode::Invalid
+    );
+    assert_eq!(err(db.plan_state("t")).code, ErrorCode::NotFound);
+
+    // Hidden: board, candidates (even with auto and launch set by hand).
+    db.set_task_auto("pl", true, NOW).unwrap();
+    db.set_task_launch("pl", true, NOW).unwrap();
+    let board: Vec<String> = db
+        .board("p")
+        .unwrap()
+        .into_iter()
+        .map(|c| c.task.id)
+        .collect();
+    assert_eq!(board, ["t"]);
+    assert!(db.autopilot_candidates("p", true).unwrap().is_empty());
+    assert!(db.projects_with_launch().unwrap().is_empty());
+    db.set_task_auto("pl", false, NOW).unwrap();
+    db.set_task_launch("pl", false, NOW).unwrap();
+
+    // Created tasks: `planned_by`, oldest first; one already started is not launched.
+    for id in ["c1", "c2", "c3"] {
+        db.insert_task(id, &new_task("p", id, None), NOW).unwrap();
+        db.set_planned_by(id, "pl", NOW).unwrap();
+    }
+    db.set_task_status("c3", TaskStatus::InReview, NOW).unwrap();
+    // A sub-task of a created task: listed, never handed over (its parent's agent starts it).
+    let mut sub = new_task("p", "c1s", None);
+    sub.parent_id = Some("c1".into());
+    db.insert_task("c1s", &sub, NOW).unwrap();
+    db.set_planned_by("c1s", "pl", NOW).unwrap();
+    let view = db.plan_view("pl").unwrap();
+    assert_eq!(view.prompt, "\n  Rifai il sito\ncon calma");
+    assert_eq!((view.state, view.attempt_id), (PlanState::Running, None));
+    let created: Vec<&str> = view.created.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(created, ["c1", "c2", "c3", "c1s"]);
+    assert_eq!(view.created[3].parent_id.as_deref(), Some("c1"));
+
+    db.begin_attempt(&attempt("pa", "pl", NOW), &process("pr", "pa", 1, "i"), NOW)
+        .unwrap();
+    assert_eq!(
+        db.plan_view("pl").unwrap().attempt_id.as_deref(),
+        Some("pa")
+    );
+    assert!(db.stale_plans().unwrap().is_empty(), "its turn runs");
+    assert!(
+        db.set_plan_state("pl", &[PlanState::Running], PlanState::Awaiting, NOW)
+            .unwrap()
+    );
+    assert!(
+        !db.set_plan_state("pl", &[PlanState::Running], PlanState::Failed, NOW)
+            .unwrap()
+    );
+    assert_eq!(db.launch_plan("pl", false, NOW).unwrap(), ["c1", "c2"]);
+    assert_eq!(db.plan_state("pl").unwrap(), PlanState::Started);
+    assert_eq!(
+        err(db.launch_plan("pl", false, NOW)).code,
+        ErrorCode::Conflict
+    );
+    assert_eq!(db.projects_with_launch().unwrap(), ["p"]);
+    let ids = |auto| -> Vec<String> {
+        db.autopilot_candidates("p", auto)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect()
+    };
+    assert_eq!(ids(false), ["c1", "c2"]);
+    db.begin_attempt(&attempt("a1", "c1", NOW), &process("r1", "a1", 1, "i"), NOW)
+        .unwrap();
+    db.set_task_status("c1", TaskStatus::Todo, NOW).unwrap();
+    db.finish_discard("a1", NOW).unwrap();
+    assert_eq!(ids(false), ["c2"], "launch cleared on start");
+
+    // A second plan once the first ended; with the autopilot its tasks get `auto`.
+    db.insert_plan("pm", "p", "Secondo", NOW + 1).unwrap();
+    assert_eq!(db.latest_plan("p").unwrap().as_deref(), Some("pm"));
+    db.insert_task("c4", &new_task("p", "c4", None), NOW)
+        .unwrap();
+    db.set_planned_by("c4", "pm", NOW).unwrap();
+    assert_eq!(db.launch_plan("pm", true, NOW).unwrap(), ["c4"]);
+    let c4 = db.task("c4").unwrap();
+    assert!(c4.auto);
+    assert_eq!(ids(false), ["c2"]);
+    assert!(db.task("c2").unwrap().launch);
+    assert!(!db.task("c1s").unwrap().launch);
+
+    // Leaving Da fare cancels the launch: back in todo it no longer starts by itself.
+    db.move_task("c2", TaskStatus::Cancelled, None, NOW)
+        .unwrap();
+    db.move_task("c2", TaskStatus::Todo, None, NOW).unwrap();
+    assert!(!db.task("c2").unwrap().launch);
+    assert!(ids(false).is_empty());
+    assert!(db.projects_with_launch().unwrap().is_empty());
+
+    // Startup: a running plan without a running turn fails.
+    db.insert_plan("pn", "p", "Terzo", NOW + 2).unwrap();
+    assert_eq!(db.stale_plans().unwrap(), [("pn".to_owned(), None)]);
+
+    // Deleting a plan keeps its tasks; the project takes everything.
+    db.delete_task("pm").unwrap();
+    assert_eq!(db.task("c4").unwrap().title, "c4");
+    db.delete_project("p").unwrap();
+    assert_eq!(err(db.task("pl")).code, ErrorCode::NotFound);
+}
+
+#[test]
+fn plan_title_is_the_first_line_truncated() {
+    assert_eq!(db::plan_title("  \n Uno \n due"), "Uno");
+    assert_eq!(db::plan_title(""), "");
+    let long = db::plan_title(&"x".repeat(200));
+    assert_eq!(long.chars().count(), MAX_PLAN_TITLE);
+    assert!(long.ends_with('…'));
 }
 
 /// `update_task` changes `auto` and `after_id` only when asked; `Some(None)` clears the

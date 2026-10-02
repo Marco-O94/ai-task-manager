@@ -10,12 +10,14 @@ pub mod error;
 pub mod model;
 pub mod review;
 pub mod transcript;
+pub mod update;
 
 pub use api::*;
 pub use error::*;
 pub use model::*;
 pub use review::*;
 pub use transcript::*;
+pub use update::*;
 
 /// UUID v4, lowercase.
 pub type Id = String;

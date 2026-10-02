@@ -7,6 +7,7 @@ mod confirm;
 mod e2e;
 #[cfg(debug_assertions)]
 mod selftest;
+mod updater;
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -138,6 +139,10 @@ pub fn run() {
     }
     let app = builder
         .plugin(tauri_plugin_dialog::init())
+        // Driven from Rust only (`updater.rs`): the capabilities grant the webview none of its
+        // commands.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .manage(updater::Pending::default())
         .plugin(nav_guard())
         .setup(|app| {
             #[cfg(debug_assertions)]
@@ -149,6 +154,7 @@ pub fn run() {
             match start_core(&handle) {
                 Ok(core) => {
                     app.manage(core);
+                    updater::start(&handle);
                     // Hidden in tauri.conf.json until recovery is done: no blank window.
                     if let Some(window) = app.get_webview_window("main")
                         && let Err(e) = window.show()
@@ -205,6 +211,12 @@ pub fn run() {
             commands::delete_branch,
             commands::open_attempt,
             commands::open_url,
+            commands::start_plan,
+            commands::get_plan,
+            commands::resolve_plan,
+            commands::app_info,
+            commands::check_update,
+            commands::install_update,
             #[cfg(debug_assertions)]
             selftest::debug_ping,
             #[cfg(debug_assertions)]
@@ -406,7 +418,7 @@ fn on_run_event(app: &AppHandle, event: RunEvent) {
 /// Stops the agents once, whichever exit path gets here first; a second caller waits for the
 /// first. Bounded even if the shutdown panics or overruns: a windowless process that keeps
 /// the single-instance socket would swallow every relaunch.
-async fn shutdown_core(app: &AppHandle) {
+pub(crate) async fn shutdown_core(app: &AppHandle) {
     static DONE: OnceCell<()> = OnceCell::const_new();
     DONE.get_or_init(|| async {
         let Some(core) = app.try_state::<Arc<Core>>().map(|s| Arc::clone(&s)) else {

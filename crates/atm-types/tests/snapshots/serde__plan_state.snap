@@ -1,0 +1,11 @@
+---
+source: crates/atm-types/tests/serde.rs
+expression: "PlanState::ALL"
+---
+[
+  "running",
+  "awaiting",
+  "started",
+  "dismissed",
+  "failed"
+]

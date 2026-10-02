@@ -254,6 +254,8 @@ mod tests {
                 parent_id: None,
                 auto: false,
                 after_id: None,
+                kind: Default::default(),
+                launch: false,
             },
             attempt_id: None,
             attempt_state: None,

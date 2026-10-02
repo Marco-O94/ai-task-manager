@@ -499,6 +499,18 @@ pub const BOARD_ASK: &[&str] = &[
     "mcp__atm__move_task",
     "mcp__atm__start_task",
 ];
+/// Extra `deny` rules of a plan's turns (round 2026-10-02, after [`DENY_RULES`]): the
+/// planner reads the repository and creates tasks, it never edits, runs commands nor starts
+/// or changes tasks. Kept out of [`DENY_RULES`] (`check.sh` confines that constant).
+pub const PLAN_DENY: &[&str] = &[
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "Bash",
+    "mcp__atm__start_task",
+    "mcp__atm__move_task",
+    "mcp__atm__update_task",
+];
 /// Model of the sub-agents that ask for none, set in the `env` of `--settings` (flag settings
 /// win over the user's and the repository's).
 pub const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
@@ -529,8 +541,11 @@ pub struct TurnArgs {
     pub subagent_model: Option<String>,
     /// The task's attachments folder, canonical, when the task has any (spec F5): `--add-dir=`.
     pub attachments_dir: Option<PathBuf>,
-    /// [`append_prompt`], fixed for the attempt.
+    /// [`append_prompt`] ([`plan_append_prompt`] for a plan), fixed for the attempt.
     pub append_prompt: String,
+    /// A plan's turn (round 2026-10-02): always `--permission-mode=default`, [`PLAN_DENY`]
+    /// after the deny rules, and those board tools left out of `ask`.
+    pub plan: bool,
 }
 
 /// Exact argv of spec §7.3, `argv[0]` = the claude path; every value as `--flag=value`,
@@ -555,6 +570,7 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
         .map(String::from),
     );
     let mode = match args.permission_mode {
+        _ if args.plan => PermissionMode::Default,
         PermissionMode::BypassPermissions if !args.allow_bypass => PermissionMode::Default,
         mode => mode,
     };
@@ -569,7 +585,11 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
     };
     argv.push(format!("{session_flag}={}", args.session_id));
     let mut disallowed = vec![ASK_USER_QUESTION];
-    let mut ask = BOARD_ASK.to_vec();
+    let mut ask: Vec<&str> = BOARD_ASK
+        .iter()
+        .copied()
+        .filter(|tool| !args.plan || !PLAN_DENY.contains(tool))
+        .collect();
     if let Some(left) = args.subagents_left {
         if left == 0 {
             disallowed.extend(SUBAGENT_TOOLS);
@@ -590,6 +610,7 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
         .chain(args.allow_rules.iter().cloned())
         .collect();
     let settings = SettingsParts {
+        deny: if args.plan { PLAN_DENY } else { &[] },
         allow: &allow,
         ask: &ask,
         env: &env,
@@ -616,6 +637,8 @@ pub fn build_argv(args: &TurnArgs) -> Vec<String> {
 /// What the `--settings` JSON carries besides [`DENY_RULES`] (spec §7.8).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SettingsParts<'a> {
+    /// `permissions.deny` after [`DENY_RULES`] ([`PLAN_DENY`] for a plan).
+    pub deny: &'a [&'a str],
     /// `permissions.allow`: [`BOARD_ALLOW`], then `attempts.allow_rules`.
     pub allow: &'a [String],
     /// `permissions.ask`: whole tools each call of which goes to the host, whatever the mode;
@@ -638,7 +661,7 @@ pub fn settings_json(parts: &SettingsParts<'_>) -> String {
     }
     #[derive(Serialize)]
     struct Permissions<'a> {
-        deny: &'a [&'a str],
+        deny: Vec<&'a str>,
         allow: &'a [String],
         #[serde(skip_serializing_if = "<[_]>::is_empty")]
         ask: &'a [&'a str],
@@ -657,7 +680,7 @@ pub fn settings_json(parts: &SettingsParts<'_>) -> String {
     }
     serde_json::to_string(&Settings {
         permissions: Permissions {
-            deny: DENY_RULES,
+            deny: DENY_RULES.iter().chain(parts.deny).copied().collect(),
             allow: parts.allow,
             ask: parts.ask,
         },
@@ -680,6 +703,26 @@ pub fn append_prompt(worktree: &Path, branch: &str, target_branch: &str) -> Stri
          subtasks, use mcp__atm__create_task with parent_id \"self\". When your task is \
          driven by the autopilot, its subtasks start on their own: give a subtask `after` \
          (another task's id) to start it only once that task is done.",
+        worktree.display()
+    )
+}
+
+/// The appended prompt of a plan's turns (round 2026-10-02): the planner explores the
+/// repository and fills the board, it implements nothing.
+pub fn plan_append_prompt(worktree: &Path, branch: &str, target_branch: &str) -> String {
+    format!(
+        "You are the planner of AI Task Manager, working read-only in a throwaway git \
+         worktree `{}` on branch `{branch}` (created from `{target_branch}`). The user's \
+         message describes what they want done in this repository. Do not implement \
+         anything: do not edit files, run commands or commit. Explore the repository (read \
+         files, search), then split the work into tasks on the project's board with \
+         mcp__atm__create_task: top-level tasks (no parent_id; \"self\" is not a task you can \
+         use), each with a short imperative title and a description detailed enough for \
+         another agent to do it alone (what to change, where, how to check it). A task you \
+         created may get subtasks (parent_id = its id). When a task depends on another, give \
+         it `after` = the id of that task, so that it starts only once that one is done. Use \
+         mcp__atm__list_tasks first and do not duplicate tasks already on the board. End with \
+         a short summary of the tasks you created.",
         worktree.display()
     )
 }

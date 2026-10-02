@@ -8,6 +8,14 @@ dà agli agenti), **Task** (kanban o lista, con il pannello del task) e **Impost
 ogni tentativo si può limitare il numero di sub-agent e sceglierne il modello: vedi
 [La pagina del progetto](#la-pagina-del-progetto).
 
+Dal Riepilogo, la card **Pianifica con un agente** affida una richiesta a un agente di sola lettura: esplora il
+repository e crea i task (con le dipendenze «dopo»), senza implementare nulla. Alla fine i task partono da soli se il
+progetto è in Auto-edit o Autonomo; in Supervisionato l'app chiede «Avvia N task?».
+
+L'app si aggiorna da sola dalle release GitHub (macOS): un aggiornamento facoltativo compare come banner, uno
+richiesto (nuova major, o nuova minor finché la versione è 0.x) blocca l'app finché non lo installi. Vedi
+[Rilascio e aggiornamenti](#rilascio-e-aggiornamenti).
+
 ## Usa il Claude Code installato sul tuo Mac
 
 L'app non contiene un modello né un client dell'API: guida il `claude` già installato sul Mac, non modificato, con il
@@ -268,7 +276,7 @@ quello delle Impostazioni app, altrimenti quello del CLI.
 
 ## Installazione
 
-Servono macOS su Apple Silicon, Claude Code installato (`claude`, per esempio in `~/.local/bin`) con un login
+Servono macOS (provato su Apple Silicon; la build Intel delle release non è provata), Claude Code installato (`claude`, per esempio in `~/.local/bin`) con un login
 dell'abbonamento, e git ≥ 2.44 (Xcode Command Line Tools o Homebrew): con un git più vecchio l'app lo segnala e non
 esegue nessun comando git, perché non potrebbe impedire il fetch pigro di un partial clone. Per compilare vedi Setup
 qui sotto.
@@ -329,6 +337,8 @@ Nel mock, `http://localhost:1420/?task=<id>` apre subito il pannello di quel tas
 `task-inreview` (che ha già due allegati) e `task-done`. Il progetto `demo` ha un Riepilogo completo (CLAUDE.md,
 AGENTS.md con un carattere bidi, README troppo grande, impostazioni e server MCP mascherati), `?overview_error` lo fa
 fallire; "Aggiungi file…" risponde a turno con un file, due file, nessuno (selettore annullato) e un file troppo grande.
+La card «Pianifica con un agente» del Riepilogo di `demo` parte con una pianificazione in attesa di conferma;
+`?plan=idle|running|awaiting|started|dismissed|empty|failed` sceglie lo stato iniziale.
 Le task di Zed (`.zed/tasks.json`) lanciano l'app, l'app con fake-claude e il mock.
 
 ## Avvio dell'app in sviluppo
@@ -398,6 +408,37 @@ guidarsi da sole li aggiungono con `--config src-tauri/tauri.testkit.conf.json`,
 `scripts/check.sh` passa clippy su tutte e tre le varianti e fallisce se `tauri.conf.json` compila la release con
 `testkit` o se i due moduli non sono dichiarati sotto la feature. Passare da una variante all'altra ricompila una
 parte di Tauri (circa 10 s).
+
+## Rilascio e aggiornamenti
+
+La versione è una sola, `[workspace.package] version` di `Cargo.toml`; l'app la mostra in fondo alla sidebar e in
+Impostazioni app. Per pubblicarne una nuova:
+
+```bash
+scripts/bump-version.sh 0.2.0        # versione del workspace + Cargo.lock, commit «Release v0.2.0», tag v0.2.0
+git push origin main v0.2.0          # il tag avvia .github/workflows/release.yml
+```
+
+Il workflow costruisce su `macos-latest` l'app per Apple Silicon e Intel, firma gli archivi dell'updater
+(`.app.tar.gz` + `.sig`) in una release in bozza con `latest.json`, e la pubblica solo quando entrambe le piattaforme
+ci sono (job `publish`); le action sono fissate a un commit. Le app installate lo controllano all'avvio e ogni
+6 ore (solo le build di release; `ATM_NO_UPDATE_CHECK=1` lo spegne): una 0.1.x → 0.2.0 (o una nuova major) è
+**richiesta** e blocca l'app con «Aggiorna e riavvia», una nuova patch (o, da 1.0, una nuova minor) è facoltativa e
+compare come banner. Installare ferma gli agenti come l'uscita dall'app (i turni si riprendono con «Continua»).
+
+- **Chiave di firma:** generata una volta fuori dal repository con
+  `cargo tauri signer generate -w ~/.tauri/ai-task-manager.key --ci` (senza password); la chiave pubblica è
+  `plugins.updater.pubkey` in `src-tauri/tauri.conf.json`. Nel repository GitHub va il secret
+  `TAURI_SIGNING_PRIVATE_KEY` con il **contenuto** di `~/.tauri/ai-task-manager.key` (Settings → Secrets and variables
+  → Actions); `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` solo se la chiave ne ha una. Persa la chiave privata, le app già
+  installate non accettano più aggiornamenti: si reinstallano a mano.
+- `scripts/release.sh` in locale usa `~/.tauri/ai-task-manager.key` se c'è (altrimenti salta gli archivi dell'updater).
+- Le app non sono firmate né notarizzate da Apple: la prima installazione da una release scaricata passa per
+  Gatekeeper (vedi Installazione). Che gli aggiornamenti installati dall'app non abbiano l'attributo di quarantena
+  è **da verificare con la prima release**.
+- Un'installazione non riuscita (app avviata da un'immagine disco o da una posizione temporanea di macOS, password di
+  amministratore rifiutata) viene detta nel modale dopo il riavvio, che offre anche la pagina delle release e
+  «Continua per ora».
 
 ## Icona
 
@@ -525,7 +566,8 @@ figlio); dal round del 2026-10-01, `autopilot_fix_and_merge` (l'interruttore del
 progetto con il comando `test -f fixed.txt` e il merge automatico; un task affidato dal dialog parte da solo, la
 prima verifica fallisce, la correzione dell'autopilota scrive `fixed.txt` e il task è mergiato da solo, con le
 notifiche registrate in un file invece che mostrate) e `autopilot_after` (con agenti in parallelo = 1, il secondo di
-due task affidati resta «In coda» finché il primo non è Fatto, poi parte ed è mergiato anche lui); infine
+due task affidati resta «In coda» finché il primo non è Fatto, poi parte ed è mergiato anche lui); dal round del 2026-10-02, `planner_card` (in Supervisionato un piano crea due task,
+il secondo dopo il primo, chiede «Avvia 2 task?», resta fuori dalla board e con «No» lascia i task in Da fare); infine
 `project_removal`, il menu di `da-rimuovere` aperto con un clic destro sintetico, chiuso con un clic fuori, e la sua
 rimozione dalla lista, mentre `main` resta selezionato.
 
@@ -548,7 +590,7 @@ passo 3; nella fase 2, tutti dopo i merge del passo 10 (che non devono farne fal
 
 I report JSON delle fasi 2 e 3 (`step_1`…`step_12`, `channel_big_ok`, `reload_resubscribe_ok`, `csp_enforced`,
 `security_confirmations`, `task_list_view`, `attachment_to_the_agent`, `subagent_limit`, `subtasks_from_the_panel`,
-`board_tools_agent`, `subtask_cascade`, `autopilot_fix_and_merge`, `autopilot_after`, `project_removal`,
+`board_tools_agent`, `subtask_cascade`, `autopilot_fix_and_merge`, `autopilot_after`, `planner_card`, `project_removal`,
 `command_failures_phase1`/`_phase2`/`_phase3`, `exit_requested_armed`, `child_env_scrubbed`,
 `perf_flood`, `csp_violations` sommate su tutti i caricamenti di pagina, `details` con cosa è stato verificato, con le
 misure della fase 3, o perché è fallito) sono l'unica cosa su stdout (i log di build vanno su stderr); lo script esce
@@ -664,7 +706,9 @@ ATM_REAL_CLAUDE=1 cargo test -p atm-core --test real_cli -- --ignored --test-thr
 - Il CLI salva i suoi transcript in `~/.claude/projects/<worktree>`: l'app non li legge e non li cancella (R12).
 - Il modello può rifiutare un follow-up che ritiene estraneo a un task già finito (M5); il prompt dell'app lo mitiga
   per gli attempt nuovi.
-- Solo macOS su Apple Silicon; app non firmata né notarizzata (Gatekeeper sopra); nessun aggiornamento automatico.
+- Solo macOS, provato su Apple Silicon (la build Intel della release è prodotta ma mai provata); app non firmata né
+  notarizzata (Gatekeeper sopra); l'aggiornamento automatico
+  dalle release GitHub non è ancora stato provato su una release reale.
 - Niente push, fetch, PR, plan mode, rewind (spec §13.2). Le immagini si passano solo come allegati (niente incolla nel
   composer né trascinamento di file).
 - Il modello dei sub-agent scelto nel dialog Avvia è la fonte con la priorità più bassa per Claude Code: il modello
@@ -769,4 +813,6 @@ gli altri restano identici all'upstream e sono esclusi da rustfmt.
 | Server MCP `sdk` in-process sul control protocol (spike del 2026-09-30) | **verificato** con il CLI 2.1.285 (2 turni haiku): `--mcp-config={"mcpServers":{"atm":{"type":"sdk","name":"atm"}}}` compatibile con `--strict-mcp-config`; handshake `initialize`, `notifications/initialized`, `tools/list` come `mcp_message` prima di `system/init`; `tools/call` con `_meta."claudecode/toolUseId"`; risposte `{"mcp_response": …}`; tool `mcp__atm__<nome>`; la regola `ask` manda `can_use_tool` (con `mcp_server.source = "sdk"`) in `default` e in `bypassPermissions` | round 2026-09-30 |
 | Sotto task e tool board con fake-claude | confermato: sotto task validati (un livello, stesso progetto), eliminazione a cascata con worktree, allegati e log, `Busy` senza toccare nulla se gira il padre o un figlio (`tests/flow.rs::deleting_a_parent_deletes_its_subtasks_and_their_files`, `deleting_a_running_parent_removes_nothing`), sezione `## Parent task` nel prompt (`a_subtask_prompt_carries_its_parent`); tool board: creazione immediata, modifica, spostamento e avvio solo dopo l'approvazione, rifiuto rispettato, chiamata non approvata rifiutata dall'app, `ConcurrencyLimit`, profondità 2, modalità del progetto per un task non figlio, nessun accesso ad altri progetti (`board_tools_*`, `board_start_*`, `a_denied_board_tool_changes_nothing`, `an_unapproved_board_call_is_refused`); E2E `subtasks_from_the_panel`, `board_tools_agent`, `subtask_cascade` | round 2026-09-30 |
 | Autopilota con fake-claude | confermato: coda che rispetta "agenti in parallelo" e riempie gli slot liberi, `after`, verifica fallita → correzione → merge automatico o «pronto», tentativi esauriti, conflitti rimandati all'agente, nulla in pausa, Stop rispettato, coda ricostruita al riavvio, timeout e chiusura dell'app che uccidono il gruppo della verifica, nessuna corsa con un merge manuale, correzione che aspetta uno slot e passa prima della coda, follow-up dell'utente durante una verifica, discard che riprende il task, cicli di dipendenze rifiutati, task in coda da un agente avviati con `started_by_attempt` (`tests/flow.rs::autopilot_*`, `board_start_without_a_slot_is_queued_in_an_autopilot_project`, `board_subtasks_inherit_auto_and_take_after`); E2E `autopilot_fix_and_merge`, `autopilot_after` | round 2026-10-01 |
+| Pianificatore con fake-claude | confermato: in Auto-edit i task creati partono da soli rispettando agenti in parallelo = 1 e `after`, con l'autopilota passano all'autopilota, in Supervisionato «Avvia N task?» con Sì e No (una seconda risposta rifiutata), Stop → piano fallito e nulla avviato, un secondo piano mentre uno è attivo rifiutato, piano senza task, argv di sola lettura (snapshot), piano interrotto da un riavvio fallito all'avvio, task del piano mai sulla board né tra i candidati (`tests/flow.rs::plan_*`, `stopped_plan_fails_and_starts_nothing`); E2E `planner_card` | round 2026-10-02 |
+| Aggiornamento dell'app da una release reale | **non ancora verificato**: serve una prima release e poi una successiva; gravità richiesta/facoltativa coperta da unit test (`updater::is_required`) | round 2026-10-02 |
 | Tool board con il CLI reale nell'app, in Supervisionato, Auto-edit e Autonomo | **verificato** il 2026-10-01 con il CLI 2.1.286: `real_cli_board_tools_ask_in_every_mode`, 3 turni haiku, circa 0,19 USD | round 2026-09-30 |

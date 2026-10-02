@@ -722,9 +722,14 @@ fn queue_reason(ctx: AppCtx, card: &TaskCard, autopilot: bool) -> String {
                 .map(|c| c.task.title.clone())
         })
     });
+    let handed = card.task.launch && !card.task.auto;
     match after {
+        Some(title) if handed => format!(
+            "Avviato dalla pianificazione: parte dopo «{title}» (spostalo fuori da Da fare per annullare)"
+        ),
         Some(title) => format!("Parte dopo «{title}»"),
-        None if !autopilot => "Autopilota del progetto spento".into(),
+        None if handed => "Avviato dalla pianificazione: attende un agente libero".into(),
+        None if !autopilot && !card.task.launch => "Autopilota del progetto spento".into(),
         None => "Attende un agente libero".into(),
     }
 }
@@ -893,6 +898,8 @@ mod tests {
                     parent_id: None,
                     auto: false,
                     after_id: None,
+                    kind: Default::default(),
+                    launch: false,
                 },
                 attempt_id: Some("a".into()),
                 attempt_state: Some(AttemptState::Active),

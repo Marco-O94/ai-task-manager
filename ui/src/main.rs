@@ -24,12 +24,14 @@ mod views {
     pub mod merge_dialog;
     pub mod onboarding;
     pub mod overview;
+    pub mod planner;
     pub mod settings;
     pub mod sidebar;
     pub mod start_dialog;
     pub mod task_dialog;
     pub mod task_panel;
     pub mod transcript;
+    pub mod update;
 }
 mod widgets {
     pub mod context_menu;

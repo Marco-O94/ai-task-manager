@@ -14,6 +14,7 @@ pub mod db;
 pub mod git;
 pub mod live;
 pub mod normalize;
+mod plan;
 pub mod runner;
 pub mod wire;
 
@@ -36,8 +37,8 @@ use atm_types::{
     MoveTaskReq, OpenAttemptReq, OpenLoginTerminalReq, OpenTarget, OpenUrlReq, PermissionMode,
     PickedFile, ProcessInfo, Project, ProjectIdReq, ProjectOverview, RespondApprovalReq,
     SendFollowUpReq, SetProjectSecurityReq, Settings, StartAttemptReq, Task, TaskCard, TaskDetail,
-    TaskStatus, UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq, VERIFY_TIMEOUT_SECS,
-    WorktreeState,
+    TaskKind, TaskStatus, UnsubscribeTranscriptReq, UpdateProjectReq, UpdateTaskReq,
+    VERIFY_TIMEOUT_SECS, WorktreeState,
 };
 use tokio::sync::OwnedMutexGuard;
 
@@ -272,6 +273,7 @@ impl Core {
     pub async fn startup(&self) -> Result<(), AppError> {
         let s = &self.inner;
         s.recover_orphans().await?;
+        s.recover_plans().await;
         for attempt_id in s.db.mark_stale_verifies(now_ms())? {
             s.stale_verify(&attempt_id);
         }
@@ -2194,6 +2196,9 @@ fn check_parent(db: &Db, project_id: &str, parent_id: &str) -> Result<(), AppErr
         ErrorCode::NotFound => AppError::invalid("Il task padre non esiste"),
         _ => e,
     })?;
+    if parent.kind != TaskKind::Task {
+        return Err(AppError::invalid("Il task padre non esiste"));
+    }
     if parent.project_id != project_id {
         return Err(AppError::invalid(
             "Il task padre appartiene a un altro progetto",
@@ -2218,6 +2223,9 @@ fn check_after(db: &Db, project_id: &str, task_id: &str, after_id: &str) -> Resu
         ErrorCode::NotFound => AppError::invalid("Il task da cui dipende non esiste"),
         _ => e,
     })?;
+    if after.kind != TaskKind::Task {
+        return Err(AppError::invalid("Il task da cui dipende non esiste"));
+    }
     if after.project_id != project_id {
         return Err(AppError::invalid(
             "Il task da cui dipende appartiene a un altro progetto",

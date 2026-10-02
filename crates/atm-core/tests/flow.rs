@@ -5381,3 +5381,381 @@ async fn usage_limit_pause_notifies_with_the_autopilot_on() {
         ("", "Autopilota in pausa")
     );
 }
+
+// ---- round 2026-10-02: the planner ----------------------------------------------------------
+
+impl Flow {
+    /// The project's default permission mode, every other setting as stored.
+    async fn set_mode(&self, mode: PermissionMode) {
+        let p = self.core.project(&self.project.id).await.unwrap();
+        let req = UpdateProjectReq {
+            id: p.id,
+            name: p.name,
+            default_target_branch: p.default_target_branch,
+            default_permission_mode: mode,
+            default_model: p.default_model,
+            description: p.description,
+            autopilot: p.autopilot,
+            autopilot_merge: p.autopilot_merge,
+            verify_command: p.verify_command,
+            verify_timeout_secs: p.verify_timeout_secs,
+            autopilot_max_fixes: p.autopilot_max_fixes,
+        };
+        self.core.update_project(req).await.unwrap();
+    }
+
+    async fn start_plan(&self, prompt: &str) -> Result<PlanView, AppError> {
+        let req = StartPlanReq {
+            project_id: self.project.id.clone(),
+            prompt: prompt.into(),
+            model: None,
+            effort: None,
+        };
+        self.core.start_plan(req).await
+    }
+
+    async fn plan_now(&self) -> PlanView {
+        let req = GetPlanReq {
+            project_id: self.project.id.clone(),
+        };
+        self.core.get_plan(req).await.unwrap().unwrap()
+    }
+
+    async fn resolve(&self, plan_id: &str, proceed: bool) -> Result<PlanView, AppError> {
+        let req = ResolvePlanReq {
+            plan_id: plan_id.into(),
+            proceed,
+        };
+        self.core.resolve_plan(req).await
+    }
+
+    /// Waits until the plan's turn is handled: no longer running, its attempt closed.
+    async fn plan_settled(&self) -> PlanView {
+        self.seen
+            .until("the end of the plan", CHAIN, async || {
+                let p = self.plan_now().await;
+                p.state != PlanState::Running
+                    && p.attempt_id.as_ref().is_some_and(|id| {
+                        self.db()
+                            .attempt(id)
+                            .is_ok_and(|a| a.state != AttemptState::Active)
+                    })
+            })
+            .await;
+        self.plan_now().await
+    }
+
+    /// Waits until turn 1 of the task's only attempt has ended.
+    async fn first_turn_end(&self, task_id: &str) {
+        self.seen
+            .until("an attempt of the task", CHAIN, async || {
+                !self.db().task_attempts(task_id).unwrap().is_empty()
+            })
+            .await;
+        self.turn_end(task_id, 1, CHAIN).await;
+    }
+
+    fn branch_exists(&self, branch: &str) -> bool {
+        let out = std::process::Command::new("git")
+            .args(["branch", "--list", branch])
+            .current_dir(&self.repo)
+            .output()
+            .unwrap();
+        !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+    }
+
+    /// Asserts the plan is hidden: never on the board, never a candidate of the scheduler.
+    async fn assert_plan_hidden(&self, plan_id: &str) {
+        let board = self
+            .core
+            .get_board(ProjectIdReq {
+                project_id: self.project.id.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(board.iter().all(|c| c.task.id != plan_id));
+        assert!(board.iter().all(|c| c.task.kind == TaskKind::Task));
+        let candidates = self
+            .db()
+            .autopilot_candidates(&self.project.id, true)
+            .unwrap();
+        assert!(candidates.iter().all(|t| t.id != plan_id));
+    }
+}
+
+fn created_titles(plan: &PlanView) -> Vec<&str> {
+    plan.created.iter().map(|t| t.title.as_str()).collect()
+}
+
+/// A project in Auto-edit (no approvals) starts what the plan created at once, through the
+/// scheduler with the autopilot off: `max_running = 1` (the plan's turn counted too) and
+/// `after` hold, the second task waits for the first to be done. The plan is hidden, its
+/// attempt discarded with its worktree and branch, its transcript kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_in_accept_edits_starts_its_tasks_in_order() {
+    let f = Flow::new(&[]).await;
+    set_max_running(&f, 1).await;
+    let view = f
+        .start_plan("  Dividi il lavoro [fake:plan]\n\nDettagli")
+        .await
+        .unwrap();
+    assert_eq!(view.prompt, "Dividi il lavoro [fake:plan]\n\nDettagli");
+    f.assert_plan_hidden(&view.id).await;
+    let plan = f.plan_settled().await;
+    assert_eq!(plan.id, view.id);
+    assert_eq!(plan.state, PlanState::Started);
+    assert_eq!(
+        created_titles(&plan),
+        ["Primo task pianificato", "Secondo task pianificato"]
+    );
+    let attempt = f.db().attempt(plan.attempt_id.as_ref().unwrap()).unwrap();
+    assert_eq!(attempt.state, AttemptState::Discarded);
+    assert_eq!(attempt.worktree_state, WorktreeState::Removed);
+    // Deleted right after the discard.
+    f.seen
+        .until("the plan's branch deleted", CHAIN, async || {
+            !f.branch_exists(&attempt.branch)
+        })
+        .await;
+    assert!(!f.entries(&attempt.id).await.is_empty());
+    let calls = board_calls(&f);
+    assert!(
+        calls.iter().all(|c| c.0 == "create_task" && !c.1),
+        "{calls:?}"
+    );
+
+    let (first, second) = (&plan.created[0].id, &plan.created[1].id);
+    assert_eq!(
+        f.db().task(second).unwrap().after_id.as_deref(),
+        Some(first.as_str())
+    );
+    f.first_turn_end(first).await;
+    assert!(f.db().task_attempts(second).unwrap().is_empty());
+    let first_attempt = f.db().task_attempts(first).unwrap().remove(0);
+    let merged = f
+        .core
+        .merge_attempt(MergeAttemptReq {
+            attempt_id: first_attempt.id.clone(),
+            message: "Primo".into(),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(merged, MergeOutcome::Merged { .. }), "{merged:?}");
+    f.first_turn_end(second).await;
+    assert!(f.db().projects_with_launch().unwrap().is_empty());
+    assert!(
+        running_counts(&f).iter().all(|&n| n <= 1),
+        "{:?}",
+        running_counts(&f)
+    );
+    f.assert_plan_hidden(&plan.id).await;
+    assert!(!f.db().task(first).unwrap().auto);
+}
+
+/// With the autopilot on, the created tasks are the autopilot's (`auto`), not `launch`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_with_the_autopilot_gives_its_tasks_to_the_autopilot() {
+    let f = Flow::new(&[]).await;
+    autopilot(&f, false, None, 2, 600).await;
+    f.start_plan("Pianifica [fake:plan]").await.unwrap();
+    let plan = f.plan_settled().await;
+    assert_eq!(plan.state, PlanState::Started);
+    for t in &plan.created {
+        assert!(f.db().task(&t.id).unwrap().auto, "{}", t.title);
+    }
+    f.first_turn_end(&plan.created[0].id).await;
+}
+
+/// A project asking for approvals (Default) waits for the user: «Avvia N task?» is notified,
+/// nothing starts. No → dismissed, the tasks stay in todo; Sì → started like Auto-edit. Only
+/// an awaiting plan can be resolved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_in_default_mode_awaits_then_proceeds_or_is_dismissed() {
+    let f = Flow::new(&[]).await;
+    f.set_mode(PermissionMode::Default).await;
+    f.start_plan("Prima idea [fake:plan]").await.unwrap();
+    let plan = f.plan_settled().await;
+    assert_eq!(plan.state, PlanState::Awaiting);
+    assert_eq!(plan.created.len(), 2);
+    assert!(
+        f.notifications().contains(&[
+            plan.id.clone(),
+            "Pianificazione".to_owned(),
+            "«Prima idea [fake:plan]»: avviare 2 task?".to_owned()
+        ]),
+        "{:?}",
+        f.notifications()
+    );
+    let attempt = f.db().attempt(plan.attempt_id.as_ref().unwrap()).unwrap();
+    assert_eq!(attempt.state, AttemptState::Discarded);
+    // Still awaiting: a second plan is refused.
+    let err = f.start_plan("Seconda idea [fake:plan]").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+
+    let dismissed = f.resolve(&plan.id, false).await.unwrap();
+    assert_eq!(dismissed.state, PlanState::Dismissed);
+    let err = f.resolve(&plan.id, true).await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    assert!(f.db().projects_with_launch().unwrap().is_empty());
+    for t in &dismissed.created {
+        assert_eq!(f.db().task(&t.id).unwrap().status, TaskStatus::Todo);
+        assert!(f.db().task_attempts(&t.id).unwrap().is_empty());
+    }
+
+    f.start_plan("Seconda idea [fake:plan]").await.unwrap();
+    let plan = f.plan_settled().await;
+    assert_eq!(plan.state, PlanState::Awaiting);
+    let started = f.resolve(&plan.id, true).await.unwrap();
+    assert_eq!(started.state, PlanState::Started);
+    f.first_turn_end(&plan.created[0].id).await;
+    assert!(
+        f.db()
+            .task_attempts(&plan.created[1].id)
+            .unwrap()
+            .is_empty()
+    );
+    f.assert_plan_hidden(&plan.id).await;
+}
+
+/// The user's Stop fails the plan: what it created stays in todo, nothing starts. While it
+/// runs, a second plan of the project is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_plan_fails_and_starts_nothing() {
+    let f = Flow::new(&[]).await;
+    let view = f
+        .start_plan("Pianifica [fake:plan] [then:hang]")
+        .await
+        .unwrap();
+    f.seen
+        .until("the plan's two tasks", CHAIN, async || {
+            f.plan_now().await.created.len() == 2
+        })
+        .await;
+    let err = f.start_plan("Ancora [fake:plan]").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+    f.assert_plan_hidden(&view.id).await;
+    f.stop(view.attempt_id.as_ref().unwrap()).await;
+    let plan = f.plan_settled().await;
+    assert_eq!(plan.state, PlanState::Failed);
+    assert!(f.db().projects_with_launch().unwrap().is_empty());
+    for t in &plan.created {
+        let task = f.db().task(&t.id).unwrap();
+        assert_eq!((task.status, task.auto), (TaskStatus::Todo, false));
+        assert!(f.db().task_attempts(&t.id).unwrap().is_empty());
+    }
+    assert_eq!(f.worktrees(), 0);
+}
+
+/// A plan that creates nothing ends `started` with no question; an empty prompt or an unknown
+/// model is refused before anything exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_without_tasks_and_bad_requests() {
+    let f = Flow::new(&[]).await;
+    f.set_mode(PermissionMode::Default).await;
+    let err = f.start_plan("  \n ").await.unwrap_err();
+    assert_eq!(err.code, ErrorCode::Invalid);
+    let req = StartPlanReq {
+        project_id: f.project.id.clone(),
+        prompt: "Pianifica".into(),
+        model: Some("gpt".into()),
+        effort: None,
+    };
+    assert_eq!(
+        f.core.start_plan(req).await.unwrap_err().code,
+        ErrorCode::Invalid
+    );
+    let none = f
+        .core
+        .get_plan(GetPlanReq {
+            project_id: f.project.id.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(none.is_none());
+    f.start_plan("Niente da fare").await.unwrap();
+    let plan = f.plan_settled().await;
+    assert_eq!((plan.state, plan.created.len()), (PlanState::Started, 0));
+    assert!(f.notifications().is_empty(), "{:?}", f.notifications());
+}
+
+/// The plan's argv: Default mode whatever the project's, the extra deny rules after
+/// `DENY_RULES`, the board tools it may not use out of `ask`, and the planner's prompt;
+/// Isolated even in a Trusted project (no MCP server nor allow rule of the repository).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_argv_is_read_only() {
+    let f = Flow::new(&[]).await;
+    f.set_mode(PermissionMode::AcceptEdits).await;
+    let trusted = f
+        .core
+        .set_project_security(security(&f.project.id, ConfigPolicy::Trusted, false))
+        .await
+        .unwrap();
+    assert!(trusted.trusted);
+    let view = f.start_plan("Pianifica [fake:plan]").await.unwrap();
+    let plan = f.plan_settled().await;
+    let attempt = f.db().attempt(plan.attempt_id.as_ref().unwrap()).unwrap();
+    let argv = f.calls().remove(0);
+    assert_eq!(flag(&argv, "--permission-mode="), Some("default"));
+    assert_eq!(isolation_flags(&argv), (true, true));
+    let settings = settings_of(&argv);
+    let mut deny: Vec<&str> = claude::DENY_RULES.to_vec();
+    deny.extend(claude::PLAN_DENY);
+    assert_eq!(settings["permissions"]["deny"], serde_json::json!(deny));
+    assert_eq!(
+        flag(&argv, "--append-system-prompt="),
+        Some(
+            claude::plan_append_prompt(Path::new(&attempt.worktree_path), &attempt.branch, "main")
+                .as_str()
+        )
+    );
+    let rules = serde_json::to_string(claude::DENY_RULES).unwrap();
+    let rules = &rules[..rules.len() - 1];
+    // The record has no argv[0].
+    let folded: Vec<String> = argv
+        .iter()
+        .map(|a| {
+            a.replace(rules, "[\"<DENY_RULES>\"")
+                .replace(&attempt.worktree_path, "<worktree>")
+                .replace(&attempt.branch, "<branch>")
+                .replace(&attempt.session_id, "<session>")
+        })
+        .collect();
+    insta::assert_json_snapshot!("plan_argv", folded);
+    assert_eq!(view.id, plan.id);
+}
+
+/// A plan cut by the app closing is failed by the next Core's startup, its attempt discarded
+/// (worktree and branch), what it created left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plan_cut_by_a_restart_fails_at_startup() {
+    let f = Flow::new(&[]).await;
+    let view = f
+        .start_plan("Pianifica [fake:plan] [then:hang]")
+        .await
+        .unwrap();
+    f.seen
+        .until("the plan's two tasks", CHAIN, async || {
+            f.plan_now().await.created.len() == 2
+        })
+        .await;
+    f.core.shutdown(runner::SHUTDOWN_DEADLINE).await;
+    let db = f.db();
+    assert_eq!(db.plan_state(&view.id).unwrap(), PlanState::Running);
+    let attempt_id = view.attempt_id.unwrap();
+    let branch = db.attempt(&attempt_id).unwrap().branch;
+
+    let core = Core::new(f.config.clone(), Seen::new().notify()).unwrap();
+    core.startup().await.unwrap();
+    assert_eq!(db.plan_state(&view.id).unwrap(), PlanState::Failed);
+    let attempt = db.attempt(&attempt_id).unwrap();
+    assert_eq!(
+        (attempt.state, attempt.worktree_state),
+        (AttemptState::Discarded, WorktreeState::Removed)
+    );
+    assert!(!f.branch_exists(&branch));
+    for t in db.plan_tasks(&view.id).unwrap() {
+        assert!(!t.auto && t.status == TaskStatus::Todo);
+    }
+    assert!(db.projects_with_launch().unwrap().is_empty());
+    core.shutdown(runner::SHUTDOWN_DEADLINE).await;
+}

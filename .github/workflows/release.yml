@@ -1,0 +1,88 @@
+# Release (round 2026-10-02, ARCHITECTURE.md «Versione e aggiornamenti»): a `v*` tag builds the
+# macOS app for Apple Silicon and Intel, signs the updater archives (.app.tar.gz + .sig) with
+# TAURI_SIGNING_PRIVATE_KEY and publishes the GitHub release with `latest.json`, the file the
+# installed apps check (releases/latest/download/latest.json). The apps themselves are not
+# signed nor notarized by Apple (README, Installazione). Windows: a later round.
+#
+# Secrets: TAURI_SIGNING_PRIVATE_KEY (the content of ~/.tauri/ai-task-manager.key, whose public
+# half is plugins.updater.pubkey in src-tauri/tauri.conf.json) and, only if the key has one,
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+#
+# The release stays a draft until both platforms are uploaded (the `publish` job): an
+# installed app never sees a `latest.json` with one platform only. Every action is pinned to
+# a commit (the tag in a comment): the signing key is in the job's environment, and a moved
+# tag must not get it.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      # One at a time: each job adds its platform to the release's latest.json.
+      max-parallel: 1
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Tag matches the workspace version
+        run: |
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          if [[ "v$version" != "$GITHUB_REF_NAME" ]]; then
+            echo "tag $GITHUB_REF_NAME != workspace version $version (scripts/bump-version.sh)" >&2
+            exit 1
+          fi
+
+      # rust-toolchain.toml pins the toolchain (with wasm32-unknown-unknown); rustup installs it.
+      - name: Rust toolchain and targets
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add ${{ matrix.target }} wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      # As in the README's Setup; Trunk then downloads Tailwind, wasm-bindgen and wasm-opt
+      # itself (ui/Trunk.toml [tools]).
+      - name: Trunk and the Tauri CLI
+        run: |
+          command -v trunk >/dev/null || cargo install trunk --version 0.21.14 --locked
+          command -v cargo-tauri >/dev/null || cargo install tauri-cli --version 2.12.0 --locked
+
+      - uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.target }} -- --locked
+          tagName: v__VERSION__
+          releaseName: AI Task Manager v__VERSION__
+          releaseBody: Vedi il README per l'installazione (app non firmata da Apple).
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+
+  # Only once every platform is in the draft: it becomes the latest release.
+  publish:
+    needs: macos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -1,0 +1,23 @@
+---
+source: crates/atm-core/tests/flow.rs
+expression: folded
+---
+[
+  "-p",
+  "--output-format",
+  "stream-json",
+  "--input-format",
+  "stream-json",
+  "--verbose",
+  "--include-partial-messages",
+  "--permission-prompt-tool",
+  "stdio",
+  "--permission-mode=default",
+  "--session-id=<session>",
+  "--disallowedTools=AskUserQuestion",
+  "--settings={\"permissions\":{\"deny\":[\"<DENY_RULES>\",\"Edit\",\"Write\",\"NotebookEdit\",\"Bash\",\"mcp__atm__start_task\",\"mcp__atm__move_task\",\"mcp__atm__update_task\"],\"allow\":[\"mcp__atm__list_tasks\",\"mcp__atm__get_task\",\"mcp__atm__create_task\"]}}",
+  "--setting-sources=user",
+  "--strict-mcp-config",
+  "--mcp-config={\"mcpServers\":{\"atm\":{\"type\":\"sdk\",\"name\":\"atm\"}}}",
+  "--append-system-prompt=You are the planner of AI Task Manager, working read-only in a throwaway git worktree `<worktree>` on branch `<branch>` (created from `main`). The user's message describes what they want done in this repository. Do not implement anything: do not edit files, run commands or commit. Explore the repository (read files, search), then split the work into tasks on the project's board with mcp__atm__create_task: top-level tasks (no parent_id; \"self\" is not a task you can use), each with a short imperative title and a description detailed enough for another agent to do it alone (what to change, where, how to check it). A task you created may get subtasks (parent_id = its id). When a task depends on another, give it `after` = the id of that task, so that it starts only once that one is done. Use mcp__atm__list_tasks first and do not duplicate tasks already on the board. End with a short summary of the tasks you created."
+]

@@ -20,6 +20,7 @@ use crate::views::settings::ProjectSettings;
 use crate::views::sidebar::{Sidebar, Topbar, projects_loaded};
 use crate::views::task_dialog::TaskDialogMode;
 use crate::views::task_panel::TaskPanel;
+use crate::views::update::{RequiredUpdate, blocks_app, provide_update_ctx, use_update};
 use crate::widgets::toast::{Toaster, Toasts};
 
 const CHANGED_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -198,6 +199,8 @@ impl AppCtx {
 pub fn App() -> impl IntoView {
     let ctx = AppCtx::new();
     provide_context(ctx);
+    provide_update_ctx();
+    let update = use_update();
 
     // The gate stays closed until the first successful `get_env` says CLI + login are fine.
     let continue_anyway = RwSignal::new(false);
@@ -227,9 +230,13 @@ pub fn App() -> impl IntoView {
     });
 
     view! {
-        <Show when=move || ready.get() fallback=move || view! { <Onboarding continue_anyway /> }>
-            <Layout />
-        </Show>
+        // Under the modal of a required update nothing takes the focus.
+        <div class="contents" inert=move || blocks_app(update)>
+            <Show when=move || ready.get() fallback=move || view! { <Onboarding continue_anyway /> }>
+                <Layout />
+            </Show>
+        </div>
+        <RequiredUpdate />
         <Toasts toaster=ctx.toasts />
     }
 }

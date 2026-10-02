@@ -16,6 +16,11 @@
 # AppleScript that lays it out drives Finder, which needs the Automation permission for the
 # terminal and otherwise times out (-1712) and fails the build, so `CI=true` makes the bundler
 # skip it. `ATM_DMG_LAYOUT=1 scripts/release.sh` runs it (macOS asks for the permission once).
+#
+# Updater archives (round 2026-10-02): `bundle.createUpdaterArtifacts` makes the bundler sign a
+# .app.tar.gz with TAURI_SIGNING_PRIVATE_KEY. Unset, the script uses ~/.tauri/ai-task-manager.key
+# (no password) if it exists, else builds without the archives. The published releases come from
+# .github/workflows/release.yml, not from here.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -30,11 +35,20 @@ case ${1:-} in
 esac
 
 if ((build)); then
+    updater=()
+    key=$HOME/.tauri/ai-task-manager.key
+    if [[ -z ${TAURI_SIGNING_PRIVATE_KEY:-} && -f $key ]]; then
+        # A path: the key's content never goes through this script.
+        export TAURI_SIGNING_PRIVATE_KEY=$key TAURI_SIGNING_PRIVATE_KEY_PASSWORD=${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}
+    elif [[ -z ${TAURI_SIGNING_PRIVATE_KEY:-} ]]; then
+        echo "release: no signing key ($key): building without the updater archives" >&2
+        updater=(--config '{"bundle":{"createUpdaterArtifacts":false}}')
+    fi
     # The default beforeBuildCommand: `trunk build --release`, without `testkit`.
     if [[ ${ATM_DMG_LAYOUT:-} == 1 ]]; then
-        cargo tauri build -- --locked >&2
+        cargo tauri build ${updater[@]+"${updater[@]}"} -- --locked >&2
     else
-        CI=true cargo tauri build -- --locked >&2
+        CI=true cargo tauri build ${updater[@]+"${updater[@]}"} -- --locked >&2
     fi
 fi
 

@@ -9,10 +9,12 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::update::{CheckUpdate, GetAppInfo, InstallUpdate};
 use crate::{
     ApprovalDecision, Attachment, AttemptView, BranchList, BranchStatus, ConfigPolicy, DiffResult,
     Effort, EntryPage, EnvStatus, Id, LoginMethod, MergeOutcome, OpenTarget, PermissionMode,
-    PickedFile, ProcessInfo, Project, ProjectOverview, Settings, TaskCard, TaskDetail, TaskStatus,
+    PickedFile, PlanView, ProcessInfo, Project, ProjectOverview, Settings, TaskCard, TaskDetail,
+    TaskStatus,
 };
 
 /// Typed marker of one IPC command.
@@ -256,6 +258,28 @@ pub struct OpenUrlReq {
     pub url: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StartPlanReq {
+    pub project_id: Id,
+    /// Trimmed, 1..=100000 characters (`Invalid`); its first line is the plan's title.
+    pub prompt: String,
+    /// One of `MODEL_ALIASES`, or `None` = the project's `default_model` (else the CLI's).
+    pub model: Option<String>,
+    pub effort: Option<Effort>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetPlanReq {
+    pub project_id: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvePlanReq {
+    pub plan_id: Id,
+    /// «Sì»: start the created tasks; «No»: leave them in todo.
+    pub proceed: bool,
+}
+
 cmd!(
     /// Cached for 60 s; `force` re-checks everything.
     GetEnv, "get_env", GetEnvReq => EnvStatus
@@ -354,6 +378,20 @@ cmd!(
 );
 cmd!(OpenAttempt, "open_attempt", OpenAttemptReq => ());
 cmd!(OpenUrl, "open_url", OpenUrlReq => ());
+cmd!(
+    /// Creates the plan's hidden task and starts its read-only attempt (mode Default).
+    /// `Conflict` while another plan of the project is running or awaiting; the start errors
+    /// of `start_attempt` (`ConcurrencyLimit`, `NotLoggedIn`, ...) leave nothing behind.
+    StartPlan, "start_plan", StartPlanReq => PlanView
+);
+cmd!(
+    /// The project's latest plan, whatever its state; `None` if it never had one.
+    GetPlan, "get_plan", GetPlanReq => Option<PlanView>
+);
+cmd!(
+    /// Answers «Avvia N task?» of an `Awaiting` plan (`Invalid` in any other state).
+    ResolvePlan, "resolve_plan", ResolvePlanReq => PlanView
+);
 
 /// Names of every §6.3 command (debug probes excluded), in table order.
 pub const COMMAND_NAMES: &[&str] = &[
@@ -393,4 +431,10 @@ pub const COMMAND_NAMES: &[&str] = &[
     DeleteBranch::NAME,
     OpenAttempt::NAME,
     OpenUrl::NAME,
+    StartPlan::NAME,
+    GetPlan::NAME,
+    ResolvePlan::NAME,
+    GetAppInfo::NAME,
+    CheckUpdate::NAME,
+    InstallUpdate::NAME,
 ];

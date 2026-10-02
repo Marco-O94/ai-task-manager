@@ -25,7 +25,7 @@ use crate::ui::spinner::Spinner;
 
 /// Label of the `""` choice of the model select: the model `start_attempt` resolves without
 /// one (the project's default, then the app's, spec §7.4), else the CLI's own default.
-fn default_model_label(project: Option<&str>, app: Option<&str>) -> String {
+pub(crate) fn default_model_label(project: Option<&str>, app: Option<&str>) -> String {
     let resolved = [project, app]
         .into_iter()
         .flatten()
@@ -51,7 +51,7 @@ fn subagent_fields(max: &str, model: &str) -> (Option<u8>, Option<String>) {
     (max, model)
 }
 
-const EFFORTS: &[(&str, &str)] = &[
+pub(crate) const EFFORTS: &[(&str, &str)] = &[
     ("", "Predefinito"),
     ("low", "Basso"),
     ("medium", "Medio"),
@@ -392,7 +392,7 @@ pub fn StartDialog(task_id: RwSignal<Option<Id>>) -> impl IntoView {
 }
 
 /// `prop:selected` keeps the choice when the options render after the value is set.
-fn option(value: String, label: String, current: RwSignal<String>) -> impl IntoView {
+pub(crate) fn option(value: String, label: String, current: RwSignal<String>) -> impl IntoView {
     let selected = value.clone();
     view! {
         <option value=value prop:selected=move || current.with(|c| *c == selected)>

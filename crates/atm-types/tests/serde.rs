@@ -35,6 +35,8 @@ fn task() -> Task {
         parent_id: Some(id(9)),
         auto: true,
         after_id: Some(id(14)),
+        kind: TaskKind::Task,
+        launch: true,
     }
 }
 
@@ -466,6 +468,8 @@ fn db_enums_match_db_and_cli_strings() {
     check_db_enum(Effort::ALL);
     check_db_enum(StopReason::ALL);
     check_db_enum(VerifyState::ALL);
+    check_db_enum(TaskKind::ALL);
+    check_db_enum(PlanState::ALL);
     assert_eq!(PermissionMode::AcceptEdits.as_str(), "acceptEdits");
     assert_eq!(Effort::XHigh.as_str(), "xhigh");
 }
@@ -481,6 +485,8 @@ fn enum_snapshots() {
     insta::assert_json_snapshot!("effort", Effort::ALL);
     insta::assert_json_snapshot!("stop_reason", StopReason::ALL);
     insta::assert_json_snapshot!("verify_state", VerifyState::ALL);
+    insta::assert_json_snapshot!("task_kind", TaskKind::ALL);
+    insta::assert_json_snapshot!("plan_state", PlanState::ALL);
     insta::assert_json_snapshot!("error_code", ERROR_CODES);
     insta::assert_json_snapshot!("level", LEVELS);
     insta::assert_json_snapshot!("notice_action", NOTICE_ACTIONS);
@@ -534,6 +540,44 @@ fn entry_kind_is_the_serde_tag() {
 fn model_types_round_trip() {
     round_trip(&project());
     round_trip(&task());
+    round_trip(&Task {
+        kind: TaskKind::Plan,
+        ..task()
+    });
+    // A task without `kind` (before the planner) is a plain task.
+    let mut json = serde_json::to_value(task()).unwrap();
+    json.as_object_mut().unwrap().remove("kind");
+    json.as_object_mut().unwrap().remove("launch");
+    let old = Task {
+        launch: false,
+        ..task()
+    };
+    assert_eq!(serde_json::from_value::<Task>(json).unwrap(), old);
+    round_trip(&PlanView {
+        id: id(20),
+        prompt: "Rifai il sito\ncon calma".into(),
+        model: Some("opus".into()),
+        effort: Some(Effort::High),
+        state: PlanState::Awaiting,
+        attempt_id: Some(id(21)),
+        created: vec![PlannedTask {
+            id: id(22),
+            title: "Header".into(),
+            status: TaskStatus::Todo,
+            parent_id: Some(id(23)),
+        }],
+        created_at: 7,
+    });
+    round_trip(&Some(PlanView {
+        id: id(20),
+        prompt: "x".into(),
+        model: None,
+        effort: None,
+        state: PlanState::Running,
+        attempt_id: None,
+        created: Vec::new(),
+        created_at: 7,
+    }));
     round_trip(&TaskCard {
         task: task(),
         attempt_id: Some(id(3)),
@@ -746,6 +790,17 @@ fn api_types_round_trip() {
     round_trip(&OpenUrlReq {
         url: "https://docs.anthropic.com".into(),
     });
+    round_trip(&StartPlanReq {
+        project_id: id(2),
+        prompt: "Pianifica".into(),
+        model: Some("sonnet".into()),
+        effort: None,
+    });
+    round_trip(&GetPlanReq { project_id: id(2) });
+    round_trip(&ResolvePlanReq {
+        plan_id: id(20),
+        proceed: true,
+    });
     round_trip(&PingReq { fail: true });
     round_trip(&ProbeMsg {
         i: 7,
@@ -775,7 +830,7 @@ fn wire_shapes() {
 #[test]
 fn command_names_are_unique_snake_case() {
     let mut names = COMMAND_NAMES.to_vec();
-    assert_eq!(names.len(), 36);
+    assert_eq!(names.len(), 42);
     assert!(
         names
             .iter()
@@ -967,4 +1022,32 @@ fn feature_limits() {
     assert_eq!(MAX_ATTACHMENTS_PER_TASK, 20);
     assert_eq!(MAX_ATTACHMENT_BYTES, 25 * 1024 * 1024);
     assert_eq!(MAX_PROJECT_DESCRIPTION, 10_000);
+}
+
+#[test]
+fn app_info_and_update_info_round_trip() {
+    round_trip(&AppInfo {
+        version: "0.1.0".into(),
+    });
+    let update = UpdateInfo {
+        current: "0.1.0".into(),
+        latest: "0.2.0".into(),
+        required: true,
+        notes: Some("Note".into()),
+        install_error: None,
+    };
+    round_trip(&update);
+    round_trip(&Some(update.clone()));
+    round_trip(&None::<UpdateInfo>);
+    assert_eq!(
+        serde_json::to_value(&update).unwrap(),
+        serde_json::json!({"current": "0.1.0", "latest": "0.2.0", "required": true, "notes": "Note",
+            "install_error": null})
+    );
+    // Before `install_error`: absent is none.
+    let old = serde_json::json!({"current": "0.1.0", "latest": "0.2.0", "required": true,
+        "notes": null});
+    let old: UpdateInfo = serde_json::from_value(old).unwrap();
+    assert_eq!(old.install_error, None);
+    assert_eq!(EVENT_UPDATE_AVAILABLE, "update_available");
 }

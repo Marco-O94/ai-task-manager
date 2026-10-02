@@ -43,7 +43,7 @@
 //! [`Session::board_tools`]; each tool's outcome is recorded as
 //! `{"kind":"board","tool":…,"is_error":…,"text":…}` or `{…,"denied":…}`; with `[ask:skip]`
 //! the tools that ask call at once, without `can_use_tool`), board_chain (like board_tools:
-//! [`Session::board_chain`]), mcp_other (one `tools/list` to a
+//! [`Session::board_chain`]), plan (like board_tools: [`Session::plan`]), mcp_other (one `tools/list` to a
 //! server named `other`; then succeeds). Whenever `--mcp-config` declares `atm`, every
 //! scenario that initializes first runs the MCP handshake as `mcp_message` requests before
 //! `system/init`, like the real CLI; each MCP message and its answer is recorded as
@@ -538,6 +538,7 @@ impl Session {
             "subagents" => self.subagents()?,
             "board_tools" if self.atm_server => self.board_tools()?,
             "board_chain" if self.atm_server => self.board_chain()?,
+            "plan" if self.atm_server => self.plan()?,
             "mcp_other" => {
                 self.mcp_server = "other";
                 let answer = self.mcp(json!({"jsonrpc": "2.0", "id": 0, "method": "tools/list"}));
@@ -754,6 +755,34 @@ impl Session {
             false,
         )?;
         self.result("success", false, Some("Lavoro diviso in due passi."));
+        Ok(())
+    }
+
+    /// The planner (round 2026-10-02): two top-level tasks, the second `after` the first
+    /// (`create_task`, which never asks), then a summary. With `[then:hang]` it waits for the
+    /// host after creating them instead of succeeding (a plan stopped by the user).
+    fn plan(&mut self) -> Step {
+        self.stream_text("Esploro il repository e preparo i task.");
+        let first = self.board_call(
+            "create_task",
+            json!({"title": "Primo task pianificato",
+                   "description": "Creato dal pianificatore [fake:simple]."}),
+            false,
+        )?;
+        let first = serde_json::from_str::<Value>(&first).unwrap_or_default();
+        self.board_call(
+            "create_task",
+            json!({"title": "Secondo task pianificato",
+                   "description": "Dopo il primo [fake:simple].", "after": first["id"]}),
+            false,
+        )?;
+        if tag(&self.prompt, "then") == Some("hang") {
+            loop {
+                self.next_response(None)?;
+            }
+        }
+        self.text("Ho creato due task: il secondo parte dopo il primo.");
+        self.result("success", false, Some("Pianificazione completata."));
         Ok(())
     }
 

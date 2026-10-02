@@ -17,6 +17,7 @@ use crate::ui::dialog::{
 use crate::ui::input::Input;
 use crate::ui::label::Label;
 use crate::ui::select_native::SelectNative;
+use crate::views::update::SettingsVersion;
 pub use project::ProjectSettings;
 pub(crate) use project::stored_req;
 
@@ -44,6 +45,7 @@ pub fn SettingsDialog(open: RwSignal<bool>) -> impl IntoView {
                         </DialogDescription>
                     </DialogHeader>
                     <AppSettings open />
+                    <SettingsVersion />
                 </DialogBody>
             </DialogContent>
         </Dialog>

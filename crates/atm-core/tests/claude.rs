@@ -52,6 +52,7 @@ fn turn_args() -> TurnArgs {
         subagent_model: None,
         attachments_dir: None,
         append_prompt: claude::append_prompt(Path::new(WORKTREE), "atm/1-hello", "main"),
+        plan: false,
     }
 }
 
@@ -275,6 +276,8 @@ fn settings_json_with_ask_and_env() {
         allow: &rules,
         ask: claude::SUBAGENT_TOOLS,
         env: &[(claude::SUBAGENT_MODEL_ENV, "haiku")],
+
+        ..Default::default()
     };
     let text = claude::settings_json(&parts);
     let deny = serde_json::to_string(claude::DENY_RULES).unwrap();

@@ -12,6 +12,8 @@
 //! - `task-header`, `task-images`, `task-forms` (Autopilota of `sito-web`): a finished turn
 //!   whose verification is running, passed, and failed once (1/2) with its output.
 //!
+//! Plans (`plan.rs`) get theirs from [`plan_attempt`], on the `plan` fixture.
+//!
 //! Query parameters, next to `?task=`: `fixture=simple|approval|flood` (the running turn
 //! defaults to `approval`, the finished history and new turns to `simple`) and
 //! `merge=clean|conflicts|dirty|nothing` (branch status and `merge_attempt` outcome).
@@ -33,6 +35,7 @@ use super::{board, emit, new_id, now_ms, send_transcript, sleep};
 const SIMPLE: &str = include_str!("fixtures/simple.json");
 const APPROVAL: &str = include_str!("fixtures/approval.json");
 const FLOOD: &str = include_str!("fixtures/flood.json");
+const PLAN: &str = include_str!("fixtures/plan.json");
 const DIFF: &str = include_str!("fixtures/diff.json");
 
 const REPO: &str = "/Users/demo/demo";
@@ -69,6 +72,8 @@ enum Fixture {
     Simple,
     Approval,
     Flood,
+    /// The planner's read-only turn (`plan.rs`), never chosen by `?fixture=`.
+    Plan,
 }
 
 impl Fixture {
@@ -86,6 +91,7 @@ impl Fixture {
             Self::Simple => parse_steps(SIMPLE),
             Self::Approval => parse_steps(APPROVAL),
             Self::Flood => flood_steps(),
+            Self::Plan => parse_steps(PLAN),
         }
     }
 }
@@ -544,6 +550,41 @@ pub fn decorate(card: &mut TaskCard) {
 #[allow(dead_code)] // called by the stateful board mock (M2-UI-BOARD), not by the M1 baseline
 pub fn forget_task(task_id: &str) {
     STATE.with_borrow_mut(|s| s.attempts.retain(|a| a.view.task_id != task_id));
+}
+
+/// For `plan.rs`: the attempt of a plan, whose hidden task is not on the board (mode Default,
+/// the `plan` fixture). `running`: its turn starts now (`deferred`: at its first subscription,
+/// like `task-inprogress`) and ends on its own or with `stop_attempt`; else one finished turn,
+/// for a seeded plan.
+pub fn plan_attempt(plan: &Task, running: bool, deferred: bool) -> Id {
+    let mut a = Attempt::new(plan, "main".into(), Fixture::Plan, Merge::Nothing);
+    a.view.permission_mode = PermissionMode::Default;
+    a.open_turn(plan.description.clone());
+    let (id, turn) = (a.view.id.clone(), a.turn);
+    if !running {
+        a.materialize(Fixture::Plan.steps());
+        a.close_turn(End::Completed);
+    }
+    a.deferred_start = running && deferred;
+    STATE.with_borrow_mut(|s| s.attempts.push(a));
+    if running && !deferred {
+        running_changed(1);
+        spawn_local(run_turn(id.clone(), turn));
+    }
+    id
+}
+
+/// For `plan.rs`: `None` while the plan's turn runs, else whether it completed (not stopped).
+pub fn plan_turn_completed(attempt_id: &str) -> Option<bool> {
+    with_attempt(attempt_id, |a| {
+        (!a.view.running).then(|| {
+            a.processes
+                .last()
+                .is_some_and(|p| p.status == ProcessStatus::Completed)
+        })
+    })
+    .ok()
+    .flatten()
 }
 
 fn find_mut<'a>(s: &'a mut State, attempt_id: &str) -> Option<&'a mut Attempt> {

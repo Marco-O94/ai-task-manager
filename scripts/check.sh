@@ -102,6 +102,7 @@ m=$(awk '/^[[:space:]]*(pub[[:space:]]+)?mod[[:space:]]+(e2e|selftest)[[:space:]
 hits "ui/src/main.rs: test driver outside testkit" "$m"
 # The testkit overlay repeats the main window (a config merge replaces arrays) only to add
 # `backgroundThrottling: disabled` (the E2E must not stall in a hidden window): no other drift.
+# (Its `bundle.createUpdaterArtifacts: false` lets the debug bundle build without the signing key.)
 m=$(/usr/bin/python3 - <<'EOF'
 import json
 main = json.load(open("src-tauri/tauri.conf.json"))["app"]["windows"]
@@ -111,6 +112,10 @@ if len(kit) != 1 or kit[0].pop("backgroundThrottling", None) != "disabled" or ki
 EOF
 ) || exit 2
 hits "testkit overlay" "$m"
+
+# The updater is driven from Rust only (round 2026-10-02): the webview gets none of its commands.
+m=$(scan -rnF 'updater' src-tauri/capabilities)
+hits "src-tauri/capabilities: updater permission" "$m"
 
 if [[ $fail -ne 0 ]]; then
     echo "check.sh: security greps FAILED" >&2

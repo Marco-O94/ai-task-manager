@@ -172,6 +172,26 @@ pub fn set_task_status(id: &str, status: TaskStatus) {
     }
 }
 
+/// For `plan.rs`: a task the mock planner creates, in Da fare and started after `after`, as
+/// the board tools' `create_task` does; `None` if the project is gone.
+pub fn create_planned(
+    project_id: &str,
+    title: &str,
+    description: &str,
+    after: Option<Id>,
+) -> Option<Id> {
+    let req = CreateTaskReq {
+        project_id: project_id.to_owned(),
+        title: title.to_owned(),
+        description: description.to_owned(),
+        status: None,
+        parent_id: None,
+        auto: false,
+        after_id: after,
+    };
+    create_task(req).ok().map(|card| card.task.id)
+}
+
 /// For `attempt.rs`: changes the mock env (usage-limit `paused`, `auth` after an auth
 /// failure, `running`) and emits `env_changed`, as the runner does. `f` runs outside the
 /// mock's borrow, so it may call the other hooks.
@@ -454,6 +474,8 @@ fn create_task(req: CreateTaskReq) -> Result<TaskCard, AppError> {
             parent_id: req.parent_id.clone(),
             auto: req.auto,
             after_id: req.after_id.clone(),
+            kind: TaskKind::Task,
+            launch: false,
         });
         move_to(&mut m.tasks, &id, status, None);
         m.task_mut(&id).cloned()
@@ -804,8 +826,15 @@ fn seed_board() -> (Vec<Project>, Vec<Task>) {
                 updated_at: created_at + (tasks.len() as Millis % 4 + 1) * HOUR,
                 parent_id: parent.map(Into::into),
                 auto: project_id == "project-web",
-                // Queued behind the header, still in review.
-                after_id: (id == "task-contacts").then(|| "task-header".into()),
+                // Queued behind the header, still in review; the demo plan's second task
+                // after its first, as a real plan links them.
+                after_id: match id {
+                    "task-contacts" => Some("task-header".into()),
+                    "task-api-docs" => Some("task-parser-tests".into()),
+                    _ => None,
+                },
+                kind: TaskKind::Task,
+                launch: false,
             });
             move_to(&mut tasks, id, status, None);
         }

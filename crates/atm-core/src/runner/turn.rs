@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use atm_types::{
-    AppError, ApprovalDecision, Level, LimitKind, NoticeAction, ProcessStatus, StopReason,
+    AppError, ApprovalDecision, Level, LimitKind, NoticeAction, ProcessStatus, StopReason, TaskKind,
 };
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, BufReader};
@@ -760,10 +760,18 @@ impl Turn {
         }
     }
 
-    /// A pending approval on a task the autopilot drives: the user is not watching the board.
+    /// A pending approval on a task the autopilot drives, or on a plan (hidden from the board
+    /// and its approval counts: only its card shows it): the user is not watching.
     fn notify_pending(&self, tool: &str) {
         let task = &self.plan.ctx.task;
-        if self.inner.db.task(&task.id).is_ok_and(|t| t.auto) {
+        if task.kind == TaskKind::Plan {
+            let body = format!("«{}» chiede di usare {tool}", task.title);
+            self.inner.notify(
+                Some(&task.id),
+                "Pianificazione: approvazione richiesta",
+                &body,
+            );
+        } else if self.inner.db.task(&task.id).is_ok_and(|t| t.auto) {
             let body = format!("«{}» chiede di usare {tool}", task.title);
             self.inner
                 .notify(Some(&task.id), "Autopilota: approvazione richiesta", &body);

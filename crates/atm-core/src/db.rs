@@ -10,9 +10,10 @@ use std::sync::{Mutex, MutexGuard};
 
 use atm_types::{
     AppError, Attachment, AttemptState, AttemptView, ConfigPolicy, CreateTaskReq, Effort, Entry,
-    EntryBody, EntryPage, Id, MAX_ATTACHMENTS_PER_TASK, Millis, PermissionMode, ProcessInfo,
-    ProcessStatus, Project, Settings, StopReason, Task, TaskCard, TaskStatus, ToolStatus,
-    UpdateProjectReq, UpdateTaskReq, VerifyState, WorktreeState,
+    EntryBody, EntryPage, Id, MAX_ATTACHMENTS_PER_TASK, MAX_PLAN_TITLE, Millis, PermissionMode,
+    PlanState, PlanView, PlannedTask, ProcessInfo, ProcessStatus, Project, Settings, StopReason,
+    Task, TaskCard, TaskStatus, ToolStatus, UpdateProjectReq, UpdateTaskReq, VerifyState,
+    WorktreeState,
 };
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ValueRef};
 use rusqlite::{
@@ -26,12 +27,14 @@ pub const PRAGMAS: &str = "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAG
 /// Migration `i` brings `PRAGMA user_version` from `i` to `i + 1`: 0001 the base schema,
 /// 0002 overview, attachments and sub-agent limits, 0003 sub-tasks (`tasks.parent_id`) and
 /// `attempts.started_by_attempt`, 0004 the autopilot (project settings, `tasks.auto` and
-/// `after_id`, the attempts' verification).
+/// `after_id`, the attempts' verification), 0005 the planner (`tasks.kind`, `planned_by`,
+/// `plan_state`, `launch`).
 pub const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0001_init.sql"),
     include_str!("../migrations/0002_overview_attachments_subagents.sql"),
     include_str!("../migrations/0003_subtasks.sql"),
     include_str!("../migrations/0004_autopilot.sql"),
+    include_str!("../migrations/0005_planner.sql"),
 ];
 
 /// Gap between consecutive positions (appends use `max + GAP`, renumbering uses `k * GAP`).
@@ -693,16 +696,22 @@ impl Db {
         })
     }
 
-    /// What the autopilot may start in a project, in board order (position; every candidate is
-    /// todo): tasks with `auto`, in todo, without an active attempt, whose `after_id` is unset
-    /// (or gone) or done, and whose parent (if any) is not cancelled. The project's own
-    /// `autopilot` flag is the caller's.
-    pub fn autopilot_candidates(&self, project_id: &str) -> Result<Vec<Task>, AppError> {
+    /// What the scheduler may start in a project, in board order (position; every candidate
+    /// is todo): visible tasks (never a plan) with `launch`, or with `auto` when
+    /// `include_auto` (the project's `autopilot`, the caller's), in todo, without an active
+    /// attempt, whose `after_id` is unset (or gone) or done, and whose parent (if any) is not
+    /// cancelled.
+    pub fn autopilot_candidates(
+        &self,
+        project_id: &str,
+        include_auto: bool,
+    ) -> Result<Vec<Task>, AppError> {
         self.read(|c| {
             all(
                 c,
                 "SELECT t.* FROM tasks t
-                 WHERE t.project_id = ?1 AND t.auto = 1 AND t.status = 'todo'
+                 WHERE t.project_id = ?1 AND t.kind = 'task' AND t.status = 'todo'
+                    AND (t.launch = 1 OR (?2 AND t.auto = 1))
                     AND NOT EXISTS (SELECT 1 FROM attempts a
                         WHERE a.task_id = t.id AND a.state = 'active')
                     AND (t.after_id IS NULL OR EXISTS (SELECT 1 FROM tasks d
@@ -710,7 +719,7 @@ impl Db {
                     AND (t.parent_id IS NULL OR EXISTS (SELECT 1 FROM tasks p
                         WHERE p.id = t.parent_id AND p.status <> 'cancelled'))
                  ORDER BY t.position, t.rowid",
-                [project_id],
+                params![project_id, include_auto],
                 task_row,
             )
         })
@@ -788,7 +797,8 @@ impl Db {
         })
     }
 
-    /// Board of a project ordered by (column, position): each task joined with its active
+    /// Board of a project ordered by (column, position), plans excluded (hidden everywhere):
+    /// each task joined with its active
     /// attempt, else its most recent one (`attempt_state` says which), and that attempt's
     /// highest-`seq` process.
     /// `running` = that attempt has a `running` process; `pending_approvals` is 0 (the
@@ -797,7 +807,10 @@ impl Db {
         let mut cards = self.read(|c| {
             all(
                 c,
-                &format!("{CARD_SELECT} WHERE t.project_id = ?1 ORDER BY t.position"),
+                &format!(
+                    "{CARD_SELECT} WHERE t.project_id = ?1 AND t.kind = 'task'
+                     ORDER BY t.position"
+                ),
                 [project_id],
                 card_row,
             )
@@ -825,7 +838,10 @@ impl Db {
         let mut cards = self.read(|c| {
             all(
                 c,
-                &format!("{CARD_SELECT} WHERE t.parent_id = ?1 ORDER BY t.position"),
+                &format!(
+                    "{CARD_SELECT} WHERE t.parent_id = ?1 AND t.kind = 'task'
+                     ORDER BY t.position"
+                ),
                 [task_id],
                 card_row,
             )
@@ -846,10 +862,266 @@ impl Db {
         })
     }
 
+    /// Sets or clears `launch` alone (the scheduler letting go of a task it could not start).
+    /// Errors: `NotFound`.
+    pub fn set_task_launch(&self, id: &str, launch: bool, now: Millis) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET launch = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, launch, now],
+            )?;
+            updated(n, "Task", id)
+        })
+    }
+
+    /// Projects with at least one visible task marked `launch` (the scheduler serves them
+    /// even with the autopilot off), oldest project first.
+    pub fn projects_with_launch(&self) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT p.id FROM projects p WHERE EXISTS (SELECT 1 FROM tasks t
+                    WHERE t.project_id = p.id AND t.launch = 1 AND t.kind = 'task')
+                 ORDER BY p.created_at, p.rowid",
+                [],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    // ---- plans ----------------------------------------------------------------------------
+
+    /// Inserts plan `id` (round 2026-10-02): a hidden task of kind `plan`, in todo, with
+    /// `plan_state = running`, title [`plan_title`] of the prompt and the prompt as its
+    /// description. Errors: `Conflict` (another plan of the project running or awaiting),
+    /// `NotFound` (project), `Invalid` (empty prompt, CHECK: description ≤ 100000).
+    pub fn insert_plan(
+        &self,
+        id: &str,
+        project_id: &str,
+        prompt: &str,
+        now: Millis,
+    ) -> Result<Task, AppError> {
+        let title = plan_title(prompt);
+        if title.is_empty() {
+            return Err(AppError::invalid("Scrivi cosa deve pianificare l'agente"));
+        }
+        self.write(|c| {
+            get_project(c, project_id)?;
+            let busy: bool = c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM tasks WHERE project_id = ?1 AND kind = 'plan'
+                    AND plan_state IN ('running', 'awaiting'))",
+                [project_id],
+                |r| r.get(0),
+            )?;
+            if busy {
+                return Err(AppError::conflict(
+                    "Una pianificazione è già in corso o in attesa di conferma in questo progetto",
+                )
+                .into());
+            }
+            let position = end_of_column(c, project_id, TaskStatus::Todo, id)?;
+            Ok(c.query_row(
+                "INSERT INTO tasks (id, project_id, title, description, status, position,
+                    created_at, updated_at, kind, plan_state)
+                 VALUES (?1, ?2, ?3, ?4, 'todo', ?5, ?6, ?6, 'plan', 'running') RETURNING *",
+                params![id, project_id, title, prompt, position, now],
+                task_row,
+            )?)
+        })
+    }
+
+    /// The project's newest plan (any state); `None` if it never had one.
+    pub fn latest_plan(&self, project_id: &str) -> Result<Option<Id>, AppError> {
+        self.read(|c| {
+            Ok(c.query_row(
+                "SELECT id FROM tasks WHERE project_id = ?1 AND kind = 'plan'
+                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                [project_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
+    /// Errors: `NotFound` (also a task that is not a plan).
+    pub fn plan_state(&self, plan_id: &str) -> Result<PlanState, AppError> {
+        self.read(|c| get_plan_state(c, plan_id))
+    }
+
+    /// Compare-and-set: the plan goes to `to` only if its state is one of `from`; returns
+    /// whether it did. Errors: `NotFound` (also a task that is not a plan).
+    pub fn set_plan_state(
+        &self,
+        plan_id: &str,
+        from: &[PlanState],
+        to: PlanState,
+        now: Millis,
+    ) -> Result<bool, AppError> {
+        self.write(|c| {
+            let state = get_plan_state(c, plan_id)?;
+            if !from.contains(&state) {
+                return Ok(false);
+            }
+            c.execute(
+                "UPDATE tasks SET plan_state = ?2, updated_at = ?3 WHERE id = ?1",
+                params![plan_id, to.as_str(), now],
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// The task was created by plan `plan_id` (`create_task` of the plan's agent). Errors:
+    /// `NotFound` (the task; an unknown plan: foreign key).
+    pub fn set_planned_by(
+        &self,
+        task_id: &str,
+        plan_id: &str,
+        now: Millis,
+    ) -> Result<(), AppError> {
+        self.write(|c| {
+            let n = c.execute(
+                "UPDATE tasks SET planned_by = ?2, updated_at = ?3 WHERE id = ?1",
+                params![task_id, plan_id, now],
+            )?;
+            updated(n, "Task", task_id)
+        })
+    }
+
+    /// Tasks created by the plan, oldest first (empty for an unknown plan).
+    pub fn plan_tasks(&self, plan_id: &str) -> Result<Vec<Task>, AppError> {
+        self.read(|c| plan_tasks(c, plan_id))
+    }
+
+    /// One transaction: the plan, running or awaiting, goes to `started`, and each top-level
+    /// task it created that is still in todo (a sub-task is its parent agent's) is handed to the scheduler: `auto = 1` (`auto_by`
+    /// cleared: as if the user had) when `autopilot` (the project's, the caller's), else
+    /// `launch = 1`. Returns the ids handed over, oldest first (empty: none was created or
+    /// left in todo, still `started`). Errors: `NotFound`, `Conflict` (the plan is in
+    /// another state: nothing changed).
+    pub fn launch_plan(
+        &self,
+        plan_id: &str,
+        autopilot: bool,
+        now: Millis,
+    ) -> Result<Vec<Id>, AppError> {
+        self.write(|c| {
+            if !get_plan_state(c, plan_id)?.is_active() {
+                return Err(AppError::conflict("La pianificazione non è più in attesa").into());
+            }
+            c.execute(
+                "UPDATE tasks SET plan_state = 'started', updated_at = ?2 WHERE id = ?1",
+                params![plan_id, now],
+            )?;
+            let sql = if autopilot {
+                "UPDATE tasks SET auto = 1, auto_by = NULL, updated_at = ?2
+                 WHERE planned_by = ?1 AND kind = 'task' AND status = 'todo'
+                    AND parent_id IS NULL RETURNING id"
+            } else {
+                "UPDATE tasks SET launch = 1, updated_at = ?2
+                 WHERE planned_by = ?1 AND kind = 'task' AND status = 'todo'
+                    AND parent_id IS NULL RETURNING id"
+            };
+            let mut ids: Vec<Id> = all(c, sql, params![plan_id, now], |r| r.get(0))?;
+            let order: Vec<Id> = plan_tasks(c, plan_id)?.into_iter().map(|t| t.id).collect();
+            ids.sort_by_key(|id| order.iter().position(|o| o == id));
+            Ok(ids)
+        })
+    }
+
+    /// Startup recovery: every plan still `running` without a running process (the app
+    /// closed during its turn or right after it; after [`Db::mark_orphans`]), with its latest
+    /// process if any. The caller settles each from that process (a completed turn counts).
+    pub fn stale_plans(&self) -> Result<Vec<(Id, Option<Id>)>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT t.id, (SELECT p.id FROM attempts a
+                        JOIN processes p ON p.attempt_id = a.id WHERE a.task_id = t.id
+                        ORDER BY a.created_at DESC, a.rowid DESC, p.seq DESC LIMIT 1)
+                 FROM tasks t
+                 WHERE t.kind = 'plan' AND t.plan_state = 'running' AND NOT EXISTS (
+                    SELECT 1 FROM attempts a JOIN processes p ON p.attempt_id = a.id
+                    WHERE a.task_id = t.id AND p.status = 'running')
+                 ORDER BY t.created_at, t.rowid",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+    }
+
+    /// Repository and `atm/…` branch of every closed attempt of a plan: startup deletes the
+    /// ones still there (a deletion cut by the app closing, or failed).
+    pub fn closed_plan_branches(&self) -> Result<Vec<(String, String)>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT pr.repo_path, a.branch FROM attempts a
+                 JOIN tasks t ON t.id = a.task_id JOIN projects pr ON pr.id = t.project_id
+                 WHERE t.kind = 'plan' AND a.state <> 'active'
+                 ORDER BY a.created_at, a.rowid",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        })
+    }
+
+    /// Active attempts of plans whose turn is over (not `running`): their discard was cut
+    /// by the app closing. Startup discards them, after [`Db::fail_stale_plans`].
+    pub fn plan_attempts_left(&self) -> Result<Vec<Id>, AppError> {
+        self.read(|c| {
+            all(
+                c,
+                "SELECT a.id FROM attempts a JOIN tasks t ON t.id = a.task_id
+                 WHERE t.kind = 'plan' AND a.state = 'active'
+                    AND t.plan_state IS NOT 'running'
+                 ORDER BY a.created_at, a.rowid",
+                [],
+                |r| r.get(0),
+            )
+        })
+    }
+
+    /// IPC view of the plan: its newest attempt (model, effort, id) and the tasks it created.
+    /// Errors: `NotFound` (also a task that is not a plan).
+    pub fn plan_view(&self, plan_id: &str) -> Result<PlanView, AppError> {
+        self.read(|c| {
+            let task = get_task(c, plan_id)?;
+            let state = get_plan_state(c, plan_id)?;
+            let attempt = c
+                .query_row(
+                    "SELECT * FROM attempts WHERE task_id = ?1
+                     ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    [plan_id],
+                    attempt_row,
+                )
+                .optional()?;
+            let created = plan_tasks(c, plan_id)?
+                .into_iter()
+                .map(|t| PlannedTask {
+                    id: t.id,
+                    title: t.title,
+                    status: t.status,
+                    parent_id: t.parent_id,
+                })
+                .collect();
+            Ok(PlanView {
+                id: task.id,
+                prompt: task.description,
+                model: attempt.as_ref().and_then(|a| a.model.clone()),
+                effort: attempt.as_ref().and_then(|a| a.effort),
+                state,
+                attempt_id: attempt.map(|a| a.id),
+                created,
+                created_at: task.created_at,
+            })
+        })
+    }
+
     // ---- attempts -------------------------------------------------------------------------
 
     /// One transaction (spec §6.3 `start_attempt`): inserts the attempt and its first
-    /// `running` process, task → inprogress. Errors: `Conflict` (another active attempt on
+    /// `running` process, task → inprogress, its `launch` cleared. Errors: `Conflict` (another active attempt on
     /// the task, or duplicate worktree path / session id).
     pub fn begin_attempt(
         &self,
@@ -892,6 +1164,7 @@ impl Db {
                 ],
             )?;
             insert_process(c, process)?;
+            c.execute("UPDATE tasks SET launch = 0 WHERE id = ?1", [&a.task_id])?;
             transition(c, &a.task_id, TaskStatus::ALL, TaskStatus::InProgress, now)
         })
     }
@@ -1684,6 +1957,8 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         parent_id: r.get("parent_id")?,
         auto: r.get("auto")?,
         after_id: r.get("after_id")?,
+        kind: text(r, "kind")?,
+        launch: r.get("launch")?,
     })
 }
 
@@ -1810,6 +2085,41 @@ fn get_task(c: &Connection, id: &str) -> Res<Task> {
         .or_missing("Task", id)
 }
 
+/// `NotFound` for an unknown task or one that is not a plan.
+fn get_plan_state(c: &Connection, plan_id: &str) -> Res<PlanState> {
+    c.query_row(
+        "SELECT plan_state FROM tasks WHERE id = ?1 AND kind = 'plan'",
+        [plan_id],
+        |r| text(r, "plan_state"),
+    )
+    .or_missing("Pianificazione", plan_id)
+}
+
+fn plan_tasks(c: &Connection, plan_id: &str) -> Res<Vec<Task>> {
+    all(
+        c,
+        "SELECT * FROM tasks WHERE planned_by = ?1 AND kind = 'task'
+         ORDER BY created_at, rowid",
+        [plan_id],
+        task_row,
+    )
+}
+
+/// Title of a plan's hidden task: the prompt's first non-blank line, trimmed, at most
+/// [`MAX_PLAN_TITLE`] characters (cut with `…`); empty for a blank prompt.
+pub fn plan_title(prompt: &str) -> String {
+    let line = prompt
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= MAX_PLAN_TITLE {
+        return line.to_owned();
+    }
+    let cut: String = line.chars().take(MAX_PLAN_TITLE - 1).collect();
+    format!("{}…", cut.trim_end())
+}
+
 fn get_attempt(c: &Connection, id: &str) -> Res<AttemptRow> {
     c.query_row("SELECT * FROM attempts WHERE id = ?1", [id], attempt_row)
         .or_missing("Attempt", id)
@@ -1874,7 +2184,9 @@ fn end_of_column(c: &Connection, project_id: &str, status: TaskStatus, id: &str)
 
 fn place(c: &Connection, id: &str, status: TaskStatus, position: f64, now: Millis) -> Res<()> {
     c.execute(
-        "UPDATE tasks SET status = ?2, position = ?3, updated_at = ?4 WHERE id = ?1",
+        "UPDATE tasks SET status = ?2, position = ?3, updated_at = ?4,
+            launch = CASE WHEN ?2 = 'todo' THEN launch ELSE 0 END
+         WHERE id = ?1",
         params![id, status.as_str(), position, now],
     )?;
     Ok(())

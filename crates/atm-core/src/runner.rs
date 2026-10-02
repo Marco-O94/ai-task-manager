@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use atm_types::{
     AppError, ApprovalDecision, AuthState, ConfigPolicy, ErrorCode, Id, Level, PermissionMode,
-    ProcessStatus, Settings, StopReason,
+    ProcessStatus, Settings, StopReason, TaskKind,
 };
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -587,7 +587,12 @@ impl Inner {
         let mut notices = r.preflight.notices.clone();
         let project = &r.ctx.project;
         let tools = self.tools(false).await;
+        // A plan's turns are read-only, whatever was asked (round 2026-10-02): always
+        // Isolated too, so that no MCP server of the repository or the user (nor their allow
+        // rules) gives it a way to write.
+        let plan = r.ctx.task.kind == TaskKind::Plan;
         let isolated = match project.config_policy {
+            _ if plan => true,
             ConfigPolicy::Isolated => true,
             ConfigPolicy::Trusted => match self.untrusted_reason(&tools.git, r.ctx).await {
                 None => false,
@@ -598,9 +603,19 @@ impl Inner {
                 }
             },
         };
+        let mode = if plan {
+            PermissionMode::Default
+        } else {
+            r.mode
+        };
+        let append_prompt = if plan {
+            claude::plan_append_prompt(worktree, &a.branch, &a.target_branch)
+        } else {
+            claude::append_prompt(worktree, &a.branch, &a.target_branch)
+        };
         let argv = claude::build_argv(&TurnArgs {
             claude: r.preflight.claude.path.clone(),
-            permission_mode: r.mode,
+            permission_mode: mode,
             allow_bypass: r.ctx.project.allow_bypass,
             session_id: a.session_id.clone(),
             resume: r.resume,
@@ -613,7 +628,8 @@ impl Inner {
                 .map(|max| u32::from(max).saturating_sub(a.subagents_used)),
             subagent_model: a.subagent_model.clone(),
             attachments_dir: r.attachments_dir,
-            append_prompt: claude::append_prompt(worktree, &a.branch, &a.target_branch),
+            append_prompt,
+            plan,
         });
         let env = self
             .child_env(&tools, r.settings)
@@ -623,7 +639,7 @@ impl Inner {
             attempt_id: a.id.clone(),
             seq: r.seq,
             prompt: r.prompt,
-            permission_mode: r.mode,
+            permission_mode: mode,
             session_id: a.session_id.clone(),
             resumed: r.resume,
             status: ProcessStatus::Running,
